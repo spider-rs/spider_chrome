@@ -86,6 +86,28 @@ pub struct Page {
 }
 
 impl Page {
+
+    /// Add a custom script to eval on new document immediately.
+    pub async fn add_script_to_evaluate_immediately_on_new_document(
+        &self,
+        source: Option<String>,
+    ) -> Result<()> {
+        if source.is_some() {
+            let source = source.unwrap_or_default();
+
+            if !source.is_empty() {
+                self.execute(AddScriptToEvaluateOnNewDocumentParams {
+                    source,
+                    world_name: None,
+                    include_command_line_api: None,
+                    run_immediately: Some(true),
+                })
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Add a custom script to eval on new document.
     pub async fn add_script_to_evaluate_on_new_document(
         &self,
