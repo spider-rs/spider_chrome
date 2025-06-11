@@ -8,6 +8,7 @@ use chromiumoxide_cdp::cdp::browser_protocol::browser::BrowserContextId;
 /// belong to the parent page's browser context.
 #[derive(Debug, Clone, Default, Hash, Eq, PartialEq)]
 pub struct BrowserContext {
+    /// The browser context ID.
     pub id: Option<BrowserContextId>,
 }
 

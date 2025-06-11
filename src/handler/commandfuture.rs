@@ -15,6 +15,7 @@ use chromiumoxide_cdp::cdp::browser_protocol::target::SessionId;
 use chromiumoxide_types::{Command, CommandResponse, MethodId, Response};
 
 pin_project! {
+
     pub struct CommandFuture<T, M = Result<Response>> {
         #[pin]
         rx_command: oneshot::Receiver<M>,
@@ -35,6 +36,7 @@ pin_project! {
 }
 
 impl<T: Command> CommandFuture<T> {
+    /// A new command future.
     pub fn new(
         cmd: T,
         target_sender: mpsc::Sender<TargetMessage>,

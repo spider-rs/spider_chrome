@@ -2,12 +2,15 @@ use chromiumoxide_cdp::cdp::js_protocol::runtime::ExecutionContextId;
 
 #[derive(Debug, Clone, Default)]
 pub struct DOMWorld {
+    /// The execution context ID associated with this world.
     execution_ctx: Option<ExecutionContextId>,
+    /// A unique identifier for the execution context.
     execution_ctx_unique_id: Option<String>,
+    /// Whether the world has been detached from the page.
     detached: bool,
 }
-
 impl DOMWorld {
+    /// Returns a new instance representing the main world.
     pub fn main_world() -> Self {
         Self {
             execution_ctx: None,
@@ -16,6 +19,7 @@ impl DOMWorld {
         }
     }
 
+    /// Returns a new instance representing a secondary world.
     pub fn secondary_world() -> Self {
         Self {
             execution_ctx: None,
@@ -24,19 +28,23 @@ impl DOMWorld {
         }
     }
 
+    /// Returns the execution context ID, if set.
     pub fn execution_context(&self) -> Option<ExecutionContextId> {
         self.execution_ctx
     }
 
+    /// Returns the unique ID of the execution context, if set.
     pub fn execution_context_unique_id(&self) -> Option<&str> {
         self.execution_ctx_unique_id.as_deref()
     }
 
+    /// Sets the execution context and its unique identifier.
     pub fn set_context(&mut self, ctx: ExecutionContextId, unique_id: String) {
         self.execution_ctx = Some(ctx);
         self.execution_ctx_unique_id = Some(unique_id);
     }
 
+    /// Removes and returns the execution context and its unique ID.
     pub fn take_context(&mut self) -> (Option<ExecutionContextId>, Option<String>) {
         (
             self.execution_ctx.take(),
@@ -44,6 +52,7 @@ impl DOMWorld {
         )
     }
 
+    /// Returns true if the world is detached.
     pub fn is_detached(&self) -> bool {
         self.detached
     }

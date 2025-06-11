@@ -13,14 +13,16 @@ pub struct EvaluationResult {
 }
 
 impl EvaluationResult {
+    /// Creates a new evaluation result from a remote object.
     pub fn new(inner: RemoteObject) -> Self {
         Self { inner }
     }
-
+    /// Get a reference to the underlying remote object.
     pub fn object(&self) -> &RemoteObject {
         &self.inner
     }
 
+    /// Get the deserialized value if available.
     pub fn value(&self) -> Option<&serde_json::Value> {
         self.object().value.as_ref()
     }
@@ -47,7 +49,9 @@ impl EvaluationResult {
 
 #[derive(Debug, Clone)]
 pub enum Evaluation {
+    /// A JavaScript expression to evaluate.
     Expression(EvaluateParams),
+    /// A JavaScript function to invoke.
     Function(CallFunctionOnParams),
 }
 

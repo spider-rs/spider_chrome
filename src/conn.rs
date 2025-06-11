@@ -28,9 +28,11 @@ pub struct Connection<T: EventMessage> {
     ws: WebSocketStream<ConnectStream>,
     /// The identifier for a specific command
     next_id: usize,
+    /// A flush is required.
     needs_flush: bool,
     /// The message that is currently being proceessed
     pending_flush: Option<MethodCall>,
+    /// The phantom marker.
     _marker: PhantomData<T>,
 }
 

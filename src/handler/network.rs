@@ -184,8 +184,10 @@ pub struct NetworkManager {
     // unused atm for remote connections, needs to be used for self launches.
     user_request_interception_enabled: bool,
     protocol_request_interception_enabled: bool,
+    /// The network is offline.
     offline: bool,
-    request_timeout: Duration,
+    /// The page request timeout.
+    pub request_timeout: Duration,
     // made_request: bool,
     /// Ignore visuals (no pings, prefetching, and etc).
     pub ignore_visuals: bool,

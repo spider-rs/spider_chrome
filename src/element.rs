@@ -32,6 +32,7 @@ pub struct Element {
     pub backend_node_id: BackendNodeId,
     /// The identifier of the node this element represents.
     pub node_id: NodeId,
+    /// The active tab.
     tab: Arc<PageInner>,
 }
 

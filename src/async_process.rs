@@ -8,6 +8,7 @@ use std::task::{Context, Poll};
 
 #[derive(Debug)]
 pub struct Command {
+    /// The inner commands to run.
     inner: process::Command,
 }
 

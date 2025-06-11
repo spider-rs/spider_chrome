@@ -10,7 +10,9 @@ use crate::handler::REQUEST_TIMEOUT;
 /// A background job run periodically.
 #[derive(Debug)]
 pub(crate) struct PeriodicJob {
+    /// The interval between job executions.
     interval: Duration,
+    /// The delay timer used to wait between executions.
     delay: Delay,
 }
 

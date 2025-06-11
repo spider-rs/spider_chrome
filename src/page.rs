@@ -86,7 +86,6 @@ pub struct Page {
 }
 
 impl Page {
-
     /// Add a custom script to eval on new document immediately.
     pub async fn add_script_to_evaluate_immediately_on_new_document(
         &self,
@@ -126,6 +125,40 @@ impl Page {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    /// Removes the `navigator.webdriver` property
+    /// changes permissions, pluggins rendering contexts and the `window.chrome`
+    /// property to make it harder to detect the scraper as a bot.
+    pub async fn _enable_real_emulation(
+        &self,
+        user_agent: &str,
+        config: &spider_fingerprint::EmulationConfiguration,
+        viewport: &Option<&spider_fingerprint::spoof_viewport::Viewport>,
+        custom_script: Option<&str>,
+    ) -> Result<()> {
+        let emulation_script = spider_fingerprint::emulate(
+            &user_agent,
+            &config,
+            &viewport,
+            &custom_script.as_ref().map(|s| Box::new(s.to_string())),
+        )
+        .unwrap_or_default();
+
+        let source = if let Some(cs) = custom_script {
+            format!(
+                "{};{};",
+                emulation_script,
+                spider_fingerprint::wrap_eval_script(&cs)
+            )
+        } else {
+            emulation_script
+        };
+
+        self.add_script_to_evaluate_on_new_document(Some(source))
+            .await?;
+
         Ok(())
     }
 

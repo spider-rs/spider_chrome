@@ -229,14 +229,17 @@ impl Target {
         self.page.as_ref().map(|p| p.inner())
     }
 
+    /// Is the target a page?
     pub fn is_page(&self) -> bool {
         self.r#type().is_page()
     }
 
+    /// The browser context ID.
     pub fn browser_context_id(&self) -> Option<&BrowserContextId> {
         self.info.browser_context_id.as_ref()
     }
 
+    /// The target connection info.
     pub fn info(&self) -> &TargetInfo {
         &self.info
     }
@@ -250,10 +253,12 @@ impl Target {
         &self.frame_manager
     }
 
+    /// The frame manager.
     pub fn frame_manager_mut(&mut self) -> &mut FrameManager {
         &mut self.frame_manager
     }
 
+    /// Get event listeners mutably.
     pub fn event_listeners_mut(&mut self) -> &mut EventListeners {
         &mut self.event_listeners
     }

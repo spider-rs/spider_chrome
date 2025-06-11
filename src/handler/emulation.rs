@@ -8,15 +8,20 @@ use crate::cmd::CommandChain;
 use crate::handler::viewport::Viewport;
 use std::time::Duration;
 
-#[derive(Debug)]
+#[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub struct EmulationManager {
+    /// Whether mobile emulation is enabled.
     pub emulating_mobile: bool,
+    /// Whether touch input is enabled.
     pub has_touch: bool,
+    /// Whether a reload is required to apply new emulation settings.
     pub needs_reload: bool,
+    /// Timeout to apply emulation requests.
     pub request_timeout: Duration,
 }
 
 impl EmulationManager {
+    /// Creates a new `EmulationManager` with the given request timeout.
     pub fn new(request_timeout: Duration) -> Self {
         Self {
             emulating_mobile: false,
@@ -25,7 +30,10 @@ impl EmulationManager {
             request_timeout,
         }
     }
-
+    /// Generates the initial emulation commands based on the provided viewport.
+    ///
+    /// This sets up device metrics and touch emulation, and updates internal flags
+    /// to determine if a page reload is required to apply the changes.
     pub fn init_commands(&mut self, viewport: &Viewport) -> CommandChain {
         let mut chains = Vec::with_capacity(2);
         let set_touch = SetTouchEmulationEnabledParams::new(viewport.emulating_mobile);

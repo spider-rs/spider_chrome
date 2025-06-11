@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 pub struct DetectionOptions {
     /// Detect Microsoft Edge
     pub msedge: bool,
-
     /// Detect unstable installations (beta, dev, unstable)
     pub unstable: bool,
 }

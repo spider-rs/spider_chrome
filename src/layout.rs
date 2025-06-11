@@ -8,7 +8,9 @@ use chromiumoxide_cdp::cdp::browser_protocol::page::Viewport;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Point {
+    /// The horizontal (X) coordinate.
     pub x: f64,
+    /// The vertical (Y) coordinate.
     pub y: f64,
 }
 
@@ -17,7 +19,7 @@ impl Point {
     pub fn new(x: f64, y: f64) -> Self {
         Self { x, y }
     }
-
+    /// Get the signed area of the triangle formed with the origin and another point.
     fn area(&self, other: &Self) -> f64 {
         (self.x * other.y - other.x * self.y) / 2.
     }
@@ -143,10 +145,14 @@ impl ElementQuad {
         area.abs()
     }
 
+    /// Get the height of the shape based on the vertical distance
+    /// between the top-left and bottom-left points.
     pub fn height(&self) -> f64 {
         self.bottom_left.y - self.top_left.y
     }
 
+    /// Get the width of the shape based on the horizontal distance
+    /// between the top-left and top-right points.
     pub fn width(&self) -> f64 {
         self.top_right.x - self.top_left.x
     }
@@ -258,11 +264,17 @@ impl ElementQuad {
 
 #[derive(Debug, Clone)]
 pub struct BoxModel {
+    /// Content area quad.
     pub content: ElementQuad,
+    /// Padding area quad.
     pub padding: ElementQuad,
+    /// Border area quad.
     pub border: ElementQuad,
+    /// Margin area quad.
     pub margin: ElementQuad,
+    /// Width of the element.
     pub width: u32,
+    /// Height of the element.
     pub height: u32,
 }
 

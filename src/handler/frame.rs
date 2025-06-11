@@ -18,6 +18,7 @@ use chromiumoxide_cdp::cdp::{
     // js_protocol::runtime,
 };
 use chromiumoxide_types::{Method, MethodId, Request};
+use spider_fingerprint::BASE_CHROME_VERSION;
 
 use crate::error::DeadlineExceeded;
 use crate::handler::domworld::DOMWorld;
@@ -25,14 +26,10 @@ use crate::handler::http::HttpRequest;
 use crate::handler::REQUEST_TIMEOUT;
 use crate::{cmd::CommandChain, ArcHttpRequest};
 
-const EVALUATION_SCRIPT_URL: &str = "____chromiumoxide_utility_world___evaluation_script__";
-
-// lazy_static::lazy_static! {
-//     /// Spoof the runtime.
-//     static ref CHROME_SPOOF_RUNTIME: bool = {
-//         std::env::var("CHROME_SPOOF_RUNTIME").unwrap_or_else(|_| "false".to_string()) == "true"
-//     };
-// }
+lazy_static::lazy_static! {
+    /// Spoof the runtime.
+    static ref EVALUATION_SCRIPT_URL: String = format!("____{}___evaluation_script__", random_world_name(&BASE_CHROME_VERSION.to_string()));
+}
 
 /// Generate a collision-resistant world name using `id` + randomness.
 pub fn random_world_name(id: &str) -> String {
@@ -70,6 +67,7 @@ pub fn random_world_name(id: &str) -> String {
 /// Represents a frame on the page
 #[derive(Debug)]
 pub struct Frame {
+    /// The parent frame ID.
     parent_frame: Option<FrameId>,
     /// Cdp identifier of this frame
     id: FrameId,
@@ -85,6 +83,7 @@ pub struct Frame {
     name: Option<String>,
     /// The received lifecycle events
     lifecycle_events: HashSet<MethodId>,
+    /// The isolated world name.
     isolated_world_name: String,
 }
 
@@ -595,37 +594,42 @@ impl FrameManager {
 
         self.isolated_worlds.insert(world_name.to_string());
 
-        let cmd = AddScriptToEvaluateOnNewDocumentParams::builder()
-            .source(format!("//# sourceURL={EVALUATION_SCRIPT_URL}"))
+        if let Ok(cmd) = AddScriptToEvaluateOnNewDocumentParams::builder()
+            .source(format!("//# sourceURL={}", *EVALUATION_SCRIPT_URL))
             .world_name(world_name)
             .build()
-            .unwrap();
+        {
+            let mut cmds = Vec::with_capacity(self.frames.len() + 1);
+            let identifier = cmd.identifier();
 
-        let mut cmds = Vec::with_capacity(self.frames.len() + 1);
-
-        cmds.push((cmd.identifier(), serde_json::to_value(cmd).unwrap()));
-
-        let cm = self.frames.keys().filter_map(|id| {
-            if let Ok(cmd) = CreateIsolatedWorldParams::builder()
-                .frame_id(id.clone())
-                .grant_univeral_access(true)
-                .world_name(world_name)
-                .build()
-            {
-                let cm = (
-                    cmd.identifier(),
-                    serde_json::to_value(cmd).unwrap_or_default(),
-                );
-
-                Some(cm)
-            } else {
-                None
+            if let Ok(cmd) = serde_json::to_value(cmd) {
+                cmds.push((identifier, cmd));
             }
-        });
 
-        cmds.extend(cm);
+            let cm = self.frames.keys().filter_map(|id| {
+                if let Ok(cmd) = CreateIsolatedWorldParams::builder()
+                    .frame_id(id.clone())
+                    .grant_univeral_access(true)
+                    .world_name(world_name)
+                    .build()
+                {
+                    let cm = (
+                        cmd.identifier(),
+                        serde_json::to_value(cmd).unwrap_or_default(),
+                    );
 
-        Some(CommandChain::new(cmds, self.request_timeout))
+                    Some(cm)
+                } else {
+                    None
+                }
+            });
+
+            cmds.extend(cm);
+
+            Some(CommandChain::new(cmds, self.request_timeout))
+        } else {
+            None
+        }
     }
 }
 
