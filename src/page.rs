@@ -4,7 +4,7 @@ use std::sync::Arc;
 use chromiumoxide_cdp::cdp::browser_protocol::emulation::{
     MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
     SetGeolocationOverrideParams, SetLocaleOverrideParams, SetTimezoneOverrideParams,
-    UserAgentBrandVersion,
+    UserAgentBrandVersion, UserAgentMetadata,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::input::{DispatchDragEventType, DragData};
 use chromiumoxide_cdp::cdp::browser_protocol::network::{
@@ -564,7 +564,54 @@ impl Page {
         Ok(self)
     }
 
-    /// Allows overriding user agent with the given string.
+    /// Generate the user-agent metadata params
+    pub fn generate_user_agent_metadata(
+        default_params: &SetUserAgentOverrideParams,
+    ) -> Option<UserAgentMetadata> {
+        let ua_data = spider_fingerprint::spoof_user_agent::build_high_entropy_data(&Some(
+            &default_params.user_agent,
+        ));
+        let windows = ua_data.platform == "Windows";
+
+        let brands = ua_data
+            .full_version_list
+            .iter()
+            .map(|b| {
+                let b = b.clone();
+                UserAgentBrandVersion::new(b.brand, b.version)
+            })
+            .collect::<Vec<_>>();
+
+        let full_versions = ua_data
+            .full_version_list
+            .into_iter()
+            .map(|b| UserAgentBrandVersion::new(b.brand, b.version))
+            .collect::<Vec<_>>();
+
+        let user_agent_metadata_builder = emulation::UserAgentMetadata::builder()
+            .architecture(ua_data.architecture)
+            .bitness(ua_data.bitness)
+            .model(ua_data.model)
+            .platform_version(ua_data.platform_version)
+            .brands(brands)
+            .full_version_lists(full_versions)
+            .platform(ua_data.platform)
+            .mobile(ua_data.mobile);
+
+        let user_agent_metadata_builder = if windows {
+            user_agent_metadata_builder.wow64(ua_data.wow64_ness)
+        } else {
+            user_agent_metadata_builder
+        };
+
+        if let Ok(user_agent_metadata) = user_agent_metadata_builder.build() {
+            Some(user_agent_metadata)
+        } else {
+            None
+        }
+    }
+
+    /// Allows overriding the user-agent for the [network](https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setUserAgentOverride) and [emulation](https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setUserAgentOverride ) with the given string.
     pub async fn set_user_agent(
         &self,
         params: impl Into<SetUserAgentOverrideParams>,
@@ -579,48 +626,28 @@ impl Page {
         }
 
         if default_params.user_agent_metadata.is_none() {
-            let ua_data = spider_fingerprint::spoof_user_agent::build_high_entropy_data(&Some(
-                &default_params.user_agent,
-            ));
-            let windows = ua_data.platform == "Windows";
-
-            let brands = ua_data
-                .full_version_list
-                .iter()
-                .map(|b| {
-                    let b = b.clone();
-                    UserAgentBrandVersion::new(b.brand, b.version)
-                })
-                .collect::<Vec<_>>();
-
-            let full_versions = ua_data
-                .full_version_list
-                .into_iter()
-                .map(|b| UserAgentBrandVersion::new(b.brand, b.version))
-                .collect::<Vec<_>>();
-
-            let user_agent_metadata_builder = emulation::UserAgentMetadata::builder()
-                .architecture(ua_data.architecture)
-                .bitness(ua_data.bitness)
-                .model(ua_data.model)
-                .platform_version(ua_data.platform_version)
-                .brands(brands)
-                .full_version_lists(full_versions)
-                .platform(ua_data.platform)
-                .mobile(ua_data.mobile);
-
-            let user_agent_metadata_builder = if windows {
-                user_agent_metadata_builder.wow64(ua_data.wow64_ness)
-            } else {
-                user_agent_metadata_builder
-            };
-
-            if let Ok(user_agent_metadata) = user_agent_metadata_builder.build() {
+            let user_agent_metadata = Self::generate_user_agent_metadata(&default_params);
+            if let Some(user_agent_metadata) = user_agent_metadata {
                 default_params.user_agent_metadata = Some(user_agent_metadata);
             }
         }
 
-        self.execute(default_params).await?;
+        let default_params1 = default_params.clone();
+
+        let mut set_emulation_agent_override =
+            chromiumoxide_cdp::cdp::browser_protocol::emulation::SetUserAgentOverrideParams::new(
+                default_params1.user_agent,
+            );
+
+        set_emulation_agent_override.accept_language = default_params1.accept_language;
+        set_emulation_agent_override.platform = default_params1.platform;
+        set_emulation_agent_override.user_agent_metadata = default_params1.user_agent_metadata;
+
+        tokio::try_join!(
+            self.execute(default_params),
+            self.execute(set_emulation_agent_override)
+        )?;
+
         Ok(self)
     }
 
@@ -772,7 +799,11 @@ impl Page {
     }
 
     /// Performs a single mouse click event at the point's location and generate a marker.
-    pub(crate) async fn click_with_highlight_base(&self, point: Point, color: Rgba) -> Result<&Self> {
+    pub(crate) async fn click_with_highlight_base(
+        &self,
+        point: Point,
+        color: Rgba,
+    ) -> Result<&Self> {
         use chromiumoxide_cdp::cdp::browser_protocol::overlay::HighlightRectParams;
         let x = point.x.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64;
         let y = point.y.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64;
