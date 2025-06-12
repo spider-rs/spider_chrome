@@ -36,7 +36,7 @@ use crate::handler::domworld::DOMWorldKind;
 use crate::handler::httpfuture::HttpFuture;
 use crate::handler::target::{GetName, GetParent, GetUrl, TargetMessage};
 use crate::handler::PageInner;
-use crate::javascript::extract::{FULL_XML_SERIALIZER_JS, OUTER_HTML};
+use crate::javascript::extract::{generate_marker_js, FULL_XML_SERIALIZER_JS, OUTER_HTML};
 use crate::js::{Evaluation, EvaluationResult};
 use crate::layout::{Delta, Point, ScrollBehavior};
 use crate::listeners::{EventListenerRequest, EventStream};
@@ -771,6 +771,51 @@ impl Page {
         Ok(self)
     }
 
+    /// Performs a single mouse click event at the point's location and generate a marker.
+    pub(crate) async fn click_with_highlight_base(&self, point: Point, color: Rgba) -> Result<&Self> {
+        use chromiumoxide_cdp::cdp::browser_protocol::overlay::HighlightRectParams;
+        let x = point.x.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+        let y = point.y.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+
+        let highlight_params = HighlightRectParams {
+            x,
+            y,
+            width: 15,
+            height: 15,
+            color: Some(color),
+            outline_color: Some(Rgba::new(255, 255, 255)),
+        };
+
+        let _ = tokio::join!(self.click(point), self.execute(highlight_params));
+        Ok(self)
+    }
+
+    /// Performs a single mouse click event at the point's location and generate a highlight to the nearest element.
+    /// Make sure page.enable_overlay is called first.
+    pub async fn click_with_highlight(&self, point: Point) -> Result<&Self> {
+        let mut color = Rgba::new(255, 0, 0);
+        color.a = Some(1.0);
+        self.click_with_highlight_base(point, color).await?;
+        Ok(self)
+    }
+
+    /// Performs a single mouse click event at the point's location and generate a highlight to the nearest element with the color.
+    /// Make sure page.enable_overlay is called first.
+    pub async fn click_with_highlight_color(&self, point: Point, color: Rgba) -> Result<&Self> {
+        self.click_with_highlight_base(point, color).await?;
+        Ok(self)
+    }
+
+    /// Performs a single mouse click event at the point's location and generate a marker with pure JS. Useful for debugging.
+    pub async fn click_with_marker(&self, point: Point) -> Result<&Self> {
+        let _ = tokio::join!(
+            self.click(point),
+            self.evaluate(generate_marker_js(point.x, point.y))
+        );
+
+        Ok(self)
+    }
+
     /// Performs a double mouse click event at the point's location.
     ///
     /// This scrolls the point into view first, then executes a
@@ -1123,6 +1168,42 @@ impl Page {
     pub async fn reload(&self) -> Result<&Self> {
         self.execute(ReloadParams::default()).await?;
         self.wait_for_navigation().await
+    }
+
+    /// Enables Overlay domain notifications. Disabled by default.
+    /// See https://chromedevtools.github.io/devtools-protocol/tot/Overlay#method-enable
+    pub async fn enable_overlay(&self) -> Result<&Self> {
+        self.execute(browser_protocol::overlay::EnableParams::default())
+            .await?;
+        Ok(self)
+    }
+
+    /// Disables Overlay domain notifications. Disabled by default.
+    /// See https://chromedevtools.github.io/devtools-protocol/tot/Overlay#method-enable
+    pub async fn disable_overlay(&self) -> Result<&Self> {
+        self.execute(browser_protocol::overlay::DisableParams::default())
+            .await?;
+        Ok(self)
+    }
+
+    /// Enables Overlay domain paint rectangles. Disabled by default.
+    /// See https://chromedevtools.github.io/devtools-protocol/tot/Overlay/#method-setShowPaintRects
+    pub async fn enable_paint_rectangles(&self) -> Result<&Self> {
+        self.execute(browser_protocol::overlay::SetShowPaintRectsParams::new(
+            true,
+        ))
+        .await?;
+        Ok(self)
+    }
+
+    /// Disabled Overlay domain paint rectangles. Disabled by default.
+    /// See https://chromedevtools.github.io/devtools-protocol/tot/Overlay/#method-setShowPaintRects
+    pub async fn disable_paint_rectangles(&self) -> Result<&Self> {
+        self.execute(browser_protocol::overlay::SetShowPaintRectsParams::new(
+            false,
+        ))
+        .await?;
+        Ok(self)
     }
 
     /// Enables log domain. Enabled by default.
