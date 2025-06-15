@@ -111,6 +111,7 @@ pub mod fetcher {
 pub type ArcHttpRequest = Option<Arc<HttpRequest>>;
 
 #[cfg(not(feature = "simd"))]
-pub(crate) use serde_json;
+pub use serde_json;
 #[cfg(feature = "simd")]
-pub(crate) use sonic_rs as serde_json;
+pub use sonic_rs as serde_json;
+pub use serde;
