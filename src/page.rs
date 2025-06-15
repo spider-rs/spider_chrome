@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use chromiumoxide_cdp::cdp::browser_protocol::emulation::{
     MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
-    SetGeolocationOverrideParams, SetLocaleOverrideParams, SetTimezoneOverrideParams,
-    UserAgentBrandVersion, UserAgentMetadata,
+    SetGeolocationOverrideParams, SetHardwareConcurrencyOverrideParams, SetLocaleOverrideParams,
+    SetTimezoneOverrideParams, UserAgentBrandVersion, UserAgentMetadata,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::input::{DispatchDragEventType, DragData};
 use chromiumoxide_cdp::cdp::browser_protocol::network::{
@@ -1151,6 +1151,15 @@ impl Page {
     /// Brings page to front (activates tab)
     pub async fn bring_to_front(&self) -> Result<&Self> {
         self.execute(BringToFrontParams::default()).await?;
+        Ok(self)
+    }
+
+    /// Emulates hardware concurrency.
+    pub async fn emulate_hardware_concurrency(&self, hardware_concurrency: i64) -> Result<&Self> {
+        self.execute(SetHardwareConcurrencyOverrideParams::new(
+            hardware_concurrency,
+        ))
+        .await?;
         Ok(self)
     }
 
