@@ -65,29 +65,32 @@ macro_rules! advance_state {
 lazy_static::lazy_static! {
     /// Initial start command params.
     static ref INIT_COMMANDS_PARAMS: Vec<(chromiumoxide_types::MethodId, serde_json::Value)> = {
-        let attach = SetAutoAttachParams::builder()
+        if let Ok(attach) = SetAutoAttachParams::builder()
             .flatten(true)
             .auto_attach(true)
             .wait_for_debugger_on_start(true)
-            .build()
-            .unwrap();
-        let enable_performance = performance::EnableParams::default();
-        let disable_log = cdplog::DisableParams::default();
+            .build() {
+                let enable_performance = performance::EnableParams::default();
+                let disable_log = cdplog::DisableParams::default();
 
-        vec![
-                (
-                    attach.identifier(),
-                    serde_json::to_value(attach).unwrap_or_default(),
-                ),
-                (
-                    enable_performance.identifier(),
-                    serde_json::to_value(enable_performance).unwrap_or_default(),
-                ),
-                (
-                    disable_log.identifier(),
-                    serde_json::to_value(disable_log).unwrap_or_default(),
-                )
-            ]
+                vec![
+                        (
+                            attach.identifier(),
+                            serde_json::to_value(attach).unwrap_or_default(),
+                        ),
+                        (
+                            enable_performance.identifier(),
+                            serde_json::to_value(enable_performance).unwrap_or_default(),
+                        ),
+                        (
+                            disable_log.identifier(),
+                            serde_json::to_value(disable_log).unwrap_or_default(),
+                        )
+                    ]
+            } else {
+                vec![]
+            }
+
     };
 
     /// Attach to target commands
@@ -331,11 +334,15 @@ impl Target {
                         .session_id(ev.session_id.clone())
                         .build();
 
-                    self.queued_events.push_back(TargetEvent::Request(Request {
-                        method: detach_command.identifier(),
-                        session_id: self.session_id.clone().map(Into::into),
-                        params: serde_json::to_value(detach_command).unwrap_or_default(),
-                    }));
+                    let method = detach_command.identifier();
+
+                    if let Ok(params) = serde_json::to_value(detach_command) {
+                        self.queued_events.push_back(TargetEvent::Request(Request {
+                            method,
+                            session_id: self.session_id.clone().map(Into::into),
+                            params,
+                        }));
+                    }
                 }
             }
 
@@ -370,6 +377,7 @@ impl Target {
         }
         self.init_state = TargetInit::Closing;
         let close_target = CloseTargetParams::new(self.info.target_id.clone());
+
         TargetEvent::Request(Request {
             method: close_target.identifier(),
             session_id: self.session_id.clone().map(Into::into),

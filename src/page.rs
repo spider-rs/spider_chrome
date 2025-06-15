@@ -612,9 +612,12 @@ impl Page {
     }
 
     /// Allows overriding the user-agent for the [network](https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setUserAgentOverride) and [emulation](https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setUserAgentOverride ) with the given string.
-    pub async fn set_user_agent(
+    async fn set_user_agent_base(
         &self,
         params: impl Into<SetUserAgentOverrideParams>,
+        metadata: bool,
+        emulate: bool,
+        accept_language: Option<String>,
     ) -> Result<&Self> {
         let mut default_params: SetUserAgentOverrideParams = params.into();
 
@@ -625,30 +628,56 @@ impl Page {
             }
         }
 
-        if default_params.user_agent_metadata.is_none() {
+        default_params.accept_language = accept_language;
+
+        if default_params.user_agent_metadata.is_none() && metadata {
             let user_agent_metadata = Self::generate_user_agent_metadata(&default_params);
             if let Some(user_agent_metadata) = user_agent_metadata {
                 default_params.user_agent_metadata = Some(user_agent_metadata);
             }
         }
 
-        let default_params1 = default_params.clone();
+        if emulate {
+            let default_params1 = default_params.clone();
 
-        let mut set_emulation_agent_override =
-            chromiumoxide_cdp::cdp::browser_protocol::emulation::SetUserAgentOverrideParams::new(
-                default_params1.user_agent,
-            );
+            let mut set_emulation_agent_override =
+                chromiumoxide_cdp::cdp::browser_protocol::emulation::SetUserAgentOverrideParams::new(
+                    default_params1.user_agent,
+                );
 
-        set_emulation_agent_override.accept_language = default_params1.accept_language;
-        set_emulation_agent_override.platform = default_params1.platform;
-        set_emulation_agent_override.user_agent_metadata = default_params1.user_agent_metadata;
+            set_emulation_agent_override.accept_language = default_params1.accept_language;
+            set_emulation_agent_override.platform = default_params1.platform;
+            set_emulation_agent_override.user_agent_metadata = default_params1.user_agent_metadata;
 
-        tokio::try_join!(
-            self.execute(default_params),
-            self.execute(set_emulation_agent_override)
-        )?;
+            tokio::try_join!(
+                self.execute(default_params),
+                self.execute(set_emulation_agent_override)
+            )?;
+        } else {
+            self.execute(default_params).await?;
+        }
 
         Ok(self)
+    }
+
+    /// Allows overriding the user-agent for the [network](https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setUserAgentOverride) with the given string.
+    pub async fn set_user_agent(
+        &self,
+        params: impl Into<SetUserAgentOverrideParams>,
+    ) -> Result<&Self> {
+        self.set_user_agent_base(params, true, true, None).await
+    }
+
+    /// Allows overriding the user-agent for the [network](https://chromedevtools.github.io/devtools-protocol/tot/Network/#method-setUserAgentOverride), [emulation](https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setUserAgentOverride ), and userAgentMetadata with the given string.
+    pub async fn set_user_agent_advanced(
+        &self,
+        params: impl Into<SetUserAgentOverrideParams>,
+        metadata: bool,
+        emulate: bool,
+        accept_language: Option<String>,
+    ) -> Result<&Self> {
+        self.set_user_agent_base(params, metadata, emulate, accept_language)
+            .await
     }
 
     /// Returns the user agent of the browser
@@ -1199,6 +1228,22 @@ impl Page {
     pub async fn reload(&self) -> Result<&Self> {
         self.execute(ReloadParams::default()).await?;
         self.wait_for_navigation().await
+    }
+
+    /// Enables ServiceWorkers. Disabled by default.
+    /// See https://chromedevtools.github.io/devtools-protocol/tot/ServiceWorker#method-enable
+    pub async fn enable_service_workers(&self) -> Result<&Self> {
+        self.execute(browser_protocol::service_worker::EnableParams::default())
+            .await?;
+        Ok(self)
+    }
+
+    /// Disables ServiceWorker. Disabled by default.
+    /// See https://chromedevtools.github.io/devtools-protocol/tot/ServiceWorker#method-enable
+    pub async fn disable_service_workers(&self) -> Result<&Self> {
+        self.execute(browser_protocol::service_worker::DisableParams::default())
+            .await?;
+        Ok(self)
     }
 
     /// Enables Overlay domain notifications. Disabled by default.

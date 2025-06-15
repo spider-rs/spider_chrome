@@ -236,12 +236,11 @@ impl Handler {
                                 let event: EventTargetCreated = EventTargetCreated { target_info };
                                 self.on_target_created(event);
                                 let attach = AttachToTargetParams::new(target_id);
+                                let method = attach.identifier();
 
-                                let _ = self.conn.submit_command(
-                                    attach.identifier(),
-                                    None,
-                                    serde_json::to_value(attach).unwrap_or_default(),
-                                );
+                                if let Ok(params) = serde_json::to_value(attach) {
+                                    let _ = self.conn.submit_command(method, None, params);
+                                }
                             }
 
                             let _ = tx.send(Ok(results)).ok();

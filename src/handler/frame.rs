@@ -71,7 +71,9 @@ pub struct Frame {
     parent_frame: Option<FrameId>,
     /// Cdp identifier of this frame
     id: FrameId,
+    /// The main world.
     main_world: DOMWorld,
+    /// The secondary world.
     secondary_world: DOMWorld,
     loader_id: Option<LoaderId>,
     /// Current url of this frame

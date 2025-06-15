@@ -53,7 +53,7 @@ lazy_static::lazy_static! {
             m
         })
         .build()
-        .unwrap();
+        .expect("client to build");
 }
 
 /// A [`Browser`] is created when chromiumoxide connects to a Chromium instance.
@@ -784,7 +784,10 @@ impl BrowserConfig {
     }
 
     pub fn with_executable(path: impl AsRef<Path>) -> Self {
-        Self::builder().chrome_executable(path).build().unwrap()
+        Self::builder()
+            .chrome_executable(path)
+            .build()
+            .expect("path to executable exist")
     }
 }
 

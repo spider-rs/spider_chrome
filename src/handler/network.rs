@@ -71,7 +71,7 @@ lazy_static! {
     ];
 
     /// Determine if a script should be rendered in the browser by name.
-    pub static ref ALLOWED_MATCHER: AhoCorasick = AhoCorasick::new(JS_FRAMEWORK_ALLOW.iter()).unwrap();
+    pub static ref ALLOWED_MATCHER: AhoCorasick = AhoCorasick::new(JS_FRAMEWORK_ALLOW.iter()).expect("matcher to build");
 
     /// path of a js framework
     pub static ref JS_FRAMEWORK_PATH: phf::Set<&'static str> = {
