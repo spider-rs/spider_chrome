@@ -256,6 +256,12 @@ impl Page {
         Ok(())
     }
 
+    /// Enable page Content Security Policy by-passing.
+    pub async fn set_bypass_csp(&self, enabled: bool) -> Result<&Self> {
+        self.inner.set_bypass_csp(enabled).await?;
+        Ok(self)
+    }
+
     /// Sets `window.chrome` on frame creation and console.log methods.
     pub async fn hide_chrome(&self) -> Result<(), CdpError> {
         self.execute(AddScriptToEvaluateOnNewDocumentParams {

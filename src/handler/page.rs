@@ -19,7 +19,8 @@ use chromiumoxide_cdp::cdp::browser_protocol::input::{
     DispatchMouseEventParams, DispatchMouseEventType, DragData, MouseButton,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::page::{
-    FrameId, GetLayoutMetricsParams, GetLayoutMetricsReturns, PrintToPdfParams, Viewport,
+    FrameId, GetLayoutMetricsParams, GetLayoutMetricsReturns, PrintToPdfParams, SetBypassCspParams,
+    Viewport,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::target::{ActivateTargetParams, SessionId, TargetId};
 use chromiumoxide_cdp::cdp::js_protocol::runtime::{
@@ -543,6 +544,12 @@ impl PageInner {
             .execute(GetLayoutMetricsParams::default())
             .await?
             .result)
+    }
+
+    /// Enable page Content Security Policy by-passing.
+    pub async fn set_bypass_csp(&self, enabled: bool) -> Result<&Self> {
+        self.execute(SetBypassCspParams::new(enabled)).await?;
+        Ok(self)
     }
 
     /// Take a screenshot of the page.
