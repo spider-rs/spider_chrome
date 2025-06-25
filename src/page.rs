@@ -1050,6 +1050,19 @@ impl Page {
         Ok(self)
     }
 
+    /// Uses the `DispatchKeyEvent` mechanism to simulate pressing keyboard
+    /// keys with the modifier: Alt=1, Ctrl=2, Meta/Command=4, Shift=8\n(default: 0)..
+    pub async fn press_key_with_modifier(
+        &self,
+        input: impl AsRef<str>,
+        modifiers: i64,
+    ) -> Result<&Self> {
+        self.inner
+            .press_key_with_modifier(input, Some(modifiers))
+            .await?;
+        Ok(self)
+    }
+
     /// Dispatches a `DragEvent`, moving the element to the given `point`.
     ///
     /// `point.x` defines the horizontal target, and `point.y` the vertical mouse position.

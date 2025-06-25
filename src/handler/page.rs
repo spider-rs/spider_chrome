@@ -379,14 +379,33 @@ impl PageInner {
     /// keys::get_key_definition("Enter").unwrap())`.
     pub async fn type_str(&self, input: impl AsRef<str>) -> Result<&Self> {
         for c in input.as_ref().split("").filter(|s| !s.is_empty()) {
-            self.press_key(c).await?;
+            self._press_key(c, None).await?;
+        }
+        Ok(self)
+    }
+
+    /// This simulates pressing keys on the page.
+    ///
+    /// # Note The `input` is treated as series of `KeyDefinition`s, where each
+    /// char is inserted as a separate keystroke. So sending
+    /// `page.type_str("Enter")` will be processed as a series of single
+    /// keystrokes:  `["E", "n", "t", "e", "r"]`. To simulate pressing the
+    /// actual Enter key instead use `page.press_key(
+    /// keys::get_key_definition("Enter").unwrap())`.
+    pub async fn type_str_with_modifier(
+        &self,
+        input: impl AsRef<str>,
+        modifiers: Option<i64>,
+    ) -> Result<&Self> {
+        for c in input.as_ref().split("").filter(|s| !s.is_empty()) {
+            self._press_key(c, modifiers).await?;
         }
         Ok(self)
     }
 
     /// Uses the `DispatchKeyEvent` mechanism to simulate pressing keyboard
     /// keys.
-    pub async fn press_key(&self, key: impl AsRef<str>) -> Result<&Self> {
+    async fn _press_key(&self, key: impl AsRef<str>, modifiers: Option<i64>) -> Result<&Self> {
         let key = key.as_ref();
         let key_definition = keys::get_key_definition(key)
             .ok_or_else(|| CdpError::msg(format!("Key not found: {key}")))?;
@@ -411,6 +430,10 @@ impl PageInner {
             .windows_virtual_key_code(key_definition.key_code)
             .native_virtual_key_code(key_definition.key_code);
 
+        if let Some(modifiers) = modifiers {
+            cmd = cmd.modifiers(modifiers);
+        }
+
         if let Ok(cmd) = cmd.clone().r#type(key_down_event_type).build() {
             self.execute(cmd).await?;
         }
@@ -420,6 +443,22 @@ impl PageInner {
         }
 
         Ok(self)
+    }
+
+    /// Uses the `DispatchKeyEvent` mechanism to simulate pressing keyboard
+    /// keys.
+    pub async fn press_key(&self, key: impl AsRef<str>) -> Result<&Self> {
+        self._press_key(key, None).await
+    }
+
+    /// Uses the `DispatchKeyEvent` mechanism to simulate pressing keyboard
+    /// keys and modifiers.
+    pub async fn press_key_with_modifier(
+        &self,
+        key: impl AsRef<str>,
+        modifiers: Option<i64>,
+    ) -> Result<&Self> {
+        self._press_key(key, modifiers).await
     }
 
     /// Calls function with given declaration on the remote object with the

@@ -277,6 +277,30 @@ impl Element {
         Ok(self)
     }
 
+    /// Type the input
+    ///
+    /// # Example type text into an input element
+    ///
+    /// ```no_run
+    /// # use chromiumoxide::page::Page;
+    /// # use chromiumoxide::error::Result;
+    /// # async fn demo(page: Page) -> Result<()> {
+    ///     let element = page.find_element("input#searchInput").await?;
+    ///     element.click().await?.type_str("this goes into the input field").await?;
+    ///     # Ok(())
+    /// # }
+    /// ```
+    pub async fn type_str_with_modifier(
+        &self,
+        input: impl AsRef<str>,
+        modifiers: i64,
+    ) -> Result<&Self> {
+        self.tab
+            .type_str_with_modifier(input, Some(modifiers))
+            .await?;
+        Ok(self)
+    }
+
     /// Presses the key.
     ///
     /// # Example type text into an input element and hit enter
