@@ -52,6 +52,9 @@ lazy_static::lazy_static! {
 
             m
         })
+        .tcp_keepalive(Some(Duration::from_secs(5)))
+        .pool_idle_timeout(Some(Duration::from_secs(60)))
+        .pool_max_idle_per_host(10)
         .build()
         .expect("client to build");
 }
