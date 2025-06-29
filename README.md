@@ -5,7 +5,7 @@
 
 A concurrent high-level API to control Chrome or Firefox over the DevTools Protocol.
 
-This project is a fork of [chromiumoxide](https://github.com/mattsse/chromiumoxide) that primarily keeps CDP up to date, applies bug fixes, improves emulation, performance, and enables high-concurrency CDP capabilities.
+This project is a fork of [chromiumoxide](https://github.com/mattsse/chromiumoxide) that primarily keeps CDP up to date, applies bug fixes, improves emulation, adblocking, firewalls, performance, and enables high-concurrency CDP capabilities. The project was moved over from [spider](https://github.com/spider-rs/spider) causing the commits to reset.
 
 ## Usage
 
@@ -118,16 +118,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?,
 }
 ```
-
-## Known Issues
-
-* The rust files generated for the PDL files in [chromiumoxide_cdp](./chromiumoxide_cdp) don't compile when support for experimental types is manually turned off (`export CDP_NO_EXPERIMENTAL=true`). This is because the use of some experimental pdl types in the `*.pdl` files themselves are not marked as experimental.
-
-## Troubleshooting
-
-Q: A new chromium instance is being launched but then times out.
-
-A: Check that your chromium language settings are set to English. `chromiumoxide` tries to parse the debugging port from the chromium process output and that is limited to english.
 
 ## License
 
