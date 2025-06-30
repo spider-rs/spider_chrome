@@ -1828,19 +1828,16 @@ impl Page {
         Ok(self.evaluate(OUTER_HTML).await?.into_value()?)
     }
 
-    #[cfg(feature = "bytes")]
     /// Returns the HTML content of the page
     pub async fn content_bytes(&self) -> Result<Vec<u8>> {
         Ok(self.evaluate(OUTER_HTML).await?.into_bytes()?)
     }
 
-    #[cfg(feature = "bytes")]
     /// Returns the full serialized content of the page (HTML or XML)
     pub async fn content_bytes_xml(&self) -> Result<Vec<u8>> {
         Ok(self.evaluate(FULL_XML_SERIALIZER_JS).await?.into_bytes()?)
     }
 
-    #[cfg(feature = "bytes")]
     /// Returns the HTML outer html of the page
     pub async fn outer_html_bytes(&self) -> Result<Vec<u8>> {
         Ok(self.outer_html().await?.into())

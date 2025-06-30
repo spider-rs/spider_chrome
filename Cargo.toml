@@ -1,6 +1,6 @@
 [package]
 name = "spider_chrome"
-version = "2.37.122"
+version = "2.37.123"
 rust-version = "1.70"
 authors = ["j-mendez <jeff@spider.cloud>"]
 edition = "2021"
@@ -36,7 +36,6 @@ tokio = { version = "1", features = [
 tracing = "0.1"
 pin-project-lite = "0.2"
 dunce = "1"
-bytes = { version = "1", features = ["serde"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 lazy_static = "1"
 phf = { version = "0.11", features = ["macros"] }
@@ -78,7 +77,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 default = ["bytes", "simd", "default-tls", "serde0"]
 stream = ["tokio-tungstenite/stream"]
 fetcher = []
-bytes = ["dep:bytes"]
+bytes = []
 adblock = ["dep:adblock"]
 simd = ["dep:sonic-rs"]
 firewall = ["dep:spider_firewall"]
