@@ -57,6 +57,7 @@ fn get_by_env_var() -> Option<PathBuf> {
     None
 }
 
+#[cfg(feature = "auto-detect-executable")]
 fn get_by_name(options: &DetectionOptions) -> Option<PathBuf> {
     let default_apps = [
         ("chrome", true),
@@ -82,6 +83,11 @@ fn get_by_name(options: &DetectionOptions) -> Option<PathBuf> {
         }
     }
 
+    None
+}
+
+#[cfg(not(feature = "auto-detect-executable"))]
+fn get_by_name(_options: &DetectionOptions) -> Option<PathBuf> {
     None
 }
 
