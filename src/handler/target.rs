@@ -884,7 +884,7 @@ impl Default for TargetConfig {
     fn default() -> Self {
         Self {
             ignore_https_errors: true,
-            request_timeout: Duration::from_secs(REQUEST_TIMEOUT),
+            request_timeout: Duration::from_millis(REQUEST_TIMEOUT),
             viewport: Default::default(),
             request_intercept: false,
             cache_enabled: true,
