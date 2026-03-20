@@ -4,7 +4,7 @@ use super::blockers::{
     block_websites::block_xhr, ignore_script_embedded, ignore_script_xhr, ignore_script_xhr_media,
     xhr::IGNORE_XHR_ASSETS,
 };
-use crate::auth::Credentials;
+use crate::auth::{AuthScope, Credentials};
 #[cfg(feature = "_cache")]
 use crate::cache::BasicCachePolicy;
 use crate::cmd::CommandChain;
@@ -21,8 +21,9 @@ use chromiumoxide_cdp::cdp::browser_protocol::network::{
 };
 use chromiumoxide_cdp::cdp::browser_protocol::{
     fetch::{
-        self, AuthChallengeResponse, AuthChallengeResponseResponse, ContinueRequestParams,
-        ContinueWithAuthParams, DisableParams, EventAuthRequired, EventRequestPaused,
+        self, AuthChallengeResponse, AuthChallengeResponseResponse, AuthChallengeSource,
+        ContinueRequestParams, ContinueWithAuthParams, DisableParams, EventAuthRequired,
+        EventRequestPaused,
     },
     network::SetBypassServiceWorkerParams,
 };
@@ -294,6 +295,11 @@ pub struct NetworkManager {
     /// In other words: if this is `false` but `credentials.is_some()`, interception may still be
     /// enabled to satisfy auth challenges.
     pub(crate) user_request_interception_enabled: bool,
+    /// When `true`, Fetch interception includes the `Response` stage pattern (`*`),
+    /// allowing `Fetch.requestPaused` events to fire after the server responds.
+    /// This enables client-side listeners to inspect / cache response bodies via
+    /// `Fetch.getResponseBody` before forwarding them with `Fetch.continueResponse`.
+    pub(crate) intercept_response: bool,
     /// Hard kill-switch to block all network traffic.
     ///
     /// When `true`, the manager immediately blocks requests (typically via
@@ -372,6 +378,7 @@ impl NetworkManager {
             credentials: None,
             block_all: false,
             user_request_interception_enabled: false,
+            intercept_response: false,
             protocol_request_interception_enabled: false,
             offline: false,
             request_timeout,
@@ -598,16 +605,53 @@ impl NetworkManager {
     }
 
     fn update_protocol_request_interception(&mut self) {
-        let enabled = self.user_request_interception_enabled || self.credentials.is_some();
+        let enabled = self.user_request_interception_enabled
+            || self.credentials.is_some()
+            || self.intercept_response;
 
         if enabled == self.protocol_request_interception_enabled {
-            return;
+            // Even if already enabled, re-send if intercept_response just changed
+            // so patterns are updated. Skip only when truly no change.
+            if !enabled {
+                return;
+            }
         }
 
         if enabled {
-            self.push_cdp_request(ENABLE_FETCH.clone())
+            self.push_cdp_request(self.build_fetch_enable_params())
         } else {
             self.push_cdp_request(DisableParams::default())
+        }
+    }
+
+    /// Build `Fetch.enable` params dynamically based on current flags.
+    fn build_fetch_enable_params(&self) -> fetch::EnableParams {
+        let mut builder = fetch::EnableParams::builder()
+            .handle_auth_requests(self.credentials.is_some())
+            .pattern(
+                RequestPattern::builder()
+                    .url_pattern("*")
+                    .request_stage(RequestStage::Request)
+                    .build(),
+            );
+
+        if self.intercept_response {
+            builder = builder.pattern(
+                RequestPattern::builder()
+                    .url_pattern("*")
+                    .request_stage(RequestStage::Response)
+                    .build(),
+            );
+        }
+
+        builder.build()
+    }
+
+    /// Enable or disable response-stage interception.
+    pub fn set_intercept_response(&mut self, enabled: bool) {
+        if self.intercept_response != enabled {
+            self.intercept_response = enabled;
+            self.update_protocol_request_interception();
         }
     }
 
@@ -877,7 +921,17 @@ impl NetworkManager {
     /// On fetch request paused interception.
     #[inline]
     pub fn on_fetch_request_paused(&mut self, event: &EventRequestPaused) {
+        // User has taken over interception — leave the event for their listener.
         if self.user_request_interception_enabled && self.protocol_request_interception_enabled {
+            return;
+        }
+
+        // Response-stage event (has a status code): the request already went through,
+        // nothing to block/filter. Just forward the response to the page.
+        if event.response_status_code.is_some() {
+            self.push_cdp_request(
+                fetch::ContinueResponseParams::new(event.request_id.clone()),
+            );
             return;
         }
 
@@ -1196,23 +1250,38 @@ impl NetworkManager {
     }
 
     pub fn on_fetch_auth_required(&mut self, event: &EventAuthRequired) {
+        let challenge_is_proxy = event.auth_challenge.source == Some(AuthChallengeSource::Proxy);
+
         let response = if self
             .attempted_authentications
             .contains(event.request_id.as_ref())
         {
             AuthChallengeResponseResponse::CancelAuth
-        } else if self.credentials.is_some() {
-            self.attempted_authentications
-                .insert(event.request_id.clone().into());
-            AuthChallengeResponseResponse::ProvideCredentials
+        } else if let Some(creds) = &self.credentials {
+            let scope_matches = match creds.scope {
+                AuthScope::Any => true,
+                AuthScope::Proxy => challenge_is_proxy,
+                AuthScope::Server => !challenge_is_proxy,
+            };
+
+            if scope_matches {
+                self.attempted_authentications
+                    .insert(event.request_id.clone().into());
+                AuthChallengeResponseResponse::ProvideCredentials
+            } else {
+                AuthChallengeResponseResponse::Default
+            }
         } else {
             AuthChallengeResponseResponse::Default
         };
 
+        let provide = response == AuthChallengeResponseResponse::ProvideCredentials;
         let mut auth = AuthChallengeResponse::new(response);
-        if let Some(creds) = self.credentials.clone() {
-            auth.username = Some(creds.username);
-            auth.password = Some(creds.password);
+        if provide {
+            if let Some(creds) = self.credentials.clone() {
+                auth.username = Some(creds.username);
+                auth.password = Some(creds.password);
+            }
         }
         self.push_cdp_request(ContinueWithAuthParams::new(event.request_id.clone(), auth));
     }
