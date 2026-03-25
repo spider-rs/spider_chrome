@@ -61,7 +61,11 @@ impl<'a> DomainDatatype<'a> {
     }
 
     pub fn size(&self) -> usize {
-        todo!()
+        match self {
+            DomainDatatype::Type(_) => 0,
+            DomainDatatype::Commnad(cmd) => cmd.parameters.len() + cmd.returns.len(),
+            DomainDatatype::Event(ev) => ev.parameters.len(),
+        }
     }
 
     pub fn type_description_tokens(&self, domain_name: &str) -> TokenStream {

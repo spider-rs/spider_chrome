@@ -172,16 +172,12 @@ pub fn convert_headers(
 ) -> reqwest::header::HeaderMap {
     let mut header_map = reqwest::header::HeaderMap::new();
 
-    for (index, items) in headers.iter().enumerate() {
+    for items in headers.iter().take(1000) {
         if let Ok(head) = reqwest::header::HeaderValue::from_str(items.1) {
             use std::str::FromStr;
             if let Ok(key) = reqwest::header::HeaderName::from_str(items.0) {
                 header_map.insert(key, head);
             }
-        }
-        // mal headers
-        if index > 1000 {
-            break;
         }
     }
 

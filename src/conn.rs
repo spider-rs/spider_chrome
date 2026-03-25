@@ -205,7 +205,9 @@ impl<T: EventMessage> Connection<T> {
         while !self.pending_commands.is_empty() {
             match self.ws.poll_ready_unpin(cx) {
                 Poll::Ready(Ok(())) => {
-                    let cmd = self.pending_commands.pop_front().unwrap();
+                    let Some(cmd) = self.pending_commands.pop_front() else {
+                        break;
+                    };
                     tracing::trace!("Sending {:?}", cmd);
                     let msg = serde_json::to_string(&cmd)?;
                     self.ws.start_send_unpin(msg.into())?;

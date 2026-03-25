@@ -1377,21 +1377,18 @@ impl NetworkManager {
                     }
                 }
 
-                self.handle_request_redirect(
-                    &mut request,
-                    if let Some(redirect_location) = redirect_location {
-                        let mut redirect_resp = redirect_resp.clone();
+                {
+                    let mut redirect_resp = redirect_resp.clone();
 
+                    if let Some(redirect_location) = redirect_location {
                         if !redirect_location.is_empty() {
                             redirect_resp.headers.0["Location"] =
                                 serde_json::Value::String(redirect_location);
                         }
+                    }
 
-                        redirect_resp
-                    } else {
-                        redirect_resp.clone()
-                    },
-                );
+                    self.handle_request_redirect(&mut request, redirect_resp);
+                }
 
                 redirect_chain = std::mem::take(&mut request.redirect_chain);
                 redirect_chain.push(request);

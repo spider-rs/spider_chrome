@@ -42,11 +42,16 @@ pub(crate) async fn canonicalize_except_snap(path: PathBuf) -> std::io::Result<P
     let executable_cleaned: PathBuf = canonicalize(&path).await?;
 
     // Handle case where executable is provided by snap, ignore canonicalize result and only make path absolute
-    Ok(if executable_cleaned.to_str().unwrap().ends_with("/snap") {
-        absolute(path).unwrap()
-    } else {
-        executable_cleaned
-    })
+    Ok(
+        if executable_cleaned
+            .to_str()
+            .map_or(false, |s| s.ends_with("/snap"))
+        {
+            absolute(path)?
+        } else {
+            executable_cleaned
+        },
+    )
 }
 
 pub mod base64 {
