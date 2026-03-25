@@ -636,7 +636,7 @@ async fn handle_single_response(
                     // Use a match to avoid nested unwrap.
                     match url::Url::parse("http://localhost") {
                         Ok(u) => u,
-                        Err(_) => return,
+                        Err(_) => return Ok(()),
                     }
                 }
             };

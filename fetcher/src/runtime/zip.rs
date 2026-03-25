@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, Read, Seek};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -41,7 +42,7 @@ impl<R: Read + Seek> ZipArchive<R> {
             let mut file = self.by_index(i)?;
             let filepath = file
                 .enclosed_name()
-                .ok_or(ZipError::InvalidArchive("Invalid file path"))?;
+                .ok_or(ZipError::InvalidArchive(Cow::Borrowed("Invalid file path")))?;
             let outpath = directory.as_ref().join(filepath);
             if file.name().ends_with('/') {
                 fs::create_dir_all(&outpath)?;
@@ -76,7 +77,7 @@ impl<R: Read + Seek> ZipArchive<R> {
     }
 }
 
-fn read_symlink(entry: &mut ZipFile<'_>) -> ZipResult<Option<Vec<u8>>> {
+fn read_symlink<R: Read + ?Sized>(entry: &mut ZipFile<'_, R>) -> ZipResult<Option<Vec<u8>>> {
     if let Some(mode) = entry.unix_mode() {
         const S_IFLNK: u32 = 0o120000; // symbolic link
         if mode & S_IFLNK == S_IFLNK {
@@ -102,7 +103,7 @@ fn create_symlink(link_target: Vec<u8>, link_path: &Path) -> ZipResult<()> {
 fn create_symlink(link_target: Vec<u8>, link_path: &Path) -> ZipResult<()> {
     // Only supports UTF-8 paths which is enough for our usecase
     let link_target = String::from_utf8(link_target)
-        .map_err(|_| ZipError::InvalidArchive("Invalid synmlink target name"))?;
+        .map_err(|_| ZipError::InvalidArchive(Cow::Borrowed("Invalid symlink target name")))?;
     std::os::windows::fs::symlink_file(link_target, link_path)?;
 
     Ok(())
