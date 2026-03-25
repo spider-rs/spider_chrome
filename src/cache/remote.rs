@@ -309,6 +309,15 @@ pub async fn clear_local_session_cache(cache_key: &str) {
     LOCAL_SESSION_CACHE.remove(cache_key);
 }
 
+/// Maximum number of top-level site keys in the local session cache.
+/// Each site key maps to a sub-map of resource entries. This cap prevents
+/// unbounded memory growth when crawling many distinct sites in a single
+/// process lifetime. The oldest entries are dropped in bulk when exceeded.
+const SESSION_CACHE_MAX_SITES: usize = 2_000;
+
+/// Maximum number of resource entries per site key.
+const SESSION_CACHE_MAX_PER_SITE: usize = 10_000;
+
 /// Insert the item into the dashmap
 pub fn session_cache_insert(
     cache_key: &str,
@@ -320,10 +329,26 @@ pub fn session_cache_insert(
 
     match LOCAL_SESSION_CACHE.entry(cache_key.to_string()) {
         Entry::Occupied(mut occ) => {
-            occ.get_mut()
-                .insert(entry_key.into(), (http_res, cache_policy));
+            let inner = occ.get_mut();
+            // Cap per-site entries to avoid a single site exhausting memory.
+            if inner.len() < SESSION_CACHE_MAX_PER_SITE {
+                inner.insert(entry_key.into(), (http_res, cache_policy));
+            }
         }
         Entry::Vacant(vac) => {
+            // If we've hit the global cap, shed ~25 % of entries (cheap bulk
+            // eviction without requiring an LRU structure).
+            if LOCAL_SESSION_CACHE.len() >= SESSION_CACHE_MAX_SITES {
+                let to_remove: Vec<String> = LOCAL_SESSION_CACHE
+                    .iter()
+                    .take(SESSION_CACHE_MAX_SITES / 4)
+                    .map(|r| r.key().clone())
+                    .collect();
+                for key in to_remove {
+                    LOCAL_SESSION_CACHE.remove(&key);
+                }
+            }
+
             let mut m: HashMap<String, (http_cache_reqwest::HttpResponse, CachePolicy)> =
                 HashMap::new();
 

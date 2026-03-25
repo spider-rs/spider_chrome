@@ -131,13 +131,17 @@ pub trait Method {
         match self.identifier() {
             Cow::Borrowed(id) => {
                 let mut iter = id.split('.');
-                (iter.next().unwrap().into(), iter.next().unwrap().into())
+                let domain = iter.next().unwrap_or_default();
+                let method = iter.next().unwrap_or_default();
+                (domain.into(), method.into())
             }
             Cow::Owned(id) => {
                 let mut iter = id.split('.');
+                let domain = iter.next().unwrap_or_default();
+                let method = iter.next().unwrap_or_default();
                 (
-                    Cow::Owned(iter.next().unwrap().into()),
-                    Cow::Owned(iter.next().unwrap().into()),
+                    Cow::Owned(domain.into()),
+                    Cow::Owned(method.into()),
                 )
             }
         }

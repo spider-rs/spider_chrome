@@ -39,7 +39,7 @@ pub use spider_network_blocker::scripts::{
 };
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 lazy_static! {
     /// General patterns for popular libraries and resources
@@ -232,6 +232,12 @@ pub(crate) fn is_redirect_status(status: i64) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
+/// How long a buffered `requests_will_be_sent` / `request_id_to_interception_id`
+/// entry may linger before being evicted. 30 seconds is generous — the CDP
+/// round-trip that reconciles the two racing events normally completes in
+/// milliseconds.
+const STALE_BUFFER_SECS: u64 = 30;
+
 #[derive(Debug)]
 /// The base network manager.
 pub struct NetworkManager {
@@ -256,8 +262,8 @@ pub struct NetworkManager {
     ///
     /// When Fetch interception is enabled, `requestPaused` and `requestWillBeSent` can race.
     /// We buffer `requestWillBeSent` here until we can attach the `InterceptionId`.
-    // TODO put event in an Arc?
-    requests_will_be_sent: HashMap<RequestId, EventRequestWillBeSent>,
+    /// Entries older than `STALE_BUFFER_SECS` are evicted to prevent unbounded growth.
+    requests_will_be_sent: HashMap<RequestId, (EventRequestWillBeSent, Instant)>,
     /// Extra HTTP headers to apply to subsequent network requests via CDP.
     ///
     /// This map is mirrored from user-supplied headers but stripped of proxy auth headers
@@ -268,7 +274,8 @@ pub struct NetworkManager {
     /// When `Fetch.requestPaused` fires before `Network.requestWillBeSent`, we temporarily
     /// store the interception id here so it can be attached to the `HttpRequest` once the
     /// network request is observed.
-    request_id_to_interception_id: HashMap<RequestId, InterceptionId>,
+    /// Entries older than `STALE_BUFFER_SECS` are evicted to prevent unbounded growth.
+    request_id_to_interception_id: HashMap<RequestId, (InterceptionId, Instant)>,
     /// Whether the user has disabled the browser cache.
     ///
     /// This is surfaced via `Network.setCacheDisabled(true/false)` and toggled through
@@ -525,6 +532,32 @@ impl NetworkManager {
     /// The next event to handle.
     pub fn poll(&mut self) -> Option<NetworkEvent> {
         self.queued_events.pop_front()
+    }
+
+    /// Evict stale entries from the race-condition buffers and from
+    /// `attempted_authentications`. Call this periodically (e.g. from the
+    /// handler's eviction tick) so that lost CDP events cannot cause unbounded
+    /// map growth.
+    pub fn evict_stale_entries(&mut self) {
+        let cutoff = Instant::now() - Duration::from_secs(STALE_BUFFER_SECS);
+
+        self.requests_will_be_sent.retain(|_, (_, ts)| *ts > cutoff);
+        self.request_id_to_interception_id
+            .retain(|_, (_, ts)| *ts > cutoff);
+
+        // `attempted_authentications` entries reference interception IDs that
+        // are cleaned up on loading-finished / loading-failed. If those events
+        // are lost, the set grows forever. Cross-reference with `requests`:
+        // any interception ID that no longer appears in a live request is stale.
+        if !self.attempted_authentications.is_empty() {
+            let live: HashSet<&str> = self
+                .requests
+                .values()
+                .filter_map(|r| r.interception_id.as_ref().map(|id| id.as_ref()))
+                .collect();
+            self.attempted_authentications
+                .retain(|id| live.contains(id.as_ref()));
+        }
     }
 
     /// Get the extra headers.
@@ -891,13 +924,15 @@ impl NetworkManager {
         }
 
         if let Some(network_id) = event.network_id.as_ref() {
-            if let Some(request_will_be_sent) =
+            if let Some((request_will_be_sent, _)) =
                 self.requests_will_be_sent.remove(network_id.as_ref())
             {
                 self.on_request(&request_will_be_sent, Some(event.request_id.clone().into()));
             } else {
-                self.request_id_to_interception_id
-                    .insert(network_id.clone(), event.request_id.clone().into());
+                self.request_id_to_interception_id.insert(
+                    network_id.clone(),
+                    (event.request_id.clone().into(), Instant::now()),
+                );
             }
         }
 
@@ -1243,15 +1278,14 @@ impl NetworkManager {
     /// Request interception doesn't happen for data URLs with Network Service.
     pub fn on_request_will_be_sent(&mut self, event: &EventRequestWillBeSent) {
         if self.protocol_request_interception_enabled && !event.request.url.starts_with("data:") {
-            if let Some(interception_id) = self
+            if let Some((interception_id, _)) = self
                 .request_id_to_interception_id
                 .remove(event.request_id.as_ref())
             {
                 self.on_request(event, Some(interception_id));
             } else {
-                // TODO remove the clone for event
                 self.requests_will_be_sent
-                    .insert(event.request_id.clone(), event.clone());
+                    .insert(event.request_id.clone(), (event.clone(), Instant::now()));
             }
         } else {
             self.on_request(event, None);

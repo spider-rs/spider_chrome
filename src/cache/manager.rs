@@ -629,8 +629,17 @@ async fn handle_single_response(
         // serve this resource on subsequent navigations in the same session,
         // and so the dedup check at the top of this function works.
         {
-            let parsed_url = url::Url::parse(url.as_str())
-                .unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
+            let parsed_url = match url::Url::parse(url.as_str()) {
+                Ok(u) => u,
+                Err(_) => {
+                    // SAFETY: "http://localhost" is always a valid URL.
+                    // Use a match to avoid nested unwrap.
+                    match url::Url::parse("http://localhost") {
+                        Ok(u) => u,
+                        Err(_) => return,
+                    }
+                }
+            };
 
             let uri: http::uri::Uri = url.as_str().parse().unwrap_or_default();
 

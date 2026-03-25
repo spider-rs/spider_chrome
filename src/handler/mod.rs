@@ -741,6 +741,10 @@ impl Stream for Handler {
             if pin.evict_command_timeout.poll_ready(cx) {
                 // evict all commands that timed out
                 pin.evict_timed_out_commands(now);
+                // evict stale network race-condition buffers
+                for t in pin.targets.values_mut() {
+                    t.network_manager.evict_stale_entries();
+                }
             }
 
             if pin.budget_exhausted {
