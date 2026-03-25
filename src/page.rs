@@ -30,9 +30,9 @@ use chromiumoxide_cdp::cdp::js_protocol::runtime::{
 use chromiumoxide_cdp::cdp::{browser_protocol, IntoEventKind};
 use chromiumoxide_types::*;
 use futures_util::{stream, StreamExt};
+use spider_fingerprint::configs::{AgentOs, Tier};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot::channel as oneshot_channel;
-use spider_fingerprint::configs::{AgentOs, Tier};
 
 use crate::auth::Credentials;
 use crate::element::Element;
@@ -1287,9 +1287,9 @@ impl Page {
     pub async fn find_xpath(&self, selector: impl Into<String>) -> Result<Element> {
         self.get_document().await?;
         let node_ids = self.inner.find_xpaths(selector).await?;
-        let node_id = *node_ids
-            .first()
-            .ok_or(CdpError::msg("No element found matching the given xpath selector"))?;
+        let node_id = *node_ids.first().ok_or(CdpError::msg(
+            "No element found matching the given xpath selector",
+        ))?;
         Element::new(Arc::clone(&self.inner), node_id).await
     }
 

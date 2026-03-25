@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::iter::FromIterator;
 use std::time::{Duration, Instant};
 
-use tokio::sync::oneshot::Sender as OneshotSender;
-use std::task::Poll;
 use serde::Serialize;
+use std::task::Poll;
+use tokio::sync::oneshot::Sender as OneshotSender;
 
 use chromiumoxide_cdp::cdp::browser_protocol::page::NavigateParams;
 use chromiumoxide_cdp::cdp::browser_protocol::target::SessionId;

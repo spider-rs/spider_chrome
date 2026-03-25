@@ -185,9 +185,7 @@ impl EventListener {
 
     /// Drains all queued events, sending them synchronously via the unbounded channel.
     /// Returns `Err` if the receiver has been dropped.
-    pub fn flush(
-        &mut self,
-    ) -> std::result::Result<(), mpsc::error::SendError<Arc<dyn Event>>> {
+    pub fn flush(&mut self) -> std::result::Result<(), mpsc::error::SendError<Arc<dyn Event>>> {
         while let Some(event) = self.queued_events.pop_front() {
             self.listener.send(event)?;
         }

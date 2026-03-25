@@ -899,10 +899,7 @@ mod tests {
 
         // Attach a child frame that has NOT received "load" (e.g. a stuck ad iframe).
         let child_id = FrameId::new("child-ad");
-        let child = Frame::with_parent(
-            child_id.clone(),
-            fm.frames.get_mut(&main_id).unwrap(),
-        );
+        let child = Frame::with_parent(child_id.clone(), fm.frames.get_mut(&main_id).unwrap());
         fm.frames.insert(child_id, child);
 
         // Build a watcher that waits for "load" on the main frame.

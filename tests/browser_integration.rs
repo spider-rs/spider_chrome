@@ -56,9 +56,7 @@ fn browser_like_headed_config(test_name: &str) -> BrowserConfig {
 
 async fn launch_with_handler(config: BrowserConfig) -> Browser {
     let (browser, mut handler) = Browser::launch(config).await.expect("launch browser");
-    let _handle = tokio::spawn(async move {
-        while let Some(_event) = handler.next().await {}
-    });
+    let _handle = tokio::spawn(async move { while let Some(_event) = handler.next().await {} });
     browser
 }
 
@@ -67,12 +65,18 @@ async fn open_about_blank_with_timeout(
     timeout_secs: u64,
 ) -> Result<(), String> {
     let browser = launch_with_handler(config).await;
-    let page = timeout(Duration::from_secs(timeout_secs), browser.new_page("about:blank"))
-        .await
-        .map_err(|_| "new_page(about:blank) timed out".to_string())?
-        .map_err(|err| format!("new_page(about:blank) failed: {err}"))?;
+    let page = timeout(
+        Duration::from_secs(timeout_secs),
+        browser.new_page("about:blank"),
+    )
+    .await
+    .map_err(|_| "new_page(about:blank) timed out".to_string())?
+    .map_err(|err| format!("new_page(about:blank) failed: {err}"))?;
 
-    let url = page.url().await.map_err(|err| format!("url() failed: {err}"))?;
+    let url = page
+        .url()
+        .await
+        .map_err(|err| format!("url() failed: {err}"))?;
     if url.as_deref() != Some("about:blank") {
         return Err(format!("unexpected URL: {url:?}"));
     }
@@ -80,21 +84,15 @@ async fn open_about_blank_with_timeout(
     Ok(())
 }
 
-async fn retried_open_start_page(
-    browser: &mut Browser,
-) -> Result<chromiumoxide::Page, String> {
+async fn retried_open_start_page(browser: &mut Browser) -> Result<chromiumoxide::Page, String> {
     let create_timeout = Duration::from_secs(30);
 
     for attempt in 1..=2 {
-        eprintln!(
-            "[chromey test] Creating initial page (attempt {attempt}/2)"
-        );
+        eprintln!("[chromey test] Creating initial page (attempt {attempt}/2)");
 
         match timeout(create_timeout, browser.new_page("about:blank")).await {
             Ok(Ok(page)) => {
-                eprintln!(
-                    "[chromey test] Created initial page on attempt {attempt}"
-                );
+                eprintln!("[chromey test] Created initial page on attempt {attempt}");
                 return Ok(page);
             }
             Ok(Err(err)) => {
@@ -140,9 +138,7 @@ async fn about_blank_page_creation_resolves() {
 
     let (browser, mut handler) = Browser::launch(config).await.expect("launch browser");
 
-    let _handle = tokio::spawn(async move {
-        while let Some(_event) = handler.next().await {}
-    });
+    let _handle = tokio::spawn(async move { while let Some(_event) = handler.next().await {} });
 
     let page = browser
         .new_page("about:blank")
@@ -192,8 +188,7 @@ async fn browser_like_startup_discovery_then_new_page_resolves() {
         return;
     }
 
-    let mut browser =
-        launch_with_handler(browser_like_config("browser-like-discovery")).await;
+    let mut browser = launch_with_handler(browser_like_config("browser-like-discovery")).await;
 
     let targets = timeout(Duration::from_secs(10), browser.fetch_targets())
         .await
@@ -224,8 +219,7 @@ async fn browser_like_headed_about_blank_page_creation_resolves() {
         return;
     }
 
-    let browser =
-        launch_with_handler(browser_like_headed_config("browser-like-headed")).await;
+    let browser = launch_with_handler(browser_like_headed_config("browser-like-headed")).await;
 
     let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
         .await

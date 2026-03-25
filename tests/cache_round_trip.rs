@@ -679,7 +679,9 @@ async fn test_cache_policy_uses_correct_headers() {
 
     {
         let s = store.lock().await;
-        let entries = s.get(&cache_site).expect("remote server should have the entry");
+        let entries = s
+            .get(&cache_site)
+            .expect("remote server should have the entry");
         assert!(!entries.is_empty());
 
         let entry = &entries[0];

@@ -57,10 +57,7 @@ impl<T: EventMessage + Unpin> Connection<T> {
         Self::connect_with_retries(debug_ws_url, DEFAULT_CONNECTION_RETRIES).await
     }
 
-    pub async fn connect_with_retries(
-        debug_ws_url: impl AsRef<str>,
-        retries: u32,
-    ) -> Result<Self> {
+    pub async fn connect_with_retries(debug_ws_url: impl AsRef<str>, retries: u32) -> Result<Self> {
         let mut config = WebSocketConfig::default();
 
         if !*WEBSOCKET_DEFAULTS {

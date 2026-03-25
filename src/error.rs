@@ -4,10 +4,10 @@ use std::process::ExitStatus;
 use std::time::Instant;
 
 use base64::DecodeError;
+use chromiumoxide_cdp::cdp::browser_protocol::page::FrameId;
 use thiserror::Error;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message;
-use chromiumoxide_cdp::cdp::browser_protocol::page::FrameId;
 
 use crate::handler::frame::NavigationError;
 use chromiumoxide_cdp::cdp::js_protocol::runtime::ExceptionDetails;

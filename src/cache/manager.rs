@@ -385,9 +385,7 @@ pub async fn put_hybrid_cache(
 
             if super::dump_remote::worke_inited() {
                 if !super::dump_remote::try_enqueue(job) {
-                    tracing::debug!(
-                        "remote dump skipped (worker not initialized or queue full)"
-                    );
+                    tracing::debug!("remote dump skipped (worker not initialized or queue full)");
                 }
             } else {
                 if let Err(err) = super::dump_remote::enqueue(job).await {

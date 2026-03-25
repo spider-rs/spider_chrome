@@ -7,13 +7,13 @@ use chromiumoxide_types::{CallId, Message, Method, Response};
 use chromiumoxide_types::{MethodId, Request as CdpRequest};
 use fnv::FnvHashMap;
 use futures_util::Stream;
-use std::task::{Context, Poll};
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot::Sender as OneshotSender;
 use hashbrown::{HashMap, HashSet};
 use spider_network_blocker::intercept_manager::NetworkInterceptManager;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::oneshot::Sender as OneshotSender;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::Error;
 
@@ -939,8 +939,8 @@ mod tests {
             .expect("target info");
         let mut target = Target::new(info, TargetConfig::default(), BrowserContext::default());
         let method: MethodId = AttachToTargetParams::IDENTIFIER.into();
-        let result =
-            serde_json::to_value(AttachToTargetReturns::new("session-1".to_string())).expect("attach result");
+        let result = serde_json::to_value(AttachToTargetReturns::new("session-1".to_string()))
+            .expect("attach result");
         let resp = Response {
             id: CallId::new(1),
             result: Some(result),

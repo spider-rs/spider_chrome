@@ -48,10 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .event_listener::<EventRequestWillBeSent>()
         .await
         .unwrap();
-    let mut request_paused = page
-        .event_listener::<EventRequestPaused>()
-        .await
-        .unwrap();
+    let mut request_paused = page.event_listener::<EventRequestPaused>().await.unwrap();
     let intercept_page = page.clone();
     let intercept_handle = tokio::task::spawn(async move {
         let mut resolutions: HashMap<network::RequestId, InterceptResolution> = HashMap::new();

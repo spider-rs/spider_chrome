@@ -134,25 +134,36 @@ impl Browser {
             let mut discovered = false;
 
             for attempt in 0..=retries {
+                let retry = || async {
+                    if attempt < retries {
+                        let backoff_ms = 50u64 * 3u64.saturating_pow(attempt);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                };
+
                 match REQUEST_CLIENT.get(&version_url).send().await {
-                    Ok(req) => {
-                        if let Ok(b) = req.bytes().await {
-                            if let Ok(connection) =
-                                crate::serde_json::from_slice::<Box<BrowserConnection>>(&b)
-                            {
-                                if !connection.web_socket_debugger_url.is_empty() {
+                    Ok(req) => match req.bytes().await {
+                        Ok(b) => {
+                            match crate::serde_json::from_slice::<Box<BrowserConnection>>(&b) {
+                                Ok(connection)
+                                    if !connection.web_socket_debugger_url.is_empty() =>
+                                {
                                     debug_ws_url = connection.web_socket_debugger_url;
+                                    discovered = true;
+                                    break;
+                                }
+                                _ => {
+                                    // JSON parse failed or webSocketDebuggerUrl was empty — retry
+                                    retry().await;
                                 }
                             }
                         }
-                        discovered = true;
-                        break;
-                    }
-                    Err(_) => {
-                        if attempt < retries {
-                            let backoff_ms = 50u64 * 3u64.saturating_pow(attempt);
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        Err(_) => {
+                            retry().await;
                         }
+                    },
+                    Err(_) => {
+                        retry().await;
                     }
                 }
             }
@@ -247,8 +258,8 @@ impl Browser {
                     // already exited, do nothing, may happen if the browser crashed
                 } else {
                     // the process is still alive, kill it and wait for exit (avoid zombie processes)
-                    child.kill().await.expect("`Browser::launch` failed but could not clean-up the child process (`kill`)");
-                    child.wait().await.expect("`Browser::launch` failed but could not clean-up the child process (`wait`)");
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
                 }
                 return Err(e);
             }
@@ -310,9 +321,7 @@ impl Browser {
     pub async fn fetch_targets(&mut self) -> Result<Vec<TargetInfo>> {
         let (tx, rx) = oneshot_channel();
 
-        self.sender
-            .send(HandlerMessage::FetchTargets(tx))
-            .await?;
+        self.sender.send(HandlerMessage::FetchTargets(tx)).await?;
 
         rx.await?
     }
@@ -326,9 +335,7 @@ impl Browser {
     pub async fn close(&self) -> Result<CloseReturns> {
         let (tx, rx) = oneshot_channel();
 
-        self.sender
-            .send(HandlerMessage::CloseBrowser(tx))
-            .await?;
+        self.sender.send(HandlerMessage::CloseBrowser(tx)).await?;
 
         rx.await?
     }
@@ -509,9 +516,7 @@ impl Browser {
         let method = cmd.identifier();
         let msg = CommandMessage::new(cmd, tx)?;
 
-        self.sender
-            .send(HandlerMessage::Command(msg))
-            .await?;
+        self.sender.send(HandlerMessage::Command(msg)).await?;
         let resp = rx.await??;
         to_command_response::<T>(resp, method)
     }
@@ -601,9 +606,7 @@ impl Browser {
     /// Return all of the pages of the browser
     pub async fn pages(&self) -> Result<Vec<Page>> {
         let (tx, rx) = oneshot_channel();
-        self.sender
-            .send(HandlerMessage::GetPages(tx))
-            .await?;
+        self.sender.send(HandlerMessage::GetPages(tx)).await?;
         Ok(rx.await?)
     }
 
@@ -735,7 +738,15 @@ async fn ws_url_from_output(
     timeout_fut: impl Future<Output = ()> + Unpin,
 ) -> Result<String> {
     use tokio::io::AsyncBufReadExt;
-    let stderr = child_process.stderr.take().expect("no stderror");
+    let stderr = match child_process.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            return Err(CdpError::LaunchIo(
+                io::Error::new(io::ErrorKind::NotFound, "browser process has no stderr"),
+                BrowserStderr::new(Vec::new()),
+            ));
+        }
+    };
     let mut stderr_bytes = Vec::<u8>::new();
     let mut buf = tokio::io::BufReader::new(stderr);
     let mut timeout_fut = timeout_fut;
@@ -962,10 +973,9 @@ impl BrowserConfig {
 
     /// Launch with the executable path.
     pub fn with_executable(path: impl AsRef<Path>) -> Self {
-        Self::builder()
-            .chrome_executable(path)
-            .build()
-            .expect("path to executable exist")
+        // SAFETY: build() only fails when no executable is provided,
+        // but we always provide one via chrome_executable().
+        Self::builder().chrome_executable(path).build().unwrap()
     }
 }
 
