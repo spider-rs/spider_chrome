@@ -340,6 +340,87 @@ async fn browser_like_about_blank_survives_tokio_churn() {
     }
 }
 
+/// Verify that `set_content` works on an `about:blank` page.
+///
+/// This is the regression test for <https://github.com/spider-rs/chromey/issues/4>
+/// where `set_content` failed with:
+///   "Either objectId or executionContextId or uniqueContextId must be specified"
+/// because the secondary (isolated) execution context was not available.
+#[tokio::test]
+async fn set_content_on_about_blank_succeeds() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch_with_handler(browser_like_config("set-content-about-blank")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    let html = r#"<html><body><h1 id="greeting">Hello from set_content</h1></body></html>"#;
+
+    timeout(Duration::from_secs(15), page.set_content(html))
+        .await
+        .expect("set_content should not time out")
+        .expect("set_content should succeed");
+
+    // Verify the content was actually set by reading it back.
+    let content = timeout(Duration::from_secs(10), page.content())
+        .await
+        .expect("content() should not time out")
+        .expect("content() should succeed");
+
+    assert!(
+        content.contains("Hello from set_content"),
+        "page content should contain the HTML we set, got: {content}"
+    );
+}
+
+/// Verify that calling `set_content` twice works (replaces prior content).
+#[tokio::test]
+async fn set_content_twice_replaces_content() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch_with_handler(browser_like_config("set-content-twice")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    let html1 = r#"<html><body><h1>First</h1></body></html>"#;
+    timeout(Duration::from_secs(15), page.set_content(html1))
+        .await
+        .expect("first set_content should not time out")
+        .expect("first set_content should succeed");
+
+    let html2 = r#"<html><body><p>Second</p></body></html>"#;
+    timeout(Duration::from_secs(15), page.set_content(html2))
+        .await
+        .expect("second set_content should not time out")
+        .expect("second set_content should succeed");
+
+    let content = timeout(Duration::from_secs(10), page.content())
+        .await
+        .expect("content() should not time out")
+        .expect("content() should succeed");
+
+    assert!(
+        content.contains("Second"),
+        "page content should contain the second HTML, got: {content}"
+    );
+    assert!(
+        !content.contains("First"),
+        "page content should not contain the first HTML, got: {content}"
+    );
+}
+
 /// Navigate to a real-world URL that may involve cross-origin redirects
 /// (e.g. adding `www.` prefix or CDN routing). This exercises the fix for
 /// navigation watchers losing track of the main frame when its ID changes

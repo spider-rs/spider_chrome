@@ -24,7 +24,7 @@ use chromiumoxide_cdp::cdp::browser_protocol::{dom::*, emulation};
 use chromiumoxide_cdp::cdp::js_protocol;
 use chromiumoxide_cdp::cdp::js_protocol::debugger::GetScriptSourceParams;
 use chromiumoxide_cdp::cdp::js_protocol::runtime::{
-    AddBindingParams, CallArgument, CallFunctionOnParams, EvaluateParams, ExecutionContextId,
+    AddBindingParams, CallFunctionOnParams, EvaluateParams, ExecutionContextId,
     RemoteObjectType, ScriptId,
 };
 use chromiumoxide_cdp::cdp::{browser_protocol, IntoEventKind};
@@ -38,7 +38,6 @@ use crate::auth::Credentials;
 use crate::element::Element;
 use crate::error::{CdpError, Result};
 use crate::handler::commandfuture::CommandFuture;
-use crate::handler::domworld::DOMWorldKind;
 use crate::handler::httpfuture::HttpFuture;
 use crate::handler::target::{GetName, GetParent, GetUrl, TargetMessage};
 use crate::handler::PageInner;
@@ -3113,29 +3112,16 @@ impl Page {
     /// # }
     /// ```
     pub async fn set_content(&self, html: impl AsRef<str>) -> Result<&Self> {
-        if let Ok(mut call) = CallFunctionOnParams::builder()
-            .function_declaration(
-                "(html) => {
-            document.open();
-            document.write(html);
-            document.close();
-        }",
-            )
-            .argument(
-                CallArgument::builder()
-                    .value(serde_json::json!(html.as_ref()))
-                    .build(),
-            )
-            .build()
-        {
-            if let Ok(frame_id) = self.mainframe().await {
-                call.execution_context_id = self
-                    .inner
-                    .execution_context_for_world(frame_id, DOMWorldKind::Secondary)
-                    .await?;
-                self.evaluate_function(call).await?;
-            }
-        }
+        // Use Runtime.evaluate instead of Runtime.callFunctionOn so that no
+        // explicit execution-context ID is required.  callFunctionOn needs
+        // either objectId, executionContextId, or uniqueContextId — none of
+        // which may be available on about:blank or freshly-created pages
+        // (see https://github.com/spider-rs/chromey/issues/4).
+        let escaped = serde_json::json!(html.as_ref());
+        self.evaluate(format!(
+            "document.open(); document.write({escaped}); document.close()"
+        ))
+        .await?;
         // relying that document.open() will reset frame lifecycle with "init"
         // lifecycle event. @see https://crrev.com/608658
         self.wait_for_navigation().await
