@@ -688,6 +688,10 @@ impl Page {
     /// Navigate directly to the given URL concurrenctly checking the cache and seeding.
     ///
     /// This resolves directly after the requested URL is fully loaded. Does nothing without the 'cache' feature on.
+    ///
+    /// `namespace` partitions the cache key (country, proxy pool, tenant, …) so
+    /// logically distinct variants of the same URL never collide on the same
+    /// cached bytes. Pass `None` for the default (empty) namespace.
     #[cfg(feature = "_cache")]
     pub async fn goto_with_cache_fast_seed(
         &self,
@@ -695,19 +699,20 @@ impl Page {
         cache_policy: Option<crate::cache::BasicCachePolicy>,
         auth_opt: Option<&str>,
         remote: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<&Self> {
         use crate::cache::manager::site_key_for_target_url;
 
         let navigate_params = params.into();
         let target_url = navigate_params.url.clone();
-        let cache_site = site_key_for_target_url(&target_url, auth_opt);
+        let cache_site = site_key_for_target_url(&target_url, auth_opt, namespace);
 
         let _ = self
             .set_cache_key((Some(cache_site.clone()), cache_policy))
             .await;
 
         let _ = tokio::join!(
-            self.seed_cache(&target_url, auth_opt, remote),
+            self.seed_cache(&target_url, auth_opt, remote, namespace),
             self.goto_with_cache(navigate_params, auth_opt)
         );
 
@@ -728,12 +733,14 @@ impl Page {
         cache_strategy: Option<crate::cache::CacheStrategy>,
         remote: Option<&str>,
         intercept_enabled: Option<bool>,
+        namespace: Option<&str>,
     ) -> Result<&Self> {
         let remote = remote.or(Some("true"));
         let navigate_params = params.into();
         let target_url = navigate_params.url.clone();
 
-        let cache_site = crate::cache::manager::site_key_for_target_url(&target_url, auth_opt);
+        let cache_site =
+            crate::cache::manager::site_key_for_target_url(&target_url, auth_opt, namespace);
 
         let _ = self
             .set_cache_key((Some(cache_site.clone()), cache_policy.clone()))
@@ -756,10 +763,11 @@ impl Page {
                 &cache_site,
                 auth_opt.map(|f| f.into()),
                 cache_strategy.clone(),
-                remote.map(|f| f.into())
+                remote.map(|f| f.into()),
+                namespace,
             ),
             run_intercept,
-            self.seed_cache(&target_url, auth_opt, remote)
+            self.seed_cache(&target_url, auth_opt, remote, namespace)
         );
 
         let _ = self.goto_with_cache(navigate_params, auth_opt).await;
@@ -779,6 +787,7 @@ impl Page {
         cache_policy: Option<crate::cache::BasicCachePolicy>,
         cache_strategy: Option<crate::cache::CacheStrategy>,
         remote: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<&Self> {
         self._goto_with_cache_remote(
             params,
@@ -787,6 +796,7 @@ impl Page {
             cache_strategy,
             remote,
             Some(true),
+            namespace,
         )
         .await
     }
@@ -802,6 +812,7 @@ impl Page {
         cache_policy: Option<crate::cache::BasicCachePolicy>,
         cache_strategy: Option<crate::cache::CacheStrategy>,
         remote: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<&Self> {
         self._goto_with_cache_remote(
             params,
@@ -810,6 +821,7 @@ impl Page {
             cache_strategy,
             remote,
             Some(false),
+            namespace,
         )
         .await
     }
@@ -826,10 +838,12 @@ impl Page {
         cache_strategy: Option<crate::cache::CacheStrategy>,
         remote: Option<&str>,
         intercept_enabled: Option<bool>,
+        namespace: Option<&str>,
     ) -> Result<Arc<crate::HttpRequest>> {
         let remote = remote.or(Some("true"));
         let target_url = navigate_params.url.clone();
-        let cache_site = crate::cache::manager::site_key_for_target_url(&target_url, auth_opt);
+        let cache_site =
+            crate::cache::manager::site_key_for_target_url(&target_url, auth_opt, namespace);
 
         let _ = self
             .set_cache_key((Some(cache_site.clone()), cache_policy.clone()))
@@ -852,10 +866,11 @@ impl Page {
                 &cache_site,
                 auth_opt.map(|f| f.into()),
                 cache_strategy.clone(),
-                remote.map(|f| f.into())
+                remote.map(|f| f.into()),
+                namespace,
             ),
             run_intercept,
-            self.seed_cache(&target_url, auth_opt, remote)
+            self.seed_cache(&target_url, auth_opt, remote, namespace)
         );
 
         let cache_future = self
@@ -877,6 +892,7 @@ impl Page {
         cache_policy: Option<crate::cache::BasicCachePolicy>,
         cache_strategy: Option<crate::cache::CacheStrategy>,
         remote: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<Arc<crate::HttpRequest>> {
         self._http_future_with_cache(
             navigate_params,
@@ -885,6 +901,7 @@ impl Page {
             cache_strategy,
             remote,
             Some(true),
+            namespace,
         )
         .await
     }
@@ -900,6 +917,7 @@ impl Page {
         cache_policy: Option<crate::cache::BasicCachePolicy>,
         cache_strategy: Option<crate::cache::CacheStrategy>,
         remote: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<Arc<crate::HttpRequest>> {
         self._http_future_with_cache(
             navigate_params,
@@ -908,6 +926,7 @@ impl Page {
             cache_strategy,
             remote,
             Some(false),
+            namespace,
         )
         .await
     }
@@ -922,21 +941,23 @@ impl Page {
         auth_opt: Option<&str>,
         cache_policy: Option<crate::cache::BasicCachePolicy>,
         remote: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<&Self> {
         let navigate_params = params.into();
         let navigation_url = navigate_params.url.to_string();
 
-        let cache_site = crate::cache::manager::site_key_for_target_url(&navigation_url, auth_opt);
+        let cache_site =
+            crate::cache::manager::site_key_for_target_url(&navigation_url, auth_opt, namespace);
 
         let _ = self
             .set_cache_key((Some(cache_site.clone()), cache_policy.clone()))
             .await;
 
-        self.seed_cache(&navigation_url, auth_opt.clone(), remote)
+        self.seed_cache(&navigation_url, auth_opt.clone(), remote, namespace)
             .await?;
 
         self.goto_with_cache(navigate_params, auth_opt).await?;
-        let _ = self.clear_local_cache_with_key(&navigation_url, auth_opt);
+        let _ = self.clear_local_cache_with_key(&navigation_url, auth_opt, namespace);
         Ok(self)
     }
 
@@ -3014,9 +3035,10 @@ impl Page {
         &self,
         target_url: &str,
         auth: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<&Self> {
         let cache_site =
-            crate::cache::manager::site_key_for_target_url(target_url, auth.as_deref());
+            crate::cache::manager::site_key_for_target_url(target_url, auth, namespace);
 
         crate::cache::remote::clear_local_session_cache(&cache_site).await;
 
@@ -3030,8 +3052,9 @@ impl Page {
         cache_site: &str,
         auth: Option<&str>,
         remote: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<&Self> {
-        crate::cache::remote::get_cache_site(&cache_site, auth.as_deref(), remote.as_deref()).await;
+        crate::cache::remote::get_cache_site(&cache_site, auth, remote, namespace).await;
         Ok(self)
     }
 
@@ -3046,9 +3069,10 @@ impl Page {
         auth: Option<String>,
         cache_strategy: Option<crate::cache::CacheStrategy>,
         dump_remote: Option<String>,
+        namespace: Option<&str>,
     ) -> Result<tokio::task::JoinHandle<()>, crate::error::CdpError> {
         let cache_site =
-            crate::cache::manager::site_key_for_target_url(target_url, auth.as_deref());
+            crate::cache::manager::site_key_for_target_url(target_url, auth.as_deref(), namespace);
 
         let handle = crate::cache::spawn_response_cache_listener(
             self.clone(),

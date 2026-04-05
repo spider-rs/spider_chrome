@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test_url = "https://spider.cloud/about";
 
     // setup response → cache listener.
-    page.spawn_cache_listener(test_url, None, Some(cache_strat), Some("true".into()))
+    page.spawn_cache_listener(test_url, None, Some(cache_strat), Some("true".into()), None)
         .await?;
 
     // ---- First run (cold) ----
@@ -79,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None,
             Some(cache_policy.clone()),
             Some(cache_strat),
+            None,
             None,
         )
         .await?

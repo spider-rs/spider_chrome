@@ -163,7 +163,12 @@ pub async fn dump_to_remote_cache(
 ///
 /// `cache_key` here is the `website_key` used by the remote server,
 /// e.g. "example.com".
-pub async fn get_cache_site(target_url: &str, auth: Option<&str>, remote: Option<&str>) {
+pub async fn get_cache_site(
+    target_url: &str,
+    auth: Option<&str>,
+    remote: Option<&str>,
+    namespace: Option<&str>,
+) {
     let mut base_url = HYBRID_CACHE_ENDPOINT.as_str();
 
     if let Some(remote) = remote {
@@ -172,7 +177,7 @@ pub async fn get_cache_site(target_url: &str, auth: Option<&str>, remote: Option
         }
     }
 
-    let cache_key = site_key_for_target_url(target_url, auth.as_deref());
+    let cache_key = site_key_for_target_url(target_url, auth, namespace);
 
     let endpoint = format!("{}/cache/site/{}", &*base_url, cache_key);
 
@@ -238,7 +243,12 @@ pub async fn get_cache_site(target_url: &str, auth: Option<&str>, remote: Option
 ///
 /// `cache_key` here is the `website_key` used by the remote server,
 /// e.g. "example.com".
-pub async fn get_cache_resource(target_url: &str, auth: Option<&str>, remote: Option<&str>) {
+pub async fn get_cache_resource(
+    target_url: &str,
+    auth: Option<&str>,
+    remote: Option<&str>,
+    namespace: Option<&str>,
+) {
     let mut base_url = HYBRID_CACHE_ENDPOINT.as_str();
 
     if let Some(remote) = remote {
@@ -247,7 +257,7 @@ pub async fn get_cache_resource(target_url: &str, auth: Option<&str>, remote: Op
         }
     }
 
-    let cache_key = site_key_for_target_url(target_url, auth.as_deref());
+    let cache_key = site_key_for_target_url(target_url, auth, namespace);
 
     let endpoint = format!("{}/cache/resource/{}", &*base_url, cache_key);
 

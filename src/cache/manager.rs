@@ -499,7 +499,16 @@ pub fn allow_cache_response(
 }
 
 /// Get the site key for target url.
-pub fn site_key_for_target_url(target_url: &str, auth: Option<&str>) -> String {
+///
+/// `namespace` is an opaque partition string supplied by the caller so logically
+/// distinct variants of the same URL (country, proxy pool, tenant, A/B bucket,
+/// device profile, …) never collide on the same cached bytes. `None` is treated
+/// as the empty namespace.
+pub fn site_key_for_target_url(
+    target_url: &str,
+    auth: Option<&str>,
+    namespace: Option<&str>,
+) -> String {
     let normalized = match url::Url::parse(target_url) {
         Ok(mut u) => {
             u.set_fragment(None);
@@ -507,7 +516,12 @@ pub fn site_key_for_target_url(target_url: &str, auth: Option<&str>) -> String {
         }
         Err(_) => target_url.to_string(),
     };
-    let input = format!("v1|url={}|auth={}", normalized, auth.unwrap_or(""));
+    let input = format!(
+        "v1|url={}|auth={}|ns={}",
+        normalized,
+        auth.unwrap_or(""),
+        namespace.unwrap_or(""),
+    );
     hex::encode(blake3::hash(input.as_bytes()).as_bytes()) // 64 hex chars, path-safe
 }
 

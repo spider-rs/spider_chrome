@@ -151,7 +151,7 @@ async fn test_dump_and_seed_round_trip() {
     let method = "GET";
 
     let cache_key = create_cache_key_raw(test_url, Some(method), auth);
-    let cache_site = site_key_for_target_url(test_url, auth);
+    let cache_site = site_key_for_target_url(test_url, auth, None);
 
     let body = b"<html><head><title>Test</title></head><body><h1>Hello World</h1></body></html>";
     let status: u16 = 200;
@@ -218,7 +218,7 @@ async fn test_dump_and_seed_round_trip() {
     // --- Step 3: Clear this test's session cache entries and seed from the mock server ---
     LOCAL_SESSION_CACHE.remove(&cache_site);
 
-    get_cache_site(test_url, auth, Some(&base_url)).await;
+    get_cache_site(test_url, auth, Some(&base_url), None).await;
 
     // --- Step 4: Verify the session cache was populated ---
     let session_key = format!("{}:{}", method, test_url);
@@ -253,7 +253,7 @@ async fn test_dump_multiple_resources_same_site() {
     let auth: Option<&str> = None;
     let method = "GET";
 
-    let cache_site = site_key_for_target_url(page_url, auth);
+    let cache_site = site_key_for_target_url(page_url, auth, None);
 
     // Dump the HTML page
     let html_body = b"<html><body>Page content here</body></html>";
@@ -329,7 +329,7 @@ async fn test_dump_multiple_resources_same_site() {
 
     // Seed from remote and verify all 3 are in session cache
     LOCAL_SESSION_CACHE.remove(&cache_site);
-    get_cache_site(page_url, auth, Some(&base_url)).await;
+    get_cache_site(page_url, auth, Some(&base_url), None).await;
 
     // The page document should be in both CACACHE and session cache
     let page_session_key = format!("{}:{}", method, page_url);
@@ -358,7 +358,7 @@ async fn test_dump_with_auth() {
     let method = "GET";
 
     let cache_key = create_cache_key_raw(test_url, Some(method), auth);
-    let cache_site = site_key_for_target_url(test_url, auth);
+    let cache_site = site_key_for_target_url(test_url, auth, None);
 
     let body = b"protected content here";
     let mut response_headers = HashMap::new();
@@ -399,7 +399,7 @@ async fn test_dump_with_auth() {
 
     // Seed and verify
     LOCAL_SESSION_CACHE.remove(&cache_site);
-    get_cache_site(test_url, auth, Some(&base_url)).await;
+    get_cache_site(test_url, auth, Some(&base_url), None).await;
 
     let session_key = format!("{}:{}", method, test_url);
     let cached = get_session_cache_item(&cache_site, &session_key);
@@ -413,7 +413,7 @@ async fn test_dump_empty_body_skipped() {
 
     let test_url = "https://empty-body.example.com/empty";
     let cache_key = create_cache_key_raw(test_url, Some("GET"), None);
-    let cache_site = site_key_for_target_url(test_url, None);
+    let cache_site = site_key_for_target_url(test_url, None, None);
 
     // Empty body should be skipped by the server-side check
     // but we test that the dump still works (the server will store it,
@@ -464,12 +464,12 @@ async fn test_cache_key_consistency() {
     );
 
     // Site keys should be stable
-    let site1 = site_key_for_target_url(url, auth);
-    let site2 = site_key_for_target_url(url, auth);
+    let site1 = site_key_for_target_url(url, auth, None);
+    let site2 = site_key_for_target_url(url, auth, None);
     assert_eq!(site1, site2, "site keys must be deterministic");
 
     // Different auth produces different keys
-    let site_no_auth = site_key_for_target_url(url, None);
+    let site_no_auth = site_key_for_target_url(url, None, None);
     assert_ne!(
         site1, site_no_auth,
         "different auth should produce different site keys"
@@ -482,7 +482,7 @@ async fn test_binary_body_round_trip() {
 
     let test_url = "https://binary-test.example.com/image.png";
     let cache_key = create_cache_key_raw(test_url, Some("GET"), None);
-    let cache_site = site_key_for_target_url(test_url, None);
+    let cache_site = site_key_for_target_url(test_url, None, None);
 
     // Simulate a binary body (PNG header + random bytes)
     let body: Vec<u8> = vec![
@@ -512,7 +512,7 @@ async fn test_binary_body_round_trip() {
 
     // Seed back and verify binary content is preserved
     LOCAL_SESSION_CACHE.remove(&cache_site);
-    get_cache_site(test_url, None, Some(&base_url)).await;
+    get_cache_site(test_url, None, Some(&base_url), None).await;
 
     let session_key = format!("GET:{}", test_url);
     let cached = get_session_cache_item(&cache_site, &session_key);
@@ -536,7 +536,7 @@ async fn test_dump_worker_queue_end_to_end() {
 
     let test_url = "https://worker-test.example.com/page";
     let cache_key = create_cache_key_raw(test_url, Some("GET"), None);
-    let cache_site = site_key_for_target_url(test_url, None);
+    let cache_site = site_key_for_target_url(test_url, None, None);
 
     let body = b"<html><body>Worker test content</body></html>".to_vec();
     let mut response_headers = HashMap::new();
@@ -580,7 +580,7 @@ async fn test_dump_worker_queue_end_to_end() {
 
     // Now seed from the server and verify round-trip through the worker
     LOCAL_SESSION_CACHE.remove(&cache_site);
-    get_cache_site(test_url, None, Some(&base_url)).await;
+    get_cache_site(test_url, None, Some(&base_url), None).await;
 
     let session_key = format!("GET:{}", test_url);
     let cached = get_session_cache_item(&cache_site, &session_key);
@@ -608,7 +608,7 @@ async fn test_cache_policy_uses_correct_headers() {
 
     let test_url = "https://policy-header-test.example.com/page";
     let cache_key = create_cache_key_raw(test_url, Some("GET"), None);
-    let cache_site = site_key_for_target_url(test_url, None);
+    let cache_site = site_key_for_target_url(test_url, None, None);
 
     let body = b"<html><body>Cache-Control test</body></html>".to_vec();
 
@@ -713,7 +713,7 @@ async fn test_put_hybrid_cache_cold_cache_dumps_to_remote() {
 
     let test_url = "https://put-cold.example.com/page";
     let cache_key = create_cache_key_raw(test_url, Some("GET"), None);
-    let cache_site = site_key_for_target_url(test_url, None);
+    let cache_site = site_key_for_target_url(test_url, None, None);
 
     let body = b"<html><body>Cold cache test content</body></html>".to_vec();
     let mut response_headers = HashMap::new();
@@ -780,7 +780,7 @@ async fn test_put_hybrid_cache_full_round_trip() {
 
     let page_url = "https://roundtrip.example.com/index";
     let cache_key = create_cache_key_raw(page_url, Some("GET"), None);
-    let cache_site = site_key_for_target_url(page_url, None);
+    let cache_site = site_key_for_target_url(page_url, None, None);
 
     let body = b"<html><body>Full round trip content</body></html>".to_vec();
     let mut resp_headers = HashMap::new();
@@ -816,7 +816,7 @@ async fn test_put_hybrid_cache_full_round_trip() {
     LOCAL_SESSION_CACHE.remove(&cache_site);
 
     // Step 3: Seed from remote
-    get_cache_site(page_url, None, Some(&base_url)).await;
+    get_cache_site(page_url, None, Some(&base_url), None).await;
 
     // Step 4: Verify session cache has the entry with correct data
     let session_key = format!("GET:{}", page_url);
