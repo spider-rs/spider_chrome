@@ -978,11 +978,14 @@ impl NetworkManager {
 
         skip_networking = self.detect_ad_if_enabled(event, skip_networking);
 
-        // Ignore embedded scripts when only_html or ignore_visuals is set.
+        // Ignore embedded scripts, tracker stylesheets, and tracker images when only_html or ignore_visuals is set.
         if !skip_networking
             && self.block_javascript
             && (self.only_html || self.ignore_visuals)
-            && (javascript_resource || document_resource)
+            && (javascript_resource
+                || document_resource
+                || event.resource_type == ResourceType::Stylesheet
+                || event.resource_type == ResourceType::Image)
         {
             skip_networking = ignore_script_embedded(current_url);
         }
