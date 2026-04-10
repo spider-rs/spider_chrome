@@ -27,12 +27,19 @@ use tokio::sync::Semaphore;
 /// Default chunk size for `IO.read` (bytes requested per round-trip).
 const DEFAULT_IO_READ_CHUNK: i64 = 65_536; // 64 KiB
 
-/// Hard upper bound on a single streamed body.  Responses larger than this
-/// are abandoned (stream closed) to avoid unbounded allocation.
-const MAX_BODY_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
-
 /// Timeout for the *entire* stream read (all chunks), not per-chunk.
 const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Optional max body size.  Set `CHROMEY_STREAM_MAX_BODY_BYTES` to enforce a
+/// cap.  When unset (default) there is no limit — matching the original
+/// `getResponseBody` behavior.
+fn max_body_bytes() -> Option<usize> {
+    // Parsed once per call (cheap — env lookup + parse).  Could be
+    // lazy_static but the env var may be changed between runs.
+    std::env::var("CHROMEY_STREAM_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
 
 /// Base threshold (bytes) below which we skip streaming and let the
 /// `Network.getResponseBody` path handle the response.  This value is
@@ -274,7 +281,6 @@ impl Drop for ChunkSink {
 async fn read_all_chunks(
     page: &Page,
     stream_handle: &StreamHandle,
-    guard: &mut StreamGuard<'_>,
     content_length_hint: Option<usize>,
 ) -> Result<Vec<u8>, StreamError> {
     // Initialise the sink.
@@ -282,10 +288,9 @@ async fn read_all_chunks(
     let mut sink = ChunkSink::open_disk().await;
 
     #[cfg(not(feature = "_cache_stream_disk"))]
-    let mut body = Vec::with_capacity(
-        content_length_hint.unwrap_or(0).min(MAX_BODY_BYTES),
-    );
+    let mut body = Vec::with_capacity(content_length_hint.unwrap_or(0));
 
+    let cap = max_body_bytes();
     let mut total_bytes: usize = 0;
 
     loop {
@@ -315,12 +320,11 @@ async fn read_all_chunks(
 
         total_bytes += decoded.len();
 
-        // Enforce body size cap.
-        if total_bytes > MAX_BODY_BYTES {
-            if let Some(h) = guard.take() {
-                let _ = page.execute(CloseParams { handle: h }).await;
+        // Optional size cap (off by default — set CHROMEY_STREAM_MAX_BODY_BYTES).
+        if let Some(max) = cap {
+            if total_bytes > max {
+                return Err(StreamError::BodyTooLarge(total_bytes));
             }
-            return Err(StreamError::BodyTooLarge(total_bytes));
         }
 
         #[cfg(feature = "_cache_stream_disk")]
@@ -430,7 +434,7 @@ pub async fn read_response_body_as_stream(
     let mut guard = StreamGuard::new(page, stream_handle.clone());
 
     // Read all chunks.
-    match read_all_chunks(page, &stream_handle, &mut guard, content_length_hint).await {
+    match read_all_chunks(page, &stream_handle, content_length_hint).await {
         Ok(body) => {
             // Explicitly close the CDP stream (guard becomes a no-op).
             if let Some(h) = guard.take() {
@@ -475,7 +479,7 @@ pub enum StreamError {
     Cdp(crate::error::CdpError),
     /// The overall stream read exceeded the time limit.
     Timeout,
-    /// The response body exceeded `MAX_BODY_BYTES`.
+    /// The response body exceeded the optional `CHROMEY_STREAM_MAX_BODY_BYTES` cap.
     BodyTooLarge(usize),
     /// Base64 decoding failed on a chunk.
     Base64(base64::DecodeError),
