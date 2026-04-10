@@ -1,6 +1,6 @@
 [package]
 name = "chromey"
-version = "2.45.2"
+version = "2.46.0"
 rust-version = "1.70"
 authors = ["j-mendez <jeff@spider.cloud>"]
 edition = "2021"
@@ -120,8 +120,10 @@ _cache = [
     "dep:auto_encoder",
     "dep:blake3",
     "dep:hex",
-    "dep:dashmap"
+    "dep:dashmap",
+    "_cache_stream_disk"
     ]
+_cache_stream_disk = []
 cache = ["_cache", "http-global-cache/cache"]
 cache_mem = ["_cache", "http-global-cache/cache_mem"]
 serde_stacker = ["dep:serde_stacker", "serde_json/unbounded_depth"]

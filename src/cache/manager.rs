@@ -605,6 +605,11 @@ async fn handle_single_response(
         return Ok(());
     }
 
+    // Skip if the Fetch streaming path is already handling this URL.
+    if crate::cache::remote::is_stream_pending(&current_url) {
+        return Ok(());
+    }
+
     let body_ret = page
         .execute(GetResponseBodyParams::new(ev.request_id.clone()))
         .await;
@@ -726,6 +731,7 @@ pub async fn spawn_fetch_cache_interceptor(
     page.send_command(crate::cdp::browser_protocol::fetch::EnableParams {
         handle_auth_requests: Some(false),
         patterns: Some(vec![
+            // Request-stage: serve from cache or continue.
             RequestPattern {
                 resource_type: Some(ResourceType::Document),
                 request_stage: Some(RequestStage::Request),
@@ -736,6 +742,17 @@ pub async fn spawn_fetch_cache_interceptor(
                 request_stage: Some(RequestStage::Request),
                 url_pattern: Some("*".into()),
             },
+            // Response-stage: stream large bodies into cache.
+            RequestPattern {
+                resource_type: Some(ResourceType::Document),
+                request_stage: Some(RequestStage::Response),
+                url_pattern: Some("*".into()),
+            },
+            RequestPattern {
+                resource_type: Some(ResourceType::Script),
+                request_stage: Some(RequestStage::Response),
+                url_pattern: Some("*".into()),
+            },
         ]),
     })
     .await?;
@@ -744,7 +761,31 @@ pub async fn spawn_fetch_cache_interceptor(
 
     let handle = tokio::spawn(async move {
         while let Some(ev) = events.next().await {
-            if let Err(err) = handle_fetch_paused(
+            // Response-stage events (body available for streaming) are
+            // handled on a dedicated spawned task so the event listener
+            // loop stays responsive for fast request-stage decisions.
+            let is_response_stage = ev.response_status_code.is_some();
+
+            if is_response_stage {
+                let page = page.clone();
+                let auth = auth.clone();
+                let cache_strategy = cache_strategy;
+                tokio::spawn(async move {
+                    if let Err(err) = handle_fetch_response_stage(
+                        &page,
+                        &ev,
+                        auth.as_deref(),
+                        cache_strategy.as_ref(),
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            "cache stream interceptor error: {err:?} - {:?}",
+                            ev.request.url
+                        );
+                    }
+                });
+            } else if let Err(err) = handle_fetch_paused(
                 &page,
                 &ev,
                 auth.as_deref(),
@@ -761,8 +802,8 @@ pub async fn spawn_fetch_cache_interceptor(
     Ok(handle)
 }
 
-/// Async handler for a single Fetch.requestPaused event. If we have the internal listener this will be the first layer.
-/// [experimental].
+/// Async handler for a single Fetch.requestPaused event (request-stage).
+/// Serves from cache on hit, continues on miss.
 async fn handle_fetch_paused(
     page: &Page,
     ev: &std::sync::Arc<EventRequestPaused>,
@@ -780,14 +821,15 @@ async fn handle_fetch_paused(
         return Ok(());
     }
 
-    if ev.response_status_code.is_some() || ev.response_error_reason.is_some() {
+    // Response-stage events with errors: continue without caching.
+    if ev.response_error_reason.is_some() {
         let params = ContinueRequestParams::new(ev.request_id.clone());
         page.send_command(params).await?;
         return Ok(());
     }
 
     if let Some((body, metadata)) =
-        get_cached_url_with_metadata(&current_url, auth.as_deref(), policy).await
+        get_cached_url_with_metadata(current_url, auth.as_deref(), policy).await
     {
         tracing::debug!("Cache HIT: {}", current_url);
         let mut resp_headers = Vec::<HeaderEntry>::with_capacity(metadata.len());
@@ -812,4 +854,213 @@ async fn handle_fetch_paused(
     }
 
     Ok(())
+}
+
+/// Handle a response-stage `Fetch.requestPaused` event.
+///
+/// If the response body is large enough to benefit from streaming (based on
+/// `Content-Length` and the adaptive threshold), we use
+/// `Fetch.takeResponseBodyAsStream` + `IO.read` to pull the body in chunks.
+/// Otherwise we continue the request and let the `Network.responseReceived`
+/// listener handle it via `getResponseBody`.
+async fn handle_fetch_response_stage(
+    page: &Page,
+    ev: &std::sync::Arc<EventRequestPaused>,
+    auth: Option<&str>,
+    cache_strategy: Option<&CacheStrategy>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let current_url = ev.request.url.as_str();
+
+    // Error responses: nothing to cache.
+    if ev.response_error_reason.is_some() {
+        let params = ContinueRequestParams::new(ev.request_id.clone());
+        page.send_command(params).await?;
+        return Ok(());
+    }
+
+    let eligible_for_cache = allow_cache_response(&ev.resource_type, cache_strategy.as_deref());
+
+    if !eligible_for_cache || !current_url.starts_with("http") {
+        let params = ContinueRequestParams::new(ev.request_id.clone());
+        page.send_command(params).await?;
+        return Ok(());
+    }
+
+    // Only cache successful responses.
+    let status = ev.response_status_code.unwrap_or(0);
+    if !(200..400).contains(&status) {
+        let params = ContinueRequestParams::new(ev.request_id.clone());
+        page.send_command(params).await?;
+        return Ok(());
+    }
+
+    // Extract Content-Length from response headers.
+    let resp_headers = response_headers_from_event(ev);
+    let content_length = super::stream::content_length_from_headers(&resp_headers);
+    let threshold = super::stream::streaming_threshold_bytes();
+
+    // Small or unknown-but-probably-small responses: let the Network
+    // listener handle it with the simpler getResponseBody path.
+    let should_stream = match content_length {
+        Some(len) => len >= threshold,
+        // No Content-Length means chunked — stream to be safe.
+        None => true,
+    };
+
+    if !should_stream {
+        let params = ContinueRequestParams::new(ev.request_id.clone());
+        page.send_command(params).await?;
+        return Ok(());
+    }
+
+    // Build a dedup key matching the format used by the Network listener.
+    let dedup_key = format!("{}:{}", DEFAULT_METHOD, current_url);
+
+    // Mark as in-flight so the Network listener skips this URL.
+    crate::cache::remote::mark_stream_pending(&dedup_key);
+
+    // Attempt to stream the body.
+    let stream_result = super::stream::read_response_body_as_stream(
+        page,
+        ev.request_id.clone(),
+        content_length,
+    )
+    .await;
+
+    match stream_result {
+        Ok(body_bytes) => {
+            // Clear the pending marker — we'll insert the real entry below.
+            crate::cache::remote::clear_stream_pending(&dedup_key);
+
+            if is_body_empty_for_cache(&body_bytes) {
+                // Nothing to cache, but we consumed the body — must fulfill.
+                let mut params = FulfillRequestParams::new(
+                    ev.request_id.clone(),
+                    status,
+                );
+                params.body = Some(general_purpose::STANDARD.encode(&body_bytes).into());
+                params.response_headers = Some(headers_to_header_entries(&resp_headers));
+                page.send_command(params).await?;
+                return Ok(());
+            }
+
+            // Populate session cache.
+            let req_headers = request_headers_from_event(ev);
+            let cache_key_url = current_url;
+
+            let uri: http::uri::Uri = cache_key_url.parse().unwrap_or_default();
+            let req = crate::http::HttpRequestLike {
+                uri,
+                method: http::method::Method::GET,
+                headers: crate::http::convert_headers(&req_headers),
+            };
+            let res = crate::http::HttpResponseLike {
+                status: StatusCode::from_u16(status as u16)
+                    .unwrap_or(StatusCode::EXPECTATION_FAILED),
+                headers: crate::http::convert_headers(&resp_headers),
+            };
+            let policy = http_cache_semantics::CachePolicy::new(&req, &res);
+
+            let parsed_url = url::Url::parse(cache_key_url).unwrap_or_else(|_| {
+                url::Url::parse("http://localhost").expect("static URL")
+            });
+
+            let http_res = http_cache_reqwest::HttpResponse {
+                url: parsed_url,
+                body: body_bytes.clone(),
+                headers: http_cache::HttpHeaders::Modern(crate::http::headers_to_multi(
+                    &resp_headers,
+                )),
+                version: crate::http::HttpVersion::Http11.into(),
+                status: status as u16,
+                metadata: None,
+            };
+
+            // We need a cache_site to insert. Derive from auth + URL.
+            let cache_site =
+                site_key_for_target_url(cache_key_url, auth, None);
+
+            crate::cache::remote::session_cache_insert(
+                &cache_site,
+                http_res,
+                policy,
+                &dedup_key,
+            );
+
+            // Fulfill the paused request with the body we already read.
+            let mut params = FulfillRequestParams::new(ev.request_id.clone(), status);
+            params.body = Some(general_purpose::STANDARD.encode(&body_bytes).into());
+            params.response_headers = Some(headers_to_header_entries(&resp_headers));
+            page.send_command(params).await?;
+
+            tracing::debug!("Stream cached: {} ({} bytes)", current_url, body_bytes.len());
+        }
+        Err(err) => {
+            // Clear the pending marker so the Network listener can retry.
+            crate::cache::remote::clear_stream_pending(&dedup_key);
+
+            tracing::debug!(
+                "Stream failed for {}, falling back to Network path: {err}",
+                current_url
+            );
+
+            // Streaming failed — continue the request normally.  The
+            // `Network.responseReceived` listener will pick it up with
+            // `getResponseBody`.  Note: after `takeResponseBodyAsStream`
+            // fails, the request may already be in an unrecoverable state,
+            // so we send `continueRequest` best-effort.
+            let params = ContinueRequestParams::new(ev.request_id.clone());
+            let _ = page.send_command(params).await;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Header helpers for response-stage events
+// ---------------------------------------------------------------------------
+
+/// Extract response headers from a `requestPaused` event into a HashMap.
+fn response_headers_from_event(
+    ev: &EventRequestPaused,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Some(ref headers) = ev.response_headers {
+        for entry in headers {
+            map.insert(entry.name.clone(), entry.value.clone());
+        }
+    }
+    map
+}
+
+/// Extract request headers from a `requestPaused` event into a HashMap.
+fn request_headers_from_event(
+    ev: &EventRequestPaused,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Some(obj) = ev.request.headers.inner().as_object() {
+        for (k, v) in obj {
+            let val = if let Some(s) = v.as_str() {
+                s.to_string()
+            } else {
+                v.to_string()
+            };
+            map.insert(k.clone(), val);
+        }
+    }
+    map
+}
+
+/// Convert a `HashMap<String, String>` to a `Vec<HeaderEntry>`.
+fn headers_to_header_entries(
+    headers: &HashMap<String, String>,
+) -> Vec<HeaderEntry> {
+    headers
+        .iter()
+        .map(|(k, v)| HeaderEntry {
+            name: k.clone(),
+            value: v.clone(),
+        })
+        .collect()
 }

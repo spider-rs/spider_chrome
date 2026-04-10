@@ -33,6 +33,10 @@ lazy_static! {
     pub static ref LOCAL_SESSION_CACHE: dashmap::DashMap<String, HashMap<String, (http_cache_reqwest::HttpResponse, CachePolicy)>> = dashmap::DashMap::new();
     /// Max concurrent remote cache dumps across the whole process.
     pub static ref REMOTE_CACHE_DUMP_SEM: Semaphore = Semaphore::new(1000);
+    /// URLs currently being streamed via `Fetch.takeResponseBodyAsStream`.
+    /// Checked by the `Network.responseReceived` listener to avoid a
+    /// redundant `getResponseBody` call for the same resource.
+    pub(crate) static ref PENDING_STREAM_URLS: dashmap::DashSet<String> = dashmap::DashSet::new();
 }
 
 /// Payload shape for the remote hybrid cache server `/cache/index` endpoint.
@@ -449,4 +453,19 @@ pub fn check_session_cache_item(cache_key: &str, target_url: &str) -> bool {
     LOCAL_SESSION_CACHE
         .get(cache_key)
         .map_or(false, |local_cache| local_cache.contains_key(target_url))
+}
+
+/// Mark a URL as "stream in-flight" so the Network listener skips it.
+pub fn mark_stream_pending(key: &str) {
+    PENDING_STREAM_URLS.insert(key.to_string());
+}
+
+/// Remove the in-flight marker (called on success *and* failure).
+pub fn clear_stream_pending(key: &str) {
+    PENDING_STREAM_URLS.remove(key);
+}
+
+/// Returns `true` when the URL is currently being body-streamed.
+pub fn is_stream_pending(key: &str) -> bool {
+    PENDING_STREAM_URLS.contains(key)
 }

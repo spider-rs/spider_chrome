@@ -45,7 +45,7 @@ pub mod httpfuture;
 mod job;
 pub mod network;
 pub mod network_utils;
-mod page;
+pub mod page;
 mod session;
 pub mod target;
 pub mod target_message_future;

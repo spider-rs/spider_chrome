@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use chromiumoxide_cdp::cdp::browser_protocol::accessibility::{
@@ -43,6 +44,17 @@ use crate::mouse::SmartMouse;
 use crate::page::ScreenshotParams;
 use crate::{keys, utils, ArcHttpRequest};
 
+/// Global count of live `PageInner` instances. Incremented on creation,
+/// decremented on `Drop`. Used to dynamically tune memory-sensitive
+/// thresholds (e.g. CDP body-streaming chunk size) under high concurrency.
+static ACTIVE_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the number of currently live page instances across the process.
+#[inline]
+pub fn active_page_count() -> usize {
+    ACTIVE_PAGES.load(Ordering::Relaxed)
+}
+
 #[derive(Debug)]
 pub struct PageHandle {
     pub(crate) rx: Receiver<TargetMessage>,
@@ -65,6 +77,7 @@ impl PageHandle {
             smart_mouse: SmartMouse::new(),
             request_timeout,
         };
+        ACTIVE_PAGES.fetch_add(1, Ordering::Relaxed);
         Self {
             rx,
             page: Arc::new(page),
@@ -90,6 +103,12 @@ pub(crate) struct PageInner {
     pub(crate) smart_mouse: SmartMouse,
     /// The request timeout for CDP commands issued from this page.
     request_timeout: std::time::Duration,
+}
+
+impl Drop for PageInner {
+    fn drop(&mut self) {
+        ACTIVE_PAGES.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl PageInner {

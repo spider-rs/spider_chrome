@@ -104,6 +104,7 @@ pub use crate::element::Element;
 pub use crate::error::Result;
 #[cfg(feature = "fetcher")]
 pub use crate::fetcher::{BrowserFetcher, BrowserFetcherOptions};
+pub use crate::handler::page::active_page_count;
 pub use crate::handler::Handler;
 pub use crate::page::Page;
 /// re-export the generated cdp types
