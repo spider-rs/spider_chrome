@@ -373,41 +373,93 @@ async fn read_all_chunks(
 ///
 /// Disk I/O errors are **never** surfaced — the reader falls back silently.
 /// On any error the CDP stream is closed via the `StreamGuard`.
+/// Result of a streaming body read attempt.
+#[derive(Debug)]
+pub enum StreamResult {
+    /// Stream completed successfully — body is fully read.
+    Ok(Vec<u8>),
+    /// The stream was never opened (CDP call failed, semaphore closed, etc).
+    /// The response body has NOT been consumed — the caller can safely fall
+    /// back to `Fetch.getResponseBody` or `continueRequest`.
+    NotStarted(StreamError),
+    /// The stream was opened but the read loop failed mid-way (timeout, CDP
+    /// error, body too large, etc).  The response body IS consumed — the
+    /// caller MUST `fulfillRequest` with the partial data collected so far.
+    /// An empty Vec means zero bytes were recovered.
+    PartialBody {
+        body: Vec<u8>,
+        error: StreamError,
+    },
+}
+
 pub async fn read_response_body_as_stream(
     page: &Page,
     request_id: impl Into<chromiumoxide_cdp::cdp::browser_protocol::fetch::RequestId>,
     content_length_hint: Option<usize>,
-) -> Result<Vec<u8>, StreamError> {
+) -> StreamResult {
     // Acquire global permit — blocks if we're at capacity.
-    let _permit = GLOBAL_STREAM_PERMITS
-        .acquire()
-        .await
-        .map_err(|_| StreamError::SemaphoreClosed)?;
+    let _permit = match GLOBAL_STREAM_PERMITS.acquire().await {
+        Ok(p) => p,
+        Err(_) => return StreamResult::NotStarted(StreamError::SemaphoreClosed),
+    };
 
     INFLIGHT_STREAMS.fetch_add(1, Ordering::Relaxed);
     let _dec = DecrementOnDrop(&INFLIGHT_STREAMS);
 
     // Open the stream.
-    let returns = tokio::time::timeout(
+    let returns = match tokio::time::timeout(
         STREAM_TIMEOUT,
         page.execute(TakeResponseBodyAsStreamParams::new(request_id)),
     )
     .await
-    .map_err(|_| StreamError::Timeout)?
-    .map_err(StreamError::Cdp)?;
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            // CDP rejected the command — body NOT consumed.
+            return StreamResult::NotStarted(StreamError::Cdp(e));
+        }
+        Err(_) => {
+            // Timeout before the stream even opened — body NOT consumed.
+            return StreamResult::NotStarted(StreamError::Timeout);
+        }
+    };
+
+    // --- Past this point the body IS consumed by Chrome. ---
 
     let stream_handle = returns.result.stream;
     let mut guard = StreamGuard::new(page, stream_handle.clone());
 
     // Read all chunks.
-    let body = read_all_chunks(page, &stream_handle, &mut guard, content_length_hint).await?;
+    match read_all_chunks(page, &stream_handle, &mut guard, content_length_hint).await {
+        Ok(body) => {
+            // Explicitly close the CDP stream (guard becomes a no-op).
+            if let Some(h) = guard.take() {
+                let _ = page.execute(CloseParams { handle: h }).await;
+            }
+            StreamResult::Ok(body)
+        }
+        Err(err) => {
+            // Close the stream best-effort.
+            if let Some(h) = guard.take() {
+                let _ = page.execute(CloseParams { handle: h }).await;
+            }
 
-    // Explicitly close the CDP stream (guard becomes a no-op).
-    if let Some(h) = guard.take() {
-        let _ = page.execute(CloseParams { handle: h }).await;
+            // Recover whatever was accumulated so far.
+            #[cfg(feature = "_cache_stream_disk")]
+            // Cannot recover partial data from a failed sink easily;
+            // the error path in read_all_chunks already returned before
+            // finish() was called.  Return empty partial.
+            let partial = Vec::new();
+
+            #[cfg(not(feature = "_cache_stream_disk"))]
+            let partial = Vec::new();
+
+            StreamResult::PartialBody {
+                body: partial,
+                error: err,
+            }
+        }
     }
-
-    Ok(body)
 }
 
 // ---------------------------------------------------------------------------

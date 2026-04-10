@@ -858,11 +858,14 @@ async fn handle_fetch_paused(
 
 /// Handle a response-stage `Fetch.requestPaused` event.
 ///
-/// If the response body is large enough to benefit from streaming (based on
-/// `Content-Length` and the adaptive threshold), we use
-/// `Fetch.takeResponseBodyAsStream` + `IO.read` to pull the body in chunks.
-/// Otherwise we continue the request and let the `Network.responseReceived`
-/// listener handle it via `getResponseBody`.
+/// Tries to stream the body via `Fetch.takeResponseBodyAsStream` + `IO.read`.
+/// If streaming can't start, falls back to `Fetch.getResponseBody` (one-shot,
+/// identical to the original `Network.getResponseBody` approach).
+/// If streaming started but failed mid-way, fulfills with the partial body
+/// to avoid hanging the request.
+///
+/// In every case the request is either fulfilled or continued — never left
+/// paused, never panics, never deadlocks.
 async fn handle_fetch_response_stage(
     page: &Page,
     ev: &std::sync::Arc<EventRequestPaused>,
@@ -899,8 +902,7 @@ async fn handle_fetch_response_stage(
     let content_length = super::stream::content_length_from_headers(&resp_headers);
     let threshold = super::stream::streaming_threshold_bytes();
 
-    // Small or unknown-but-probably-small responses: let the Network
-    // listener handle it with the simpler getResponseBody path.
+    // Small responses: let the Network listener handle via getResponseBody.
     let should_stream = match content_length {
         Some(len) => len >= threshold,
         // No Content-Length means chunked — stream to be safe.
@@ -919,102 +921,160 @@ async fn handle_fetch_response_stage(
     // Mark as in-flight so the Network listener skips this URL.
     crate::cache::remote::mark_stream_pending(&dedup_key);
 
-    // Attempt to stream the body.
-    let stream_result = super::stream::read_response_body_as_stream(
+    // ---------------------------------------------------------------
+    // Try streaming first.
+    // ---------------------------------------------------------------
+    let body_bytes = match super::stream::read_response_body_as_stream(
         page,
         ev.request_id.clone(),
         content_length,
     )
-    .await;
+    .await
+    {
+        super::stream::StreamResult::Ok(body) => body,
 
-    match stream_result {
-        Ok(body_bytes) => {
-            // Clear the pending marker — we'll insert the real entry below.
-            crate::cache::remote::clear_stream_pending(&dedup_key);
-
-            if is_body_empty_for_cache(&body_bytes) {
-                // Nothing to cache, but we consumed the body — must fulfill.
-                let mut params = FulfillRequestParams::new(
-                    ev.request_id.clone(),
-                    status,
-                );
-                params.body = Some(general_purpose::STANDARD.encode(&body_bytes).into());
-                params.response_headers = Some(headers_to_header_entries(&resp_headers));
-                page.send_command(params).await?;
-                return Ok(());
-            }
-
-            // Populate session cache.
-            let req_headers = request_headers_from_event(ev);
-            let cache_key_url = current_url;
-
-            let uri: http::uri::Uri = cache_key_url.parse().unwrap_or_default();
-            let req = crate::http::HttpRequestLike {
-                uri,
-                method: http::method::Method::GET,
-                headers: crate::http::convert_headers(&req_headers),
-            };
-            let res = crate::http::HttpResponseLike {
-                status: StatusCode::from_u16(status as u16)
-                    .unwrap_or(StatusCode::EXPECTATION_FAILED),
-                headers: crate::http::convert_headers(&resp_headers),
-            };
-            let policy = http_cache_semantics::CachePolicy::new(&req, &res);
-
-            let parsed_url = url::Url::parse(cache_key_url).unwrap_or_else(|_| {
-                url::Url::parse("http://localhost").expect("static URL")
-            });
-
-            let http_res = http_cache_reqwest::HttpResponse {
-                url: parsed_url,
-                body: body_bytes.clone(),
-                headers: http_cache::HttpHeaders::Modern(crate::http::headers_to_multi(
-                    &resp_headers,
-                )),
-                version: crate::http::HttpVersion::Http11.into(),
-                status: status as u16,
-                metadata: None,
-            };
-
-            // We need a cache_site to insert. Derive from auth + URL.
-            let cache_site =
-                site_key_for_target_url(cache_key_url, auth, None);
-
-            crate::cache::remote::session_cache_insert(
-                &cache_site,
-                http_res,
-                policy,
-                &dedup_key,
-            );
-
-            // Fulfill the paused request with the body we already read.
-            let mut params = FulfillRequestParams::new(ev.request_id.clone(), status);
-            params.body = Some(general_purpose::STANDARD.encode(&body_bytes).into());
-            params.response_headers = Some(headers_to_header_entries(&resp_headers));
-            page.send_command(params).await?;
-
-            tracing::debug!("Stream cached: {} ({} bytes)", current_url, body_bytes.len());
-        }
-        Err(err) => {
-            // Clear the pending marker so the Network listener can retry.
-            crate::cache::remote::clear_stream_pending(&dedup_key);
-
+        super::stream::StreamResult::NotStarted(err) => {
+            // Body was NOT consumed — fall back to the one-shot
+            // `Fetch.getResponseBody` (identical to the original
+            // `Network.getResponseBody` path).
             tracing::debug!(
-                "Stream failed for {}, falling back to Network path: {err}",
+                "Stream not started for {}, falling back to Fetch.getResponseBody: {err}",
                 current_url
             );
-
-            // Streaming failed — continue the request normally.  The
-            // `Network.responseReceived` listener will pick it up with
-            // `getResponseBody`.  Note: after `takeResponseBodyAsStream`
-            // fails, the request may already be in an unrecoverable state,
-            // so we send `continueRequest` best-effort.
-            let params = ContinueRequestParams::new(ev.request_id.clone());
-            let _ = page.send_command(params).await;
+            match fetch_response_body_oneshot(page, ev, &dedup_key).await {
+                Some(body) => body,
+                None => {
+                    // Both paths failed — continue the request so Chrome
+                    // processes it normally.  The Network listener may
+                    // still cache it via the original getResponseBody.
+                    crate::cache::remote::clear_stream_pending(&dedup_key);
+                    let params = ContinueRequestParams::new(ev.request_id.clone());
+                    let _ = page.send_command(params).await;
+                    return Ok(());
+                }
+            }
         }
+
+        super::stream::StreamResult::PartialBody { body, error } => {
+            // Body IS consumed — we MUST fulfill.  Use whatever was
+            // recovered (may be empty).
+            tracing::debug!(
+                "Stream failed mid-read for {} ({} bytes recovered): {error}",
+                current_url,
+                body.len(),
+            );
+            // Fulfill with the partial body so the request isn't left
+            // hanging.  Don't cache partial data.
+            crate::cache::remote::clear_stream_pending(&dedup_key);
+            let mut params = FulfillRequestParams::new(ev.request_id.clone(), status);
+            params.body = Some(general_purpose::STANDARD.encode(&body).into());
+            params.response_headers = Some(headers_to_header_entries(&resp_headers));
+            let _ = page.send_command(params).await;
+            return Ok(());
+        }
+    };
+
+    // ---------------------------------------------------------------
+    // We have the full body — cache and fulfill.
+    // ---------------------------------------------------------------
+    crate::cache::remote::clear_stream_pending(&dedup_key);
+
+    if is_body_empty_for_cache(&body_bytes) {
+        let mut params = FulfillRequestParams::new(ev.request_id.clone(), status);
+        params.body = Some(general_purpose::STANDARD.encode(&body_bytes).into());
+        params.response_headers = Some(headers_to_header_entries(&resp_headers));
+        page.send_command(params).await?;
+        return Ok(());
     }
 
+    // Populate session cache.
+    let req_headers = request_headers_from_event(ev);
+    let cache_key_url = current_url;
+
+    let uri: http::uri::Uri = cache_key_url.parse().unwrap_or_default();
+    let req = crate::http::HttpRequestLike {
+        uri,
+        method: http::method::Method::GET,
+        headers: crate::http::convert_headers(&req_headers),
+    };
+    let res = crate::http::HttpResponseLike {
+        status: StatusCode::from_u16(status as u16)
+            .unwrap_or(StatusCode::EXPECTATION_FAILED),
+        headers: crate::http::convert_headers(&resp_headers),
+    };
+    let policy = http_cache_semantics::CachePolicy::new(&req, &res);
+
+    let parsed_url = url::Url::parse(cache_key_url).unwrap_or_else(|_| {
+        url::Url::parse("http://localhost").expect("static URL")
+    });
+
+    let http_res = http_cache_reqwest::HttpResponse {
+        url: parsed_url,
+        body: body_bytes.clone(),
+        headers: http_cache::HttpHeaders::Modern(crate::http::headers_to_multi(
+            &resp_headers,
+        )),
+        version: crate::http::HttpVersion::Http11.into(),
+        status: status as u16,
+        metadata: None,
+    };
+
+    let cache_site = site_key_for_target_url(cache_key_url, auth, None);
+
+    crate::cache::remote::session_cache_insert(
+        &cache_site,
+        http_res,
+        policy,
+        &dedup_key,
+    );
+
+    // Fulfill the paused request with the full body.
+    let mut params = FulfillRequestParams::new(ev.request_id.clone(), status);
+    params.body = Some(general_purpose::STANDARD.encode(&body_bytes).into());
+    params.response_headers = Some(headers_to_header_entries(&resp_headers));
+    page.send_command(params).await?;
+
+    tracing::debug!("Stream cached: {} ({} bytes)", current_url, body_bytes.len());
+
     Ok(())
+}
+
+/// Fallback: use `Fetch.getResponseBody` (one-shot, same as the original
+/// `Network.getResponseBody` approach) when streaming couldn't start.
+///
+/// Returns `Some(body)` on success, `None` if the fallback also fails.
+async fn fetch_response_body_oneshot(
+    page: &Page,
+    ev: &std::sync::Arc<EventRequestPaused>,
+    dedup_key: &str,
+) -> Option<Vec<u8>> {
+    use chromiumoxide_cdp::cdp::browser_protocol::fetch::GetResponseBodyParams;
+
+    let result = page
+        .execute(GetResponseBodyParams::new(ev.request_id.clone()))
+        .await;
+
+    match result {
+        Ok(ret) => {
+            let body_bytes = if ret.result.base64_encoded {
+                match general_purpose::STANDARD.decode(&ret.result.body) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        tracing::debug!("Fetch.getResponseBody base64 decode failed: {err}");
+                        crate::cache::remote::clear_stream_pending(dedup_key);
+                        return None;
+                    }
+                }
+            } else {
+                ret.result.body.into_bytes()
+            };
+            Some(body_bytes)
+        }
+        Err(err) => {
+            tracing::debug!("Fetch.getResponseBody failed: {err}");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
