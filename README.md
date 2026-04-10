@@ -3,11 +3,19 @@
 [![Crates.io](https://img.shields.io/crates/v/chromey.svg)](https://crates.io/crates/chromey)
 [![Documentation](https://docs.rs/chromey/badge.svg)](https://docs.rs/chromey)
 
-A concurrent high-level API to control Chrome or Firefox over the DevTools Protocol.
+A fast, concurrent Chrome DevTools Protocol (CDP) library for Rust.
 
-This project is a fork of [chromiumoxide](https://github.com/mattsse/chromiumoxide) that primarily keeps CDP up to date, applies bug fixes, improves emulation, adblocking, firewalls, extended features, performance, and enables high-concurrency CDP capabilities. The project was moved over from [spider](https://github.com/spider-rs/spider) causing the commits to reset.
+Control headless or headed Chrome/Chromium with high concurrency, built-in adblocking, network firewalls, HTTP caching, browser fingerprinting, and always up-to-date CDP bindings.
 
-## Usage
+## Quick Start
+
+Add chromey to your `Cargo.toml`:
+
+```toml
+chromey = "2"
+```
+
+Navigate to a page and interact with it:
 
 ```rust
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -15,12 +23,9 @@ use futures_util::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-   // create a `Browser` that spawns a `chromium` process running with UI (`with_head()`, headless is default) 
-   // and the handler that drives the websocket etc.
     let (mut browser, mut handler) =
         Browser::launch(BrowserConfig::builder().with_head().build()?).await?;
-    
-   // spawn a new task that continuously polls the handler
+
     let handle = tokio::task::spawn(async move {
         while let Some(h) = handler.next().await {
             if h.is_err() {
@@ -28,82 +33,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    
-   // create a new browser page and navigate to the url
-    let page = browser.new_page("https://en.wikipedia.org").await?;
-    
-   // find the search bar type into the search field and hit `Enter`,
-   // this triggers a new navigation to the search result page
-   page.find_element("input#searchInput")
-           .await?
-           .click()
-           .await?
-           .type_str("Rust programming language")
-           .await?
-           .press_key("Enter")
-           .await?;
 
-   let html = page.wait_for_navigation().await?.content().await?;
-   
+    let page = browser.new_page("https://en.wikipedia.org").await?;
+
+    page.find_element("input#searchInput")
+        .await?
+        .click()
+        .await?
+        .type_str("Rust programming language")
+        .await?
+        .press_key("Enter")
+        .await?;
+
+    let html = page.wait_for_navigation().await?.content().await?;
+
     browser.close().await?;
     let _ = handle.await;
     Ok(())
 }
 ```
 
-The current API still lacks some functionality, but the [`Page::execute`](src/page.rs) function allows sending all `chromiumoxide_types::Command` types (see [Generated Code](README.md#generated-code)). Most `Element` and `Page` functions are basically just simplified command constructions and combinations, like `Page::pdf`:
+## Features
 
-```rust
-pub async fn pdf(&self, params: PrintToPdfParams) -> Result<Vec<u8>> {
-     let res = self.execute(params).await?;
-     Ok(base64::decode(&res.data)?)
- }
-```
+All features are opt-in via Cargo feature flags (except `simd` and `default-tls` which are on by default).
 
-If you need something else, the `Page::execute` function allows for writing your own command wrappers. PRs are very welcome if you think a meaningful command is missing a designated function.
+| Feature | Flag | What it does |
+|---|---|---|
+| SIMD JSON | `simd` | Fast CDP message parsing via `sonic-rs` (default) |
+| Adblocking | `adblock` | Built-in cosmetic + network adblocking engine |
+| Adblock EasyList | `adblock_easylist` | Ships with bundled EasyList filter lists |
+| Network firewall | `firewall-default` / `firewall-rustls` | Block requests by domain, pattern, or resource type |
+| HTTP caching | `cache` / `cache_mem` | Disk or in-memory HTTP response caching |
+| Browser fetcher | `_fetcher-native-tokio` / `_fetcher-rusttls-tokio` | Auto-download Chrome for Testing |
+| Browser fingerprinting | (always on) | Realistic fingerprint emulation via `spider_fingerprint` |
+| io_uring | `io_uring` | Linux io_uring support for I/O-heavy workloads |
+| Deep JSON | `serde_stacker` | Parse deeply nested CDP payloads without stack overflow |
 
-### Add chromey to your project
+## Auto-Download Chrome
 
-`chromey` comes with support for [`tokio`](https://github.com/tokio-rs/tokio) runtime. 
-
-```toml
-chromey = { version = "2", default-features = false }
-```
-
-This configuration is made possible primarily by the websocket crate of choice: [`tokio-tungstenite`](https://github.com/snapview/tokio-tungstenite/tree/master).
-
-## Generated Code
-
-The [`chromiumoxide_pdl`](chromiumoxide_pdl) crate contains a [PDL parser](chromiumoxide_pdl/src/pdl/parser.rs), which is a rust rewrite of a [python script in the chromium source tree]( https://chromium.googlesource.com/deps/inspector_protocol/+/refs/heads/master/pdl.py) and a [`Generator`](chromiumoxide_pdl/src/build/generator.rs) that turns the parsed PDL files into rust code. The [`chromiumoxide_cdp`](chromiumoxide_cdp) crate only purpose is to invoke the generator during its [build process](chromiumoxide_cdp/build.rs) and [include the generated output](chromiumoxide_cdp/src/lib.rs) before compiling the crate itself. This separation is done merely because the generated output is ~60K lines of rust code (not including all the proc macro expansions). So expect the compiling to take some time.
-The generator can be configured and used independently, see [chromiumoxide_cdp/build.rs](chromiumoxide_cdp/build.rs).
-
-Every chrome pdl domain is put in its own rust module, the types for the page domain of the browser_protocol are in `chromiumoxide_cdp::cdp::browser_protocol::page`, the runtime domain of the js_protocol in  `chromiumoxide_cdp::cdp::js_protocol::runtime` and so on.
-
-[vanilla.aslushnikov.com](https://vanilla.aslushnikov.com/) is a great resource to browse all the types defined in the pdl files. This site displays `Command` types as defined in the pdl files as `Method`. `chromiumoxid` sticks to the `Command` nomenclature. So for everything that is defined as a command type in the pdl (=marked as `Method` on [vanilla.aslushnikov.com](https://vanilla.aslushnikov.com/)) `chromiumoxide` contains a type for command and a designated type for the return type. For every command there is a `<name of command>Params` type with builder support (`<name of command>Params::builder()`) and its corresponding return type: `<name of command>Returns`. All commands share an implementation of the `chromiumoxide_types::Command` trait.
-All Events are bundled in single enum (`CdpEvent`)
-
-## Fetcher
-
-By default `chromey` will try to find an installed version of chromium on the computer it runs on.
-It is possible to download and install one automatically for some platforms using the `fetcher`.
-
-Ther features are currently a bit messy due to a Cargo bug and will be changed once it is resolved.
-Based on your runtime and TLS configuration you should enable one of the following:
-- `_fetcher-rusttls-tokio`
-- `_fetcher-native-tokio`
+If you don't have Chrome installed, chromey can fetch it for you:
 
 ```rust
 use std::path::Path;
-
-use futures_util::StreamExt;
-
-use chromiumoxide::browser::{BrowserConfig};
+use chromiumoxide::browser::BrowserConfig;
 use chromiumoxide::fetcher::{BrowserFetcher, BrowserFetcherOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let download_path = Path::new("./download");
+    let download_path = Path::new("./chrome");
     tokio::fs::create_dir_all(&download_path).await?;
+
     let fetcher = BrowserFetcher::new(
         BrowserFetcherOptions::builder()
             .with_path(&download_path)
@@ -111,28 +90,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let info = fetcher.fetch().await?;
 
-    let config = BrowserConfig::builder()
+    let _config = BrowserConfig::builder()
         .chrome_executable(info.executable_path)
-        .build()?,
+        .build()?;
+
+    Ok(())
 }
 ```
 
+Enable with `_fetcher-native-tokio` or `_fetcher-rusttls-tokio`.
+
 ## Remote Caching
 
-Enable remote caching by using the [hybrid_cache_server](https://github.com/spider-rs/hybrid_cache_server) crate and set the `HYBRID_CACHE_ENDPOINT` env variable ex: `HYBRID_CACHE_ENDPOINT=http://remote-cache:8080`. Use the remote cache methods to perform navigation or set content.
+Enable remote HTTP caching with [hybrid_cache_server](https://github.com/spider-rs/hybrid_cache_server) by setting `HYBRID_CACHE_ENDPOINT`:
+
+```sh
+HYBRID_CACHE_ENDPOINT=http://remote-cache:8080
+```
+
+## Extending with CDP Commands
+
+Every CDP command is available through `Page::execute`. Most built-in methods are thin wrappers around it:
+
+```rust
+pub async fn pdf(&self, params: PrintToPdfParams) -> Result<Vec<u8>> {
+    let res = self.execute(params).await?;
+    Ok(base64::decode(&res.data)?)
+}
+```
+
+Browse all available CDP types at [vanilla.aslushnikov.com](https://vanilla.aslushnikov.com/).
 
 ## License
 
-Licensed under either of these:
+Licensed under either of:
 
- * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-   https://www.apache.org/licenses/LICENSE-2.0)
- * MIT license ([LICENSE-MIT](LICENSE-MIT) or
-   https://opensource.org/licenses/MIT)
-   
-
-## References
-
-* [chromedp](https://github.com/chromedp/chromedp)
-* [rust-headless-chrome](https://github.com/atroche/rust-headless-chrome) which the launch config, `KeyDefinition` and typing support among others is taken from.
-* [puppeteer](https://github.com/puppeteer/puppeteer)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
