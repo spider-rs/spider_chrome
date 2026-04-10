@@ -3,19 +3,13 @@
 [![Crates.io](https://img.shields.io/crates/v/chromey.svg)](https://crates.io/crates/chromey)
 [![Documentation](https://docs.rs/chromey/badge.svg)](https://docs.rs/chromey)
 
-A fast, concurrent Chrome DevTools Protocol (CDP) library for Rust.
-
-Control headless or headed Chrome/Chromium with high concurrency, built-in adblocking, network firewalls, HTTP caching, browser fingerprinting, and always up-to-date CDP bindings.
+Chrome DevTools Protocol library for Rust.
 
 ## Quick Start
-
-Add chromey to your `Cargo.toml`:
 
 ```toml
 chromey = "2"
 ```
-
-Navigate to a page and interact with it:
 
 ```rust
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -55,23 +49,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Features
 
-All features are opt-in via Cargo feature flags (except `simd` and `default-tls` which are on by default).
+Optional features enabled via Cargo feature flags:
 
-| Feature | Flag | What it does |
-|---|---|---|
-| SIMD JSON | `simd` | Fast CDP message parsing via `sonic-rs` (default) |
-| Adblocking | `adblock` | Built-in cosmetic + network adblocking engine |
-| Adblock EasyList | `adblock_easylist` | Ships with bundled EasyList filter lists |
-| Network firewall | `firewall-default` / `firewall-rustls` | Block requests by domain, pattern, or resource type |
-| HTTP caching | `cache` / `cache_mem` | Disk or in-memory HTTP response caching |
-| Browser fetcher | `_fetcher-native-tokio` / `_fetcher-rusttls-tokio` | Auto-download Chrome for Testing |
-| Browser fingerprinting | (always on) | Realistic fingerprint emulation via `spider_fingerprint` |
-| io_uring | `io_uring` | Linux io_uring support for I/O-heavy workloads |
-| Deep JSON | `serde_stacker` | Parse deeply nested CDP payloads without stack overflow |
+| Flag | Description |
+|---|---|
+| `simd` | Fast CDP message parsing (default) |
+| `adblock` | Network and cosmetic adblocking |
+| `adblock_easylist` | Bundled EasyList filter lists |
+| `firewall-default` / `firewall-rustls` | Request blocking by domain or pattern |
+| `cache` / `cache_mem` | Disk or in-memory HTTP response caching |
+| `_fetcher-native-tokio` / `_fetcher-rusttls-tokio` | Auto-download Chrome for Testing |
+| `io_uring` | Linux io_uring I/O |
+| `serde_stacker` | Deeply nested CDP payload parsing |
 
 ## Auto-Download Chrome
-
-If you don't have Chrome installed, chromey can fetch it for you:
 
 ```rust
 use std::path::Path;
@@ -98,19 +89,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Enable with `_fetcher-native-tokio` or `_fetcher-rusttls-tokio`.
+Requires `_fetcher-native-tokio` or `_fetcher-rusttls-tokio`.
 
-## Remote Caching
+## CDP Commands
 
-Enable remote HTTP caching with [hybrid_cache_server](https://github.com/spider-rs/hybrid_cache_server) by setting `HYBRID_CACHE_ENDPOINT`:
-
-```sh
-HYBRID_CACHE_ENDPOINT=http://remote-cache:8080
-```
-
-## Extending with CDP Commands
-
-Every CDP command is available through `Page::execute`. Most built-in methods are thin wrappers around it:
+Every CDP command is available through `Page::execute`. Most built-in methods are thin wrappers:
 
 ```rust
 pub async fn pdf(&self, params: PrintToPdfParams) -> Result<Vec<u8>> {
@@ -119,7 +102,7 @@ pub async fn pdf(&self, params: PrintToPdfParams) -> Result<Vec<u8>> {
 }
 ```
 
-Browse all available CDP types at [vanilla.aslushnikov.com](https://vanilla.aslushnikov.com/).
+Browse CDP types at [vanilla.aslushnikov.com](https://vanilla.aslushnikov.com/).
 
 ## License
 
@@ -127,3 +110,7 @@ Licensed under either of:
 
 - [Apache License, Version 2.0](LICENSE-APACHE)
 - [MIT License](LICENSE-MIT)
+
+## Acknowledgments
+
+Originally forked from [chromiumoxide](https://github.com/mattsse/chromiumoxide).
