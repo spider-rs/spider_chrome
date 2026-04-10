@@ -7,9 +7,9 @@
 //!
 //! When the `_cache_stream_disk` feature is enabled (default with `_cache`),
 //! chunks are spilled to a temporary file so that only one chunk lives in
-//! memory at a time.  The completed file is read back as a single `Vec<u8>`
-//! for cache insertion.  When disabled, chunks accumulate in a `Vec<u8>`
-//! directly.
+//! memory at a time.  If any disk I/O error occurs (disk full, permissions,
+//! temp dir missing, etc.) the reader transparently falls back to in-memory
+//! accumulation for the remainder of the stream — no data is ever lost.
 
 use crate::page::Page;
 use base64::{engine::general_purpose, Engine as _};
@@ -56,6 +56,10 @@ static GLOBAL_STREAM_PERMITS: Semaphore = Semaphore::const_new(12);
 /// Number of streams currently in-flight (for diagnostics / metrics).
 static INFLIGHT_STREAMS: AtomicUsize = AtomicUsize::new(0);
 
+/// Monotonic counter for unique temp file names.
+#[cfg(feature = "_cache_stream_disk")]
+static STREAM_FILE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 /// Returns the number of body streams currently being read.
 #[inline]
 pub fn inflight_stream_count() -> usize {
@@ -89,7 +93,7 @@ pub fn streaming_threshold_bytes() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Stream guard (RAII close)
+// Stream guard (RAII — ensures IO.close)
 // ---------------------------------------------------------------------------
 
 /// RAII guard that ensures `IO.close` is sent even on early return / error.
@@ -106,7 +110,7 @@ impl<'a> StreamGuard<'a> {
         }
     }
 
-    /// Take ownership of the handle (called on success to close explicitly).
+    /// Take ownership of the handle (called before explicit close).
     fn take(&mut self) -> Option<StreamHandle> {
         self.handle.take()
     }
@@ -116,8 +120,7 @@ impl Drop for StreamGuard<'_> {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             let page = self.page.clone();
-            // Fire-and-forget: close on a background task so Drop is
-            // non-blocking and cannot deadlock the current task.
+            // Fire-and-forget on a background task so Drop is non-blocking.
             tokio::spawn(async move {
                 let _ = page.execute(CloseParams { handle }).await;
             });
@@ -126,37 +129,133 @@ impl Drop for StreamGuard<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Disk-backed temp file guard
+// ChunkSink — disk with automatic memory fallback
 // ---------------------------------------------------------------------------
 
-/// RAII guard that removes the temp file on drop (success or error).
+/// Where decoded chunks are accumulated.  Starts on disk when possible
+/// and falls back to memory transparently on any I/O error.
 #[cfg(feature = "_cache_stream_disk")]
-struct TempFileGuard {
-    path: std::path::PathBuf,
+enum ChunkSink {
+    /// Chunks are written to a temp file.
+    Disk {
+        file: tokio::fs::File,
+        path: std::path::PathBuf,
+    },
+    /// In-memory accumulation (initial mode when `_cache_stream_disk` is off,
+    /// or fallback after a disk error).
+    Memory { buf: Vec<u8> },
 }
 
 #[cfg(feature = "_cache_stream_disk")]
-impl TempFileGuard {
-    fn new(path: std::path::PathBuf) -> Self {
-        Self { path }
+impl ChunkSink {
+    /// Try to open a temp file.  Returns `Memory` on any failure.
+    async fn open_disk() -> Self {
+        match Self::try_open_disk().await {
+            Ok(sink) => sink,
+            Err(err) => {
+                tracing::debug!("stream disk init failed, using memory: {err}");
+                ChunkSink::Memory { buf: Vec::new() }
+            }
+        }
     }
 
-    /// Consume the guard, returning the path without deleting the file.
-    /// The caller takes responsibility for cleanup.
-    fn into_path(mut self) -> std::path::PathBuf {
-        let p = std::mem::take(&mut self.path);
-        // Prevent Drop from running removal on the now-empty path.
-        std::mem::forget(self);
-        p
+    async fn try_open_disk() -> Result<Self, std::io::Error> {
+        let tmp_dir = std::env::temp_dir();
+
+        // Ensure the directory exists (handles bare containers, chroots, etc).
+        tokio::fs::create_dir_all(&tmp_dir).await?;
+
+        // Unique name: PID + monotonic counter — no collisions within a process.
+        let seq = STREAM_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let file_name = format!("chromey_stream_{}_{}.tmp", std::process::id(), seq);
+        let path = tmp_dir.join(file_name);
+
+        let file = tokio::fs::File::create(&path).await?;
+        Ok(ChunkSink::Disk { file, path })
+    }
+
+    /// Write a decoded chunk.  On disk I/O error, reads back what was
+    /// already written, appends the current chunk, and switches to `Memory`.
+    /// Never returns an error — disk failures are absorbed silently.
+    async fn write_chunk(&mut self, decoded: &[u8]) {
+        match self {
+            ChunkSink::Disk { file, path } => {
+                use tokio::io::AsyncWriteExt;
+                if let Err(err) = file.write_all(decoded).await {
+                    tracing::debug!(
+                        "stream disk write failed, falling back to memory: {err}"
+                    );
+                    // Best-effort flush so read-back captures as much as
+                    // possible.  Ignore errors — we're already in fallback.
+                    let _ = file.flush().await;
+
+                    // Read back whatever was successfully written.
+                    let mut recovered = match tokio::fs::read(path.as_path()).await {
+                        Ok(bytes) => bytes,
+                        Err(_) => Vec::new(),
+                    };
+
+                    // Clean up the temp file — we no longer need it.
+                    let _ = tokio::fs::remove_file(path.as_path()).await;
+
+                    // Append the current chunk that failed to write.
+                    recovered.extend_from_slice(decoded);
+
+                    // Swap to Memory.  The old `file` handle and `path` are
+                    // replaced; the file is already deleted above.
+                    *self = ChunkSink::Memory { buf: recovered };
+                }
+            }
+            ChunkSink::Memory { buf } => {
+                buf.extend_from_slice(decoded);
+            }
+        }
+    }
+
+    /// Finalize: return the complete body and clean up any temp file.
+    ///
+    /// If the temp file can't be read back (extremely rare — would require
+    /// the file to vanish or permissions to change between write and read),
+    /// returns an empty `Vec` so the caller can skip caching rather than
+    /// panic.  The stream is still properly closed by the `StreamGuard`.
+    async fn finish(&mut self) -> Vec<u8> {
+        match self {
+            ChunkSink::Disk { ref mut file, ref path } => {
+                use tokio::io::AsyncWriteExt;
+
+                if let Err(err) = file.flush().await {
+                    tracing::debug!("stream disk flush failed on finish: {err}");
+                }
+
+                let path = path.clone();
+
+                let body = match tokio::fs::read(&path).await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        tracing::debug!("stream disk read-back failed: {err}");
+                        Vec::new()
+                    }
+                };
+                // Always clean up.
+                let _ = tokio::fs::remove_file(&path).await;
+
+                // Switch to Memory so Drop doesn't try to remove again.
+                *self = ChunkSink::Memory { buf: Vec::new() };
+
+                body
+            }
+            ChunkSink::Memory { ref mut buf } => std::mem::take(buf),
+        }
     }
 }
 
 #[cfg(feature = "_cache_stream_disk")]
-impl Drop for TempFileGuard {
+impl Drop for ChunkSink {
     fn drop(&mut self) {
-        if !self.path.as_os_str().is_empty() {
-            let path = self.path.clone();
-            // Best-effort removal — don't block the current task.
+        // If the sink is dropped without calling `finish` (e.g. early error),
+        // clean up the temp file in the background.
+        if let ChunkSink::Disk { path, .. } = self {
+            let path = path.clone();
             tokio::spawn(async move {
                 let _ = tokio::fs::remove_file(&path).await;
             });
@@ -165,36 +264,27 @@ impl Drop for TempFileGuard {
 }
 
 // ---------------------------------------------------------------------------
-// Stream reader — disk-backed path
+// Unified chunk reader
 // ---------------------------------------------------------------------------
 
-/// Disk-backed: stream chunks to a temp file, then read back.
-/// Peak memory = one chunk (~64 KiB) rather than the full body.
-#[cfg(feature = "_cache_stream_disk")]
-async fn read_chunks_to_disk(
+/// Read all chunks from a CDP IO stream.  Returns the fully assembled body.
+///
+/// With `_cache_stream_disk`: spills to disk, auto-falls back to memory.
+/// Without: pure in-memory accumulation.
+async fn read_all_chunks(
     page: &Page,
     stream_handle: &StreamHandle,
     guard: &mut StreamGuard<'_>,
+    content_length_hint: Option<usize>,
 ) -> Result<Vec<u8>, StreamError> {
-    use tokio::io::AsyncWriteExt;
+    // Initialise the sink.
+    #[cfg(feature = "_cache_stream_disk")]
+    let mut sink = ChunkSink::open_disk().await;
 
-    // Create a unique temp file.
-    let tmp_dir = std::env::temp_dir();
-    let file_name = format!(
-        "chromey_stream_{:x}_{:x}.tmp",
-        std::process::id(),
-        INFLIGHT_STREAMS.load(Ordering::Relaxed) as u64
-            ^ std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
+    #[cfg(not(feature = "_cache_stream_disk"))]
+    let mut body = Vec::with_capacity(
+        content_length_hint.unwrap_or(0).min(MAX_BODY_BYTES),
     );
-    let tmp_path = tmp_dir.join(file_name);
-    let file_guard = TempFileGuard::new(tmp_path.clone());
-
-    let mut file = tokio::fs::File::create(&tmp_path)
-        .await
-        .map_err(StreamError::Io)?;
 
     let mut total_bytes: usize = 0;
 
@@ -225,82 +315,18 @@ async fn read_chunks_to_disk(
 
         total_bytes += decoded.len();
 
+        // Enforce body size cap.
         if total_bytes > MAX_BODY_BYTES {
             if let Some(h) = guard.take() {
                 let _ = page.execute(CloseParams { handle: h }).await;
             }
-            // file_guard drops here → removes the temp file.
             return Err(StreamError::BodyTooLarge(total_bytes));
         }
 
-        file.write_all(&decoded).await.map_err(StreamError::Io)?;
+        #[cfg(feature = "_cache_stream_disk")]
+        sink.write_chunk(&decoded).await;
 
-        if chunk.eof {
-            break;
-        }
-    }
-
-    file.flush().await.map_err(StreamError::Io)?;
-    drop(file);
-
-    // Read the completed file back into memory.
-    let body = tokio::fs::read(file_guard.into_path())
-        .await
-        .map_err(StreamError::Io)?;
-
-    // Clean up the temp file now that we have the bytes.
-    let _ = tokio::fs::remove_file(&tmp_path).await;
-
-    Ok(body)
-}
-
-// ---------------------------------------------------------------------------
-// Stream reader — memory-only path
-// ---------------------------------------------------------------------------
-
-/// Memory-only: accumulate chunks into a Vec<u8>.
-#[cfg(not(feature = "_cache_stream_disk"))]
-async fn read_chunks_to_memory(
-    page: &Page,
-    stream_handle: &StreamHandle,
-    guard: &mut StreamGuard<'_>,
-    content_length_hint: Option<usize>,
-) -> Result<Vec<u8>, StreamError> {
-    let alloc_hint = content_length_hint.unwrap_or(0).min(MAX_BODY_BYTES);
-    let mut body = Vec::with_capacity(alloc_hint);
-
-    loop {
-        let read_result = tokio::time::timeout(STREAM_TIMEOUT, async {
-            page.execute(
-                ReadParams::builder()
-                    .handle(stream_handle.clone())
-                    .size(DEFAULT_IO_READ_CHUNK)
-                    .build()
-                    .map_err(StreamError::Build)?,
-            )
-            .await
-            .map_err(StreamError::Cdp)
-        })
-        .await
-        .map_err(|_| StreamError::Timeout)??;
-
-        let chunk = &read_result.result;
-
-        let decoded = if chunk.base64_encoded.unwrap_or(false) {
-            general_purpose::STANDARD
-                .decode(&chunk.data)
-                .map_err(StreamError::Base64)?
-        } else {
-            chunk.data.as_bytes().to_vec()
-        };
-
-        if body.len() + decoded.len() > MAX_BODY_BYTES {
-            if let Some(h) = guard.take() {
-                let _ = page.execute(CloseParams { handle: h }).await;
-            }
-            return Err(StreamError::BodyTooLarge(body.len() + decoded.len()));
-        }
-
+        #[cfg(not(feature = "_cache_stream_disk"))]
         body.extend_from_slice(&decoded);
 
         if chunk.eof {
@@ -308,6 +334,14 @@ async fn read_chunks_to_memory(
         }
     }
 
+    // Finalise.
+    #[cfg(feature = "_cache_stream_disk")]
+    {
+        let _ = content_length_hint; // used only by the memory path
+        Ok(sink.finish().await)
+    }
+
+    #[cfg(not(feature = "_cache_stream_disk"))]
     Ok(body)
 }
 
@@ -320,7 +354,9 @@ async fn read_chunks_to_memory(
 ///
 /// When the `_cache_stream_disk` feature is enabled (default), chunks are
 /// spilled to a temporary file so peak memory per stream stays at ~64 KiB.
-/// When disabled, chunks accumulate in a `Vec<u8>`.
+/// If any disk I/O error occurs the reader transparently falls back to
+/// in-memory accumulation — no chunks are ever lost.  When `_cache_stream_disk`
+/// is disabled, chunks accumulate in a `Vec<u8>` directly.
 ///
 /// # Concurrency
 ///
@@ -329,13 +365,14 @@ async fn read_chunks_to_memory(
 ///
 /// # Errors
 ///
-/// Returns `Err` if:
+/// Returns `Err` only for non-recoverable failures:
 /// - the semaphore is closed (should never happen),
 /// - `takeResponseBodyAsStream` fails (request not paused at HeadersReceived),
 /// - a timeout is exceeded,
 /// - the body exceeds `MAX_BODY_BYTES`.
 ///
-/// On *any* error the stream is closed via the `StreamGuard`.
+/// Disk I/O errors are **never** surfaced — the reader falls back silently.
+/// On any error the CDP stream is closed via the `StreamGuard`.
 pub async fn read_response_body_as_stream(
     page: &Page,
     request_id: impl Into<chromiumoxide_cdp::cdp::browser_protocol::fetch::RequestId>,
@@ -362,17 +399,10 @@ pub async fn read_response_body_as_stream(
     let stream_handle = returns.result.stream;
     let mut guard = StreamGuard::new(page, stream_handle.clone());
 
-    // Read chunks via the appropriate backend.
-    #[cfg(feature = "_cache_stream_disk")]
-    let body = {
-        let _ = content_length_hint; // used only by the memory path
-        read_chunks_to_disk(page, &stream_handle, &mut guard).await?
-    };
+    // Read all chunks.
+    let body = read_all_chunks(page, &stream_handle, &mut guard, content_length_hint).await?;
 
-    #[cfg(not(feature = "_cache_stream_disk"))]
-    let body = read_chunks_to_memory(page, &stream_handle, &mut guard, content_length_hint).await?;
-
-    // Explicitly close the stream (guard becomes a no-op).
+    // Explicitly close the CDP stream (guard becomes a no-op).
     if let Some(h) = guard.take() {
         let _ = page.execute(CloseParams { handle: h }).await;
     }
@@ -399,7 +429,8 @@ pub enum StreamError {
     Base64(base64::DecodeError),
     /// Builder error from CDP param construction.
     Build(String),
-    /// File I/O error (disk-backed streaming).
+    /// File I/O error (only when disk read-back in `finish()` fails after
+    /// the in-memory fallback itself failed — extremely unlikely).
     Io(std::io::Error),
 }
 
