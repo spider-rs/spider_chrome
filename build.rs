@@ -22,19 +22,27 @@ mod easylist {
         for &(host, path, filename) in LISTS {
             let dest = Path::new(&out_dir).join(filename);
 
-            // Cache: skip if already downloaded and non-trivial.
-            if dest.exists()
-                && std::fs::metadata(&dest)
-                    .map(|m| m.len() > 1024)
-                    .unwrap_or(false)
-            {
-                continue;
+            // Cache: skip if already downloaded, non-trivial, and valid ABP content.
+            if dest.exists() {
+                if let Ok(content) = std::fs::read_to_string(&dest) {
+                    if content.len() > 1024 && content.contains("[Adblock Plus") {
+                        continue;
+                    }
+                }
             }
 
             match fetch_https(host, path) {
                 Ok(body) => {
-                    let _ = std::fs::write(&dest, &body);
-                    println!("cargo:warning=Downloaded {filename} ({} bytes)", body.len());
+                    // Validate: must start with the ABP header and have enough rules.
+                    if body.contains("[Adblock Plus") && body.lines().count() > 100 {
+                        let _ = std::fs::write(&dest, &body);
+                        println!("cargo:warning=Downloaded {filename} ({} bytes)", body.len());
+                    } else {
+                        if !dest.exists() {
+                            let _ = std::fs::write(&dest, "");
+                        }
+                        println!("cargo:warning={filename}: response failed validation (corrupt or truncated), using fallback");
+                    }
                 }
                 Err(e) => {
                     // Write empty fallback so include_str! compiles.
