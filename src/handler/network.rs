@@ -1805,6 +1805,209 @@ mod tests {
         );
     }
 
+    /// Helper: run a URL through the full `on_fetch_request_paused` pipeline
+    /// and return whether it was blocked (true) or allowed (false).
+    #[cfg(feature = "adblock")]
+    fn run_full_interception(nm: &mut NetworkManager, url: &str, resource_type: chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType, is_same_site: bool) -> bool {
+        use super::NetworkEvent;
+
+        // Drain any prior events.
+        while nm.poll().is_some() {}
+
+        let event = make_request_paused(url, resource_type, is_same_site);
+        nm.on_fetch_request_paused(&event);
+
+        // Check what was emitted: Fetch.fulfillRequest = blocked, Fetch.continueRequest = allowed.
+        let mut blocked = false;
+        while let Some(ev) = nm.poll() {
+            if let NetworkEvent::SendCdpRequest((method, _)) = &ev {
+                let m: &str = method.as_ref();
+                if m == "Fetch.fulfillRequest" || m == "Fetch.failRequest" {
+                    blocked = true;
+                }
+            }
+        }
+        blocked
+    }
+
+    // ── End-to-end interception tests ───────────────────────────────────
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_tracker_script_blocked() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://www.wine-searcher.com/".to_string());
+
+        assert!(
+            run_full_interception(
+                &mut nm,
+                "https://www.googletagmanager.com/gtm.js?id=GTM-XXXX",
+                ResourceType::Script,
+                false,
+            ),
+            "GTM script should be blocked through full pipeline"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_legitimate_script_allowed() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://www.rust-lang.org/".to_string());
+
+        assert!(
+            !run_full_interception(
+                &mut nm,
+                "https://www.rust-lang.org/static/js/app-bundle.js",
+                ResourceType::Script,
+                true,
+            ),
+            "legitimate first-party script should be allowed through full pipeline"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_analytics_xhr_blocked() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://example.org/".to_string());
+
+        assert!(
+            run_full_interception(
+                &mut nm,
+                "https://www.google-analytics.com/g/collect?v=2&tid=UA-123",
+                ResourceType::Xhr,
+                false,
+            ),
+            "Google Analytics XHR should be blocked through full pipeline"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_whitelisted_overrides_adblock() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://example.org/".to_string());
+        nm.set_whitelist_patterns(["googletagmanager.com"]);
+
+        // GTM would normally be blocked by adblock, but whitelist overrides.
+        assert!(
+            !run_full_interception(
+                &mut nm,
+                "https://www.googletagmanager.com/gtm.js?id=GTM-TEST",
+                ResourceType::Script,
+                false,
+            ),
+            "whitelisted tracker should be allowed even when adblock would block it"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_blacklist_strict_overrides_whitelist() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://example.org/".to_string());
+        nm.set_blacklist_patterns(["cdn.example.net/evil.js"]);
+        nm.set_whitelist_patterns(["cdn.example.net/evil.js"]);
+        nm.set_blacklist_strict(true);
+
+        assert!(
+            run_full_interception(
+                &mut nm,
+                "https://cdn.example.net/evil.js",
+                ResourceType::Script,
+                false,
+            ),
+            "strict blacklist should win over whitelist"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_first_party_document_not_blocked() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://www.nytimes.com/".to_string());
+
+        assert!(
+            !run_full_interception(
+                &mut nm,
+                "https://www.nytimes.com/2024/article.html",
+                ResourceType::Document,
+                true,
+            ),
+            "first-party document navigation should never be blocked"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_custom_engine_blocks_through_pipeline() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://mysite.com/".to_string());
+
+        let mut filter_set = adblock::lists::FilterSet::new(false);
+        let mut opts = adblock::lists::ParseOptions::default();
+        opts.rule_types = adblock::lists::RuleTypes::All;
+        filter_set.add_filters(["||evil-cdn.example.net^$script"], opts);
+        let engine = adblock::Engine::from_filter_set(filter_set, true);
+        nm.set_adblock_engine(std::sync::Arc::new(engine));
+
+        assert!(
+            run_full_interception(
+                &mut nm,
+                "https://evil-cdn.example.net/tracker.js",
+                ResourceType::Script,
+                false,
+            ),
+            "custom engine rule should block through full pipeline"
+        );
+
+        // Legitimate script on the same site should still pass.
+        assert!(
+            !run_full_interception(
+                &mut nm,
+                "https://mysite.com/app.js",
+                ResourceType::Script,
+                true,
+            ),
+            "first-party script should still be allowed with custom engine"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_hostname_with_userinfo() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://example.org/".to_string());
+
+        // URL with userinfo should still correctly identify googletagmanager.com.
+        assert!(
+            run_full_interception(
+                &mut nm,
+                "https://user:pass@www.googletagmanager.com/gtm.js?id=GTM-XXXX",
+                ResourceType::Script,
+                false,
+            ),
+            "tracker URL with userinfo should still be blocked"
+        );
+    }
+
     #[test]
     fn test_blacklist_non_strict_allows_whitelist_override() {
         let mut nm = NetworkManager::new(false, Duration::from_secs(30));
