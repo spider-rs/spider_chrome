@@ -1234,8 +1234,23 @@ impl NetworkManager {
 
                 filter_set.add_filters(
                     &*spider_network_blocker::adblock::ADBLOCK_PATTERNS,
-                    rules,
+                    rules.clone(),
                 );
+
+                // When adblock_easylist is enabled, EasyList + EasyPrivacy are
+                // embedded at build time for zero-cost runtime loading.
+                #[cfg(feature = "adblock_easylist")]
+                {
+                    static EASYLIST: &str = include_str!(concat!(env!("OUT_DIR"), "/easylist.txt"));
+                    static EASYPRIVACY: &str = include_str!(concat!(env!("OUT_DIR"), "/easyprivacy.txt"));
+
+                    if !EASYLIST.is_empty() {
+                        filter_set.add_filter_list(EASYLIST, rules.clone());
+                    }
+                    if !EASYPRIVACY.is_empty() {
+                        filter_set.add_filter_list(EASYPRIVACY, rules);
+                    }
+                }
 
                 Engine::from_filter_set(filter_set, true)
             };
@@ -1717,17 +1732,17 @@ mod tests {
         use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
 
         let mut nm = NetworkManager::new(false, Duration::from_secs(30));
-        nm.set_page_url("https://example.com/".to_string());
+        nm.set_page_url("https://www.rust-lang.org/".to_string());
 
         let event = make_request_paused(
-            "https://cdn.example.com/assets/app-bundle.js",
+            "https://www.rust-lang.org/static/js/app-bundle.js",
             ResourceType::Script,
             true,
         );
 
         assert!(
             !nm.detect_ad(&event),
-            "legitimate app bundle should not be blocked"
+            "legitimate first-party app bundle should not be blocked"
         );
     }
 

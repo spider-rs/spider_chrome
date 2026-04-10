@@ -80,6 +80,9 @@ version = "2"
 optional = true
 default-features = false
 
+[build-dependencies]
+native-tls = { version = "0.2", optional = true }
+
 [dev-dependencies]
 quote = "1"
 proc-macro2 = "1"
@@ -96,6 +99,7 @@ stream = ["tokio-tungstenite/stream"]
 fetcher = []
 bytes = []
 adblock = ["dep:adblock"]
+adblock_easylist = ["adblock", "dep:native-tls"]
 simd = ["dep:sonic-rs"]
 firewall = ["dep:spider_firewall"]
 firewall-default = ["firewall", "spider_firewall/default"]
