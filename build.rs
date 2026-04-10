@@ -54,7 +54,7 @@ mod easylist {
         let mut tls = connector.connect(host, stream)?;
 
         let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n"
+            "GET {path} HTTP/1.0\r\nHost: {host}\r\nAccept-Encoding: identity\r\n\r\n"
         );
         tls.write_all(request.as_bytes())?;
 
@@ -86,7 +86,7 @@ mod easylist {
         let mut tls = connector.connect(host, stream)?;
 
         let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n"
+            "GET {path} HTTP/1.0\r\nHost: {host}\r\nAccept-Encoding: identity\r\n\r\n"
         );
         tls.write_all(request.as_bytes())?;
 

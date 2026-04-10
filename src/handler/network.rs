@@ -1738,10 +1738,10 @@ mod tests {
         use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
 
         let mut nm = NetworkManager::new(false, Duration::from_secs(30));
-        nm.set_page_url("https://www.rust-lang.org/".to_string());
+        nm.set_page_url("https://www.mylegitsite-test.com/".to_string());
 
         let event = make_request_paused(
-            "https://www.rust-lang.org/static/js/app-bundle.js",
+            "https://www.mylegitsite-test.com/static/js/app-bundle.js",
             ResourceType::Script,
             true,
         );
@@ -1857,12 +1857,12 @@ mod tests {
         use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
 
         let mut nm = NetworkManager::new(false, Duration::from_secs(30));
-        nm.set_page_url("https://www.rust-lang.org/".to_string());
+        nm.set_page_url("https://www.mylegitsite-test.com/".to_string());
 
         assert!(
             !run_full_interception(
                 &mut nm,
-                "https://www.rust-lang.org/static/js/app-bundle.js",
+                "https://www.mylegitsite-test.com/static/js/app-bundle.js",
                 ResourceType::Script,
                 true,
             ),
@@ -1985,6 +1985,37 @@ mod tests {
                 true,
             ),
             "first-party script should still be allowed with custom engine"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_ad_image_blocked() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://www.mylegitsite-test.com/".to_string());
+
+        // Ad tracking pixel should be blocked via adblock pattern or trie.
+        assert!(
+            run_full_interception(
+                &mut nm,
+                "https://googleads.g.doubleclick.net/pagead/viewthroughconversion/123/?random=456",
+                ResourceType::Image,
+                false,
+            ),
+            "doubleclick ad image/tracking pixel should be blocked"
+        );
+
+        // Legitimate first-party image should pass.
+        assert!(
+            !run_full_interception(
+                &mut nm,
+                "https://www.mylegitsite-test.com/images/logo.png",
+                ResourceType::Image,
+                true,
+            ),
+            "legitimate first-party image should not be blocked"
         );
     }
 
