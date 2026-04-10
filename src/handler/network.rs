@@ -1282,6 +1282,12 @@ impl NetworkManager {
             .strip_prefix("https://")
             .or_else(|| u.strip_prefix("http://"))
             .and_then(|rest| rest.split('/').next())
+            // Strip userinfo (user:pass@) if present.
+            .map(|authority| match authority.rfind('@') {
+                Some(i) => &authority[i + 1..],
+                None => authority,
+            })
+            // Strip port (:8080) if present.
             .and_then(|host_port| host_port.split(':').next())
             .unwrap_or(source_domain);
 

@@ -101,11 +101,17 @@ mod easylist {
     }
 
     fn extract_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
-        let lower = response.to_ascii_lowercase();
-        let needle = format!("\n{}: ", name.to_ascii_lowercase());
-        let start = lower.find(&needle)? + needle.len();
-        let end = response[start..].find('\r').map(|i| start + i).unwrap_or(response.len());
-        Some(response[start..end].trim())
+        // Search headers case-insensitively, line by line.
+        let header_end = response.find("\r\n\r\n").unwrap_or(response.len());
+        let headers_section = &response[..header_end];
+        let prefix = format!("{}: ", name.to_ascii_lowercase());
+
+        for line in headers_section.split("\r\n") {
+            if line.to_ascii_lowercase().starts_with(&prefix) {
+                return Some(line[prefix.len()..].trim());
+            }
+        }
+        None
     }
 
     fn parse_https_url(url: &str) -> Option<(String, String)> {
