@@ -489,6 +489,8 @@ impl Handler {
                 max_bytes_allowed: self.config.max_bytes_allowed,
                 whitelist_patterns: self.config.whitelist_patterns.clone(),
                 blacklist_patterns: self.config.blacklist_patterns.clone(),
+                #[cfg(feature = "adblock")]
+                adblock_filter_rules: self.config.adblock_filter_rules.clone(),
             },
             browser_ctx,
         );
@@ -808,6 +810,9 @@ pub struct HandlerConfig {
     pub whitelist_patterns: Option<Vec<String>>,
     /// Optional per-run/per-site blacklist of URL substrings (scripts/resources).
     pub blacklist_patterns: Option<Vec<String>>,
+    /// Extra ABP/uBO filter rules for the adblock engine.
+    #[cfg(feature = "adblock")]
+    pub adblock_filter_rules: Option<Vec<String>>,
     /// Capacity of the channel between browser handle and handler.
     /// Defaults to 1000.
     pub channel_capacity: usize,
@@ -839,6 +844,8 @@ impl Default for HandlerConfig {
             max_bytes_allowed: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
+            #[cfg(feature = "adblock")]
+            adblock_filter_rules: None,
             channel_capacity: 1000,
             connection_retries: crate::conn::DEFAULT_CONNECTION_RETRIES,
         }

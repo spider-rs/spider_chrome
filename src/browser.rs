@@ -291,6 +291,8 @@ impl Browser {
             max_bytes_allowed: config.max_bytes_allowed,
             whitelist_patterns: config.whitelist_patterns.clone(),
             blacklist_patterns: config.blacklist_patterns.clone(),
+            #[cfg(feature = "adblock")]
+            adblock_filter_rules: config.adblock_filter_rules.clone(),
             channel_capacity: config.channel_capacity,
             connection_retries: config.connection_retries,
         };
@@ -886,6 +888,11 @@ pub struct BrowserConfig {
     pub whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to block through the network.
     pub blacklist_patterns: Option<Vec<String>>,
+    /// Extra ABP/uBO filter rules to load into the adblock engine (requires `adblock` feature).
+    /// These are merged with the built-in `ADBLOCK_PATTERNS` for richer blocking
+    /// (e.g. EasyList / EasyPrivacy content).
+    #[cfg(feature = "adblock")]
+    pub adblock_filter_rules: Option<Vec<String>>,
     /// Capacity of the channel between browser handle and handler.
     /// Defaults to 1000.
     pub channel_capacity: usize,
@@ -959,6 +966,9 @@ pub struct BrowserConfigBuilder {
     whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to block through the network.
     blacklist_patterns: Option<Vec<String>>,
+    /// Extra ABP/uBO filter rules for the adblock engine.
+    #[cfg(feature = "adblock")]
+    adblock_filter_rules: Option<Vec<String>>,
     /// Capacity of the channel between browser handle and handler.
     channel_capacity: usize,
     /// Number of WebSocket connection retry attempts.
@@ -1013,6 +1023,8 @@ impl Default for BrowserConfigBuilder {
             max_bytes_allowed: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
+            #[cfg(feature = "adblock")]
+            adblock_filter_rules: None,
             channel_capacity: 1000,
             connection_retries: crate::conn::DEFAULT_CONNECTION_RETRIES,
         }
@@ -1204,6 +1216,14 @@ impl BrowserConfigBuilder {
         self
     }
 
+    /// Set extra ABP/uBO filter rules for the adblock engine.
+    /// Pass EasyList/EasyPrivacy content lines for richer blocking coverage.
+    #[cfg(feature = "adblock")]
+    pub fn set_adblock_filter_rules(mut self, rules: Vec<String>) -> Self {
+        self.adblock_filter_rules = Some(rules);
+        self
+    }
+
     /// Set the capacity of the channel between browser handle and handler.
     /// Defaults to 1000.
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
@@ -1257,6 +1277,8 @@ impl BrowserConfigBuilder {
             max_bytes_allowed: self.max_bytes_allowed,
             whitelist_patterns: self.whitelist_patterns,
             blacklist_patterns: self.blacklist_patterns,
+            #[cfg(feature = "adblock")]
+            adblock_filter_rules: self.adblock_filter_rules,
             channel_capacity: self.channel_capacity,
             connection_retries: self.connection_retries,
         })

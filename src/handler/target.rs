@@ -180,6 +180,26 @@ impl Target {
         network_manager.only_html = config.only_html;
         network_manager.intercept_manager = config.intercept_manager;
 
+        #[cfg(feature = "adblock")]
+        if let Some(rules) = &config.adblock_filter_rules {
+            use adblock::lists::{FilterSet, ParseOptions, RuleTypes};
+
+            let mut filter_set = FilterSet::new(false);
+            let mut opts = ParseOptions::default();
+            opts.rule_types = RuleTypes::All;
+
+            // Include built-in patterns.
+            filter_set.add_filters(
+                &*spider_network_blocker::adblock::ADBLOCK_PATTERNS,
+                opts.clone(),
+            );
+            // Merge user-supplied rules (e.g. EasyList / EasyPrivacy content).
+            filter_set.add_filters(rules.iter().map(|s| s.as_str()), opts);
+
+            let engine = adblock::Engine::from_filter_set(filter_set, true);
+            network_manager.set_adblock_engine(std::sync::Arc::new(engine));
+        }
+
         Self {
             info,
             r#type: ty,
@@ -876,6 +896,9 @@ pub struct TargetConfig {
     pub whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to black through the network.
     pub blacklist_patterns: Option<Vec<String>>,
+    /// Extra ABP/uBO filter rules for the adblock engine.
+    #[cfg(feature = "adblock")]
+    pub adblock_filter_rules: Option<Vec<String>>,
 }
 
 impl Default for TargetConfig {
@@ -898,6 +921,8 @@ impl Default for TargetConfig {
             max_bytes_allowed: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
+            #[cfg(feature = "adblock")]
+            adblock_filter_rules: None,
         }
     }
 }

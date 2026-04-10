@@ -238,6 +238,25 @@ pub(crate) fn is_redirect_status(status: i64) -> bool {
 /// milliseconds.
 const STALE_BUFFER_SECS: u64 = 30;
 
+/// Wrapper around `adblock::Engine` that implements `Debug`.
+#[cfg(feature = "adblock")]
+pub struct AdblockEngine(std::sync::Arc<adblock::Engine>);
+
+#[cfg(feature = "adblock")]
+impl std::fmt::Debug for AdblockEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdblockEngine").finish()
+    }
+}
+
+#[cfg(feature = "adblock")]
+impl std::ops::Deref for AdblockEngine {
+    type Target = adblock::Engine;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[derive(Debug)]
 /// The base network manager.
 pub struct NetworkManager {
@@ -362,6 +381,10 @@ pub struct NetworkManager {
     blacklist_matcher: Option<AhoCorasick>,
     /// If true, blacklist always wins (cannot be unblocked by whitelist/3p allow).
     blacklist_strict: bool,
+    /// Custom adblock engine built from user-supplied filter rules.
+    /// When `Some`, takes precedence over the global default engine.
+    #[cfg(feature = "adblock")]
+    adblock_engine: Option<AdblockEngine>,
 }
 
 impl NetworkManager {
@@ -403,7 +426,15 @@ impl NetworkManager {
             cache_site_key: None,
             #[cfg(feature = "_cache")]
             cache_policy: None,
+            #[cfg(feature = "adblock")]
+            adblock_engine: None,
         }
+    }
+
+    /// Set a custom adblock engine built from user-supplied filter rules.
+    #[cfg(feature = "adblock")]
+    pub fn set_adblock_engine(&mut self, engine: std::sync::Arc<adblock::Engine>) {
+        self.adblock_engine = Some(AdblockEngine(engine));
     }
 
     /// Replace the whitelist patterns (compiled once).
@@ -1185,7 +1216,9 @@ impl NetworkManager {
         (current_url_cow, had_replacer)
     }
 
-    /// Perform a page intercept for chrome
+    /// Perform a page intercept for chrome using the adblock engine.
+    /// Uses the custom engine when user-supplied filter rules are configured,
+    /// otherwise falls back to the global default engine with built-in patterns.
     #[cfg(feature = "adblock")]
     pub fn detect_ad(&self, event: &EventRequestPaused) -> bool {
         use adblock::{
@@ -1206,31 +1239,62 @@ impl NetworkManager {
 
                 Engine::from_filter_set(filter_set, true)
             };
-        };
+        }
 
-        let blockable = ResourceType::Image == event.resource_type
+        let blockable = event.resource_type == ResourceType::Script
+            || event.resource_type == ResourceType::Image
             || event.resource_type == ResourceType::Media
             || event.resource_type == ResourceType::Stylesheet
             || event.resource_type == ResourceType::Document
             || event.resource_type == ResourceType::Fetch
             || event.resource_type == ResourceType::Xhr;
 
+        if !blockable {
+            return false;
+        }
+
         let u = &event.request.url;
 
-        let block_request = blockable
-            // set it to example.com for 3rd party handling is_same_site
-        && {
-            let request = adblock::request::Request::preparsed(
-                 &u,
-                 "example.com",
-                 "example.com",
-                 &event.resource_type.as_ref().to_lowercase(),
-                 !event.request.is_same_site.unwrap_or_default());
-
-            AD_ENGINE.check_network_request(&request).matched
+        let source_domain = if self.document_target_domain.is_empty() {
+            "example.com"
+        } else {
+            &self.document_target_domain
         };
 
-        block_request
+        // Fast hostname extraction without full URL parsing.
+        // preparsed(url, request_hostname, source_hostname, type, third_party)
+        let hostname = u
+            .strip_prefix("https://")
+            .or_else(|| u.strip_prefix("http://"))
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|host_port| host_port.split(':').next())
+            .unwrap_or(source_domain);
+
+        let resource_type_str = match event.resource_type {
+            ResourceType::Script => "script",
+            ResourceType::Image => "image",
+            ResourceType::Media => "media",
+            ResourceType::Stylesheet => "stylesheet",
+            ResourceType::Document => "document",
+            ResourceType::Fetch => "fetch",
+            ResourceType::Xhr => "xhr",
+            _ => "other",
+        };
+
+        let request = adblock::request::Request::preparsed(
+            u,
+            hostname,
+            source_domain,
+            resource_type_str,
+            !event.request.is_same_site.unwrap_or_default(),
+        );
+
+        let engine: &Engine = match self.adblock_engine.as_ref() {
+            Some(custom) => custom,
+            None => &AD_ENGINE,
+        };
+
+        engine.check_network_request(&request).matched
     }
 
     pub fn on_fetch_auth_required(&mut self, event: &EventAuthRequired) {
@@ -1581,6 +1645,143 @@ mod tests {
         // In strict mode, it should still be considered blocked at decision time.
         // (We can only directly assert the matchers here; the decision logic is exercised in integration.)
         assert!(nm.blacklist_strict);
+    }
+
+    #[cfg(feature = "adblock")]
+    fn make_request_paused(
+        url: &str,
+        resource_type: chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType,
+        is_same_site: bool,
+    ) -> chromiumoxide_cdp::cdp::browser_protocol::fetch::EventRequestPaused {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::{
+            Headers, Request, ResourcePriority, RequestReferrerPolicy,
+        };
+        use chromiumoxide_cdp::cdp::browser_protocol::fetch::EventRequestPaused;
+
+        EventRequestPaused {
+            request_id: chromiumoxide_cdp::cdp::browser_protocol::network::RequestId::from(
+                "test-req".to_string(),
+            )
+            .into(),
+            request: Request {
+                url: url.to_string(),
+                method: "GET".to_string(),
+                headers: Headers::new(serde_json::Value::Object(Default::default())),
+                initial_priority: ResourcePriority::Medium,
+                referrer_policy: RequestReferrerPolicy::NoReferrer,
+                url_fragment: None,
+                has_post_data: None,
+                post_data_entries: None,
+                mixed_content_type: None,
+                is_link_preload: None,
+                trust_token_params: None,
+                is_same_site: Some(is_same_site),
+                is_ad_related: None,
+            },
+            frame_id: chromiumoxide_cdp::cdp::browser_protocol::page::FrameId::from(
+                "frame1".to_string(),
+            ),
+            resource_type,
+            response_error_reason: None,
+            response_status_code: None,
+            response_status_text: None,
+            response_headers: None,
+            network_id: None,
+            redirected_request_id: None,
+        }
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_detect_ad_blocks_known_tracker_scripts() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://www.wine-searcher.com/".to_string());
+
+        let event = make_request_paused(
+            "https://www.googletagmanager.com/gtm.js?id=GTM-XXXX",
+            ResourceType::Script,
+            false,
+        );
+
+        assert!(
+            nm.detect_ad(&event),
+            "googletagmanager.com script should be detected as ad"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_detect_ad_allows_legitimate_scripts() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://example.com/".to_string());
+
+        let event = make_request_paused(
+            "https://cdn.example.com/assets/app-bundle.js",
+            ResourceType::Script,
+            true,
+        );
+
+        assert!(
+            !nm.detect_ad(&event),
+            "legitimate app bundle should not be blocked"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_detect_ad_uses_source_domain() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://www.wine-searcher.com/some-page".to_string());
+
+        assert!(
+            !nm.document_target_domain.is_empty(),
+            "document_target_domain should be set after set_page_url"
+        );
+
+        let event = make_request_paused(
+            "https://www.google-analytics.com/analytics.js",
+            ResourceType::Script,
+            false,
+        );
+
+        assert!(
+            nm.detect_ad(&event),
+            "google-analytics.com should be blocked as tracker"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_custom_adblock_engine_takes_precedence() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://example.com/".to_string());
+
+        // Build a custom engine with a specific rule.
+        let mut filter_set = adblock::lists::FilterSet::new(false);
+        let mut opts = adblock::lists::ParseOptions::default();
+        opts.rule_types = adblock::lists::RuleTypes::All;
+        filter_set.add_filters(["||custom-tracker.example.net^"], opts);
+        let engine = adblock::Engine::from_filter_set(filter_set, true);
+        nm.set_adblock_engine(std::sync::Arc::new(engine));
+
+        let event = make_request_paused(
+            "https://custom-tracker.example.net/pixel.js",
+            ResourceType::Script,
+            false,
+        );
+
+        assert!(
+            nm.detect_ad(&event),
+            "custom engine rule should block custom-tracker.example.net"
+        );
     }
 
     #[test]
