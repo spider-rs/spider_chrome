@@ -436,7 +436,7 @@ impl Handler {
         let CdpEventMessage { params, method, .. } = event;
 
         match params {
-            CdpEvent::TargetTargetCreated(ref ev) => self.on_target_created(*ev.clone()),
+            CdpEvent::TargetTargetCreated(ref ev) => self.on_target_created((**ev).clone()),
             CdpEvent::TargetAttachedToTarget(ref ev) => self.on_attached_to_target(ev.clone()),
             CdpEvent::TargetTargetDestroyed(ref ev) => self.on_target_destroyed(ev.clone()),
             CdpEvent::TargetDetachedFromTarget(ref ev) => self.on_detached_from_target(ev.clone()),

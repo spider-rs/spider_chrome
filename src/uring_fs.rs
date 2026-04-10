@@ -345,28 +345,47 @@ mod inner {
     }
 
     pub async fn write_file(path: String, data: Vec<u8>) -> io::Result<()> {
-        if let Some(result) = try_uring(|tx| IoTask::WriteFile {
-            path: path.clone(),
-            data: data.clone(),
-            tx,
-        })
-        .await
-        {
-            return result;
+        if URING_ENABLED.load(Ordering::Acquire) {
+            if let Some(sender) = URING_POOL.get() {
+                let (tx, rx) = oneshot::channel();
+                if sender.send(IoTask::WriteFile { path, data, tx }).is_err() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "chromey io_uring worker channel closed",
+                    ));
+                }
+                return match rx.await {
+                    Ok(result) => result,
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "chromey io_uring worker dropped the response",
+                    )),
+                };
+            }
         }
-        tokio::fs::write(&path, &data).await
+        tokio::fs::write(path, data).await
     }
 
     pub async fn read_file(path: String) -> io::Result<Vec<u8>> {
-        if let Some(result) = try_uring(|tx| IoTask::ReadFile {
-            path: path.clone(),
-            tx,
-        })
-        .await
-        {
-            return result;
+        if URING_ENABLED.load(Ordering::Acquire) {
+            if let Some(sender) = URING_POOL.get() {
+                let (tx, rx) = oneshot::channel();
+                if sender.send(IoTask::ReadFile { path, tx }).is_err() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "chromey io_uring worker channel closed",
+                    ));
+                }
+                return match rx.await {
+                    Ok(result) => result,
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "chromey io_uring worker dropped the response",
+                    )),
+                };
+            }
         }
-        tokio::fs::read(&path).await
+        tokio::fs::read(path).await
     }
 
     pub async fn tcp_connect(addr: SocketAddr) -> io::Result<std::net::TcpStream> {
