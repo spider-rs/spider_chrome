@@ -21,6 +21,7 @@ pin_project! {
         delay: tokio::time::Sleep,
 
         message: Option<TargetMessage>,
+        send_fut: Option<Pin<Box<dyn Future<Output = std::result::Result<(), mpsc::error::SendError<TargetMessage>>> + Send>>>,
 
         method: MethodId,
 
@@ -49,6 +50,7 @@ impl<T: Command> CommandFuture<T> {
             target_sender,
             rx_command,
             message,
+            send_fut: None,
             delay,
             method,
             _marker: PhantomData,
@@ -65,21 +67,43 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
-        if this.message.is_some() {
-            let message = this.message.take().expect("existence checked above");
+        // Phase 1: deliver the command to the target channel.
+        if let Some(message) = this.message.take() {
             match this.target_sender.try_send(message) {
                 Ok(()) => {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    // Sent — fall through to phase 2.
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    *this.message = Some(msg);
+                Err(mpsc::error::TrySendError::Full(msg)) => {
+                    // Channel full — park via async send instead of busy-looping.
+                    let sender = this.target_sender.clone();
+                    *this.send_fut =
+                        Some(Box::pin(async move { sender.send(msg).await }));
                     cx.waker().wake_by_ref();
-                    Poll::Pending
+                    return Poll::Pending;
                 }
-                Err(e) => Poll::Ready(Err(e.into())),
+                Err(e) => return Poll::Ready(Err(e.into())),
             }
-        } else if this.delay.poll(cx).is_ready() {
+        }
+
+        if let Some(fut) = this.send_fut.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    *this.send_fut = None;
+                    // Sent — fall through to phase 2.
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                Poll::Pending => {
+                    // Enforce timeout while waiting for channel capacity.
+                    if this.delay.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(crate::error::CdpError::Timeout));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        // Phase 2: wait for the response on the oneshot.
+        if this.delay.as_mut().poll(cx).is_ready() {
             Poll::Ready(Err(crate::error::CdpError::Timeout))
         } else {
             match this.rx_command.as_mut().poll(cx) {

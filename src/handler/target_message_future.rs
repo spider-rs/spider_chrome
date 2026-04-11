@@ -7,6 +7,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::handler::target::TargetMessage;
 use crate::{error::Result, ArcHttpRequest};
 
+type SendFut = Pin<Box<dyn Future<Output = std::result::Result<(), mpsc::error::SendError<TargetMessage>>> + Send>>;
+
 /// Convenience alias for sending messages to a Target task/actor.
 ///
 /// This channel is typically owned by the Target event loop and accepts
@@ -19,6 +21,7 @@ pin_project! {
         rx_request: oneshot::Receiver<T>,
         target_sender: mpsc::Sender<TargetMessage>,
         message: Option<TargetMessage>,
+        send_fut: Option<SendFut>,
     }
 }
 
@@ -32,6 +35,7 @@ impl<T> TargetMessageFuture<T> {
             target_sender,
             rx_request,
             message: Some(message),
+            send_fut: None,
         }
     }
 
@@ -86,22 +90,36 @@ impl<T> Future for TargetMessageFuture<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
-        if this.message.is_some() {
-            let message = this.message.take().expect("existence checked above");
+        // Phase 1: deliver the message to the target channel.
+        if let Some(message) = this.message.take() {
             match this.target_sender.try_send(message) {
                 Ok(()) => {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    // Sent — fall through to phase 2.
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    *this.message = Some(msg);
+                Err(mpsc::error::TrySendError::Full(msg)) => {
+                    // Channel full — park via async send instead of busy-looping.
+                    let sender = this.target_sender.clone();
+                    *this.send_fut =
+                        Some(Box::pin(async move { sender.send(msg).await }));
                     cx.waker().wake_by_ref();
-                    Poll::Pending
+                    return Poll::Pending;
                 }
-                Err(e) => Poll::Ready(Err(e.into())),
+                Err(e) => return Poll::Ready(Err(e.into())),
             }
-        } else {
-            this.rx_request.as_mut().poll(cx).map_err(Into::into)
         }
+
+        if let Some(fut) = this.send_fut.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    *this.send_fut = None;
+                    // Sent — fall through to phase 2.
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Phase 2: wait for the result on the oneshot.
+        this.rx_request.as_mut().poll(cx).map_err(Into::into)
     }
 }

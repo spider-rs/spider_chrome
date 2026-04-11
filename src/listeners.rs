@@ -165,7 +165,15 @@ impl fmt::Debug for EventListenerRequest {
     }
 }
 
-/// Represents a single event listener
+/// Represents a single event listener.
+///
+/// Uses an unbounded channel intentionally: `flush()` is called
+/// synchronously from the handler's poll loop and cannot await a
+/// bounded channel's back-pressure. Bounding the channel would
+/// require either dropping events (behaviour change) or making
+/// the flush path async (large refactor). Consumers that register
+/// a listener must poll the resulting `EventStream` to prevent
+/// unbounded growth.
 pub struct EventListener {
     /// Unique id for this listener (used for immediate removal).
     pub id: ListenerId,
