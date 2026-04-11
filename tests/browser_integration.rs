@@ -601,6 +601,117 @@ async fn multiple_pages_concurrent_operations() {
     }
 }
 
+/// Generate a large HTML payload in Chrome via JS and read it back.
+/// This exercises the full body streaming/transfer pipeline under load
+/// and verifies no hang or timeout occurs for large content.
+#[tokio::test]
+async fn large_payload_set_content_and_read_back() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch_with_handler(browser_like_config("large-payload")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    // Generate ~512 KiB of HTML content via JS (avoids sending it over CDP).
+    timeout(
+        Duration::from_secs(30),
+        page.evaluate(
+            r#"
+            (() => {
+                const chunk = '<p>' + 'A'.repeat(1024) + '</p>\n';
+                document.body.innerHTML = chunk.repeat(512);
+            })()
+            "#,
+        ),
+    )
+    .await
+    .expect("evaluate should not time out")
+    .expect("evaluate should succeed");
+
+    let content = timeout(Duration::from_secs(30), page.content())
+        .await
+        .expect("content() should not time out — possible deadlock on large body")
+        .expect("content() should succeed");
+
+    // 512 chunks * ~1 KiB = ~512 KiB minimum
+    assert!(
+        content.len() > 400_000,
+        "expected at least 400KB of content, got {} bytes",
+        content.len()
+    );
+    eprintln!("large payload test: {} bytes read back", content.len());
+}
+
+/// Navigate multiple pages to real URLs concurrently.
+/// This tests that the full pipeline (navigation + content extraction)
+/// doesn't deadlock under concurrent real-world load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_navigation_and_content_extraction() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch_with_handler(browser_like_config("concurrent-nav")).await;
+
+    // Create 3 pages sequentially.
+    let mut pages = Vec::new();
+    for _ in 0..3 {
+        let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+            .await
+            .expect("new_page should not time out")
+            .expect("new_page should resolve");
+        pages.push(page);
+    }
+
+    // Navigate all pages concurrently with large generated content.
+    let futs: Vec<_> = pages
+        .into_iter()
+        .enumerate()
+        .map(|(i, page)| {
+            tokio::spawn(async move {
+                // Generate a ~256KB page via set_content.
+                let filler = "X".repeat(1000);
+                let body: String = (0..256)
+                    .map(|j| format!("<p data-page='{i}' data-idx='{j}'>{filler}</p>\n"))
+                    .collect();
+                let html = format!("<html><body>{body}</body></html>");
+
+                timeout(Duration::from_secs(30), page.set_content(&html))
+                    .await
+                    .unwrap_or_else(|_| panic!("page {i}: set_content timed out"))
+                    .unwrap_or_else(|e| panic!("page {i}: set_content failed: {e}"));
+
+                let content = timeout(Duration::from_secs(30), page.content())
+                    .await
+                    .unwrap_or_else(|_| panic!("page {i}: content() timed out"))
+                    .unwrap_or_else(|e| panic!("page {i}: content() failed: {e}"));
+
+                assert!(
+                    content.len() > 200_000,
+                    "page {i}: expected >200KB, got {} bytes",
+                    content.len()
+                );
+                eprintln!("page {i}: {} bytes", content.len());
+
+                // Also verify we can still run commands after the large transfer.
+                let url = page.url().await.expect("url() after large content");
+                assert!(url.is_some(), "page {i} should have a URL");
+            })
+        })
+        .collect();
+
+    for fut in futs {
+        fut.await.expect("task join");
+    }
+}
+
 /// Navigate to a real-world URL that may involve cross-origin redirects
 /// (e.g. adding `www.` prefix or CDN routing). This exercises the fix for
 /// navigation watchers losing track of the main frame when its ID changes

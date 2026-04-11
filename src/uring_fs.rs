@@ -321,46 +321,33 @@ mod inner {
         URING_ENABLED.load(Ordering::Acquire)
     }
 
-    async fn try_uring<T>(
-        make_task: impl FnOnce(oneshot::Sender<io::Result<T>>) -> IoTask,
-    ) -> Option<io::Result<T>> {
-        if !URING_ENABLED.load(Ordering::Acquire) {
-            return None;
-        }
-        let sender = URING_POOL.get()?;
-        let (tx, rx) = oneshot::channel();
-        if sender.send(make_task(tx)).is_err() {
-            return Some(Err(io::Error::new(
+    /// Send a pre-built `IoTask` to the worker and await its result.
+    /// Caller must only call this after checking `URING_ENABLED` and
+    /// `URING_POOL.get()`.
+    async fn await_worker<T>(
+        sender: &mpsc::UnboundedSender<IoTask>,
+        task: IoTask,
+        rx: oneshot::Receiver<io::Result<T>>,
+    ) -> io::Result<T> {
+        if sender.send(task).is_err() {
+            return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "chromey io_uring worker channel closed",
-            )));
+            ));
         }
-        match rx.await {
-            Ok(result) => Some(result),
-            Err(_) => Some(Err(io::Error::new(
+        rx.await.unwrap_or_else(|_| {
+            Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "chromey io_uring worker dropped the response",
-            ))),
-        }
+            ))
+        })
     }
 
     pub async fn write_file(path: String, data: Vec<u8>) -> io::Result<()> {
         if URING_ENABLED.load(Ordering::Acquire) {
             if let Some(sender) = URING_POOL.get() {
                 let (tx, rx) = oneshot::channel();
-                if sender.send(IoTask::WriteFile { path, data, tx }).is_err() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "chromey io_uring worker channel closed",
-                    ));
-                }
-                return match rx.await {
-                    Ok(result) => result,
-                    Err(_) => Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "chromey io_uring worker dropped the response",
-                    )),
-                };
+                return await_worker(sender, IoTask::WriteFile { path, data, tx }, rx).await;
             }
         }
         tokio::fs::write(path, data).await
@@ -370,27 +357,18 @@ mod inner {
         if URING_ENABLED.load(Ordering::Acquire) {
             if let Some(sender) = URING_POOL.get() {
                 let (tx, rx) = oneshot::channel();
-                if sender.send(IoTask::ReadFile { path, tx }).is_err() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "chromey io_uring worker channel closed",
-                    ));
-                }
-                return match rx.await {
-                    Ok(result) => result,
-                    Err(_) => Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "chromey io_uring worker dropped the response",
-                    )),
-                };
+                return await_worker(sender, IoTask::ReadFile { path, tx }, rx).await;
             }
         }
         tokio::fs::read(path).await
     }
 
     pub async fn tcp_connect(addr: SocketAddr) -> io::Result<std::net::TcpStream> {
-        if let Some(result) = try_uring(|tx| IoTask::TcpConnect { addr, tx }).await {
-            return result;
+        if URING_ENABLED.load(Ordering::Acquire) {
+            if let Some(sender) = URING_POOL.get() {
+                let (tx, rx) = oneshot::channel();
+                return await_worker(sender, IoTask::TcpConnect { addr, tx }, rx).await;
+            }
         }
         tokio::task::spawn_blocking(move || std::net::TcpStream::connect(addr))
             .await

@@ -27,9 +27,6 @@ use tokio::sync::Semaphore;
 /// Default chunk size for `IO.read` (bytes requested per round-trip).
 const DEFAULT_IO_READ_CHUNK: i64 = 65_536; // 64 KiB
 
-/// Timeout for the *entire* stream read (all chunks), not per-chunk.
-const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Optional max body size.  Set `CHROMEY_STREAM_MAX_BODY_BYTES` to enforce a
 /// cap.  When unset (default) there is no limit — matching the original
 /// `getResponseBody` behavior.
@@ -56,9 +53,23 @@ const HIGH_PRESSURE_PAGES: usize = 64;
 // Global concurrency controls
 // ---------------------------------------------------------------------------
 
-/// Per-process cap on concurrent in-flight `IO.read` streams.
-/// Prevents CDP command queue saturation when many pages cache simultaneously.
-static GLOBAL_STREAM_PERMITS: Semaphore = Semaphore::const_new(12);
+/// Default concurrent stream limit when `CHROMEY_STREAM_CONCURRENCY` is unset.
+const DEFAULT_STREAM_CONCURRENCY: usize = 48;
+
+/// Timeout for acquiring a stream permit before giving up.
+const STREAM_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+lazy_static::lazy_static! {
+    /// Per-process cap on concurrent in-flight `IO.read` streams.
+    /// Configurable via `CHROMEY_STREAM_CONCURRENCY` env var (default 48).
+    static ref GLOBAL_STREAM_PERMITS: Semaphore = {
+        let n = std::env::var("CHROMEY_STREAM_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_STREAM_CONCURRENCY);
+        Semaphore::new(n)
+    };
+}
 
 /// Number of streams currently in-flight (for diagnostics / metrics).
 static INFLIGHT_STREAMS: AtomicUsize = AtomicUsize::new(0);
@@ -293,9 +304,12 @@ async fn read_all_chunks(
     let cap = max_body_bytes();
     let mut total_bytes: usize = 0;
 
+    // Reusable buffer for base64 decoding — avoids allocating a new Vec per chunk.
+    let mut decode_buf: Vec<u8> = Vec::with_capacity(DEFAULT_IO_READ_CHUNK as usize);
+
     loop {
-        let read_result = tokio::time::timeout(STREAM_TIMEOUT, async {
-            page.execute(
+        let read_result = page
+            .execute(
                 ReadParams::builder()
                     .handle(stream_handle.clone())
                     .size(DEFAULT_IO_READ_CHUNK)
@@ -303,22 +317,22 @@ async fn read_all_chunks(
                     .map_err(StreamError::Build)?,
             )
             .await
-            .map_err(StreamError::Cdp)
-        })
-        .await
-        .map_err(|_| StreamError::Timeout)??;
+            .map_err(StreamError::Cdp)?;
 
         let chunk = &read_result.result;
 
-        let decoded = if chunk.base64_encoded.unwrap_or(false) {
+        // Decode in-place or borrow directly — no allocation for plain-text chunks.
+        let data_bytes: &[u8] = if chunk.base64_encoded.unwrap_or(false) {
+            decode_buf.clear();
             general_purpose::STANDARD
-                .decode(&chunk.data)
-                .map_err(StreamError::Base64)?
+                .decode_vec(&chunk.data, &mut decode_buf)
+                .map_err(StreamError::Base64)?;
+            &decode_buf
         } else {
-            chunk.data.as_bytes().to_vec()
+            chunk.data.as_bytes()
         };
 
-        total_bytes += decoded.len();
+        total_bytes += data_bytes.len();
 
         // Optional size cap (off by default — set CHROMEY_STREAM_MAX_BODY_BYTES).
         if let Some(max) = cap {
@@ -328,10 +342,10 @@ async fn read_all_chunks(
         }
 
         #[cfg(feature = "_cache_stream_disk")]
-        sink.write_chunk(&decoded).await;
+        sink.write_chunk(data_bytes).await;
 
         #[cfg(not(feature = "_cache_stream_disk"))]
-        body.extend_from_slice(&decoded);
+        body.extend_from_slice(data_bytes);
 
         if chunk.eof {
             break;
@@ -401,30 +415,30 @@ pub async fn read_response_body_as_stream(
     request_id: impl Into<chromiumoxide_cdp::cdp::browser_protocol::fetch::RequestId>,
     content_length_hint: Option<usize>,
 ) -> StreamResult {
-    // Acquire global permit — blocks if we're at capacity.
-    let _permit = match GLOBAL_STREAM_PERMITS.acquire().await {
-        Ok(p) => p,
-        Err(_) => return StreamResult::NotStarted(StreamError::SemaphoreClosed),
+    // Acquire global permit — waits up to STREAM_PERMIT_TIMEOUT for capacity.
+    let _permit = match tokio::time::timeout(
+        STREAM_PERMIT_TIMEOUT,
+        GLOBAL_STREAM_PERMITS.acquire(),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => return StreamResult::NotStarted(StreamError::SemaphoreClosed),
+        Err(_) => return StreamResult::NotStarted(StreamError::Timeout),
     };
 
     INFLIGHT_STREAMS.fetch_add(1, Ordering::Relaxed);
     let _dec = DecrementOnDrop(&INFLIGHT_STREAMS);
 
-    // Open the stream.
-    let returns = match tokio::time::timeout(
-        STREAM_TIMEOUT,
-        page.execute(TakeResponseBodyAsStreamParams::new(request_id)),
-    )
-    .await
+    // Open the stream. page.execute() already enforces request_timeout.
+    let returns = match page
+        .execute(TakeResponseBodyAsStreamParams::new(request_id))
+        .await
     {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            // CDP rejected the command — body NOT consumed.
+        Ok(r) => r,
+        Err(e) => {
+            // CDP rejected or timed out — body NOT consumed.
             return StreamResult::NotStarted(StreamError::Cdp(e));
-        }
-        Err(_) => {
-            // Timeout before the stream even opened — body NOT consumed.
-            return StreamResult::NotStarted(StreamError::Timeout);
         }
     };
 
