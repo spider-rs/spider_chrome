@@ -235,19 +235,25 @@ impl<T: IntoEventKind + Unpin> Stream for EventStream<T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let pin = self.get_mut();
-        match pin.events.poll_recv(cx) {
-            Poll::Ready(Some(event)) => {
-                if let Ok(e) = event.into_any_arc().downcast() {
-                    Poll::Ready(Some(e))
-                } else {
-                    // wrong type for this stream; keep polling
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+        // Drain up to a bounded number of wrong-type events before
+        // yielding, to avoid busy-spinning when mismatched events
+        // accumulate in the channel.
+        for _ in 0..64 {
+            match pin.events.poll_recv(cx) {
+                Poll::Ready(Some(event)) => {
+                    if let Ok(e) = event.into_any_arc().downcast() {
+                        return Poll::Ready(Some(e));
+                    }
+                    // wrong type — try the next message in the channel
+                    continue;
                 }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
         }
+        // Hit the drain limit — yield and come back.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 

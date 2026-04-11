@@ -1015,7 +1015,7 @@ impl Page {
                 tx,
             }))
             .await?;
-        Ok(rx.await?)
+        self.inner.recv_msg(rx).await
     }
 
     pub async fn authenticate(&self, credentials: Credentials) -> Result<()> {
@@ -1050,7 +1050,7 @@ impl Page {
         self.inner
             .send_msg(TargetMessage::Url(GetUrl::new(tx)))
             .await?;
-        Ok(rx.await?)
+        self.inner.recv_msg(rx).await
     }
 
     /// Returns the current url of the frame
@@ -1062,7 +1062,7 @@ impl Page {
                 tx,
             }))
             .await?;
-        Ok(rx.await?)
+        self.inner.recv_msg(rx).await
     }
 
     /// Returns the parent id of the frame
@@ -1071,7 +1071,7 @@ impl Page {
         self.inner
             .send_msg(TargetMessage::Parent(GetParent { frame_id, tx }))
             .await?;
-        Ok(rx.await?)
+        self.inner.recv_msg(rx).await
     }
 
     /// Return the main frame of the page
@@ -1080,7 +1080,7 @@ impl Page {
         self.inner
             .send_msg(TargetMessage::MainFrame(tx))
             .await?;
-        Ok(rx.await?)
+        self.inner.recv_msg(rx).await
     }
 
     /// Return the frames of the page
@@ -1089,7 +1089,7 @@ impl Page {
         self.inner
             .send_msg(TargetMessage::AllFrames(tx))
             .await?;
-        Ok(rx.await?)
+        self.inner.recv_msg(rx).await
     }
 
     /// Set the cache key of the page

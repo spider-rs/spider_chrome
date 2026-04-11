@@ -183,6 +183,14 @@ impl PageInner {
         Ok(())
     }
 
+    /// Await a oneshot response with the page's request timeout.
+    pub(crate) async fn recv_msg<T>(&self, rx: tokio::sync::oneshot::Receiver<T>) -> Result<T> {
+        tokio::time::timeout(self.request_timeout, rx)
+            .await
+            .map_err(|_| CdpError::Timeout)?
+            .map_err(|e| CdpError::ChannelSendError(crate::error::ChannelError::Canceled(e)))
+    }
+
     /// Returns the first element in the node which matches the given CSS
     /// selector.
     pub async fn find_element(&self, selector: impl Into<String>, node: NodeId) -> Result<NodeId> {

@@ -592,11 +592,19 @@ impl Stream for Handler {
 
         let mut dispose = false;
 
+        // Per-section iteration cap to ensure fairness between browser
+        // messages, target polling, and websocket events.  When a cap is
+        // hit we break out, re-wake, and let other sections run.
+        const POLL_BUDGET: usize = 256;
+
         loop {
             let now = Instant::now();
+            let mut budget_hit = false;
+
             // temporary pinning of the browser receiver should be safe as we are pinning
             // through the already pinned self. with the receivers we can also
             // safely ignore exhaustion as those are fused.
+            let mut browser_msgs = 0usize;
             while let Poll::Ready(Some(msg)) = pin.from_browser.poll_recv(cx) {
                 match msg {
                     HandlerMessage::Command(cmd) => {
@@ -655,12 +663,18 @@ impl Stream for Handler {
                         pin.event_listeners.add_listener(req);
                     }
                 }
+                browser_msgs += 1;
+                if browser_msgs >= POLL_BUDGET {
+                    budget_hit = true;
+                    break;
+                }
             }
 
             for n in (0..pin.target_ids.len()).rev() {
                 let target_id = pin.target_ids.swap_remove(n);
 
                 if let Some((id, mut target)) = pin.targets.remove_entry(&target_id) {
+                    let mut target_events = 0usize;
                     while let Some(event) = target.poll(cx, now) {
                         match event {
                             TargetEvent::Request(req) => {
@@ -688,6 +702,11 @@ impl Stream for Handler {
                                 }
                             }
                         }
+                        target_events += 1;
+                        if target_events >= POLL_BUDGET {
+                            budget_hit = true;
+                            break;
+                        }
                     }
 
                     // poll the target's event listeners
@@ -701,6 +720,7 @@ impl Stream for Handler {
             }
 
             let mut done = true;
+            let mut ws_msgs = 0usize;
 
             while let Poll::Ready(Some(ev)) = Pin::new(&mut pin.conn).poll_next(cx) {
                 match ev {
@@ -738,6 +758,11 @@ impl Stream for Handler {
                     }
                 }
                 done = false;
+                ws_msgs += 1;
+                if ws_msgs >= POLL_BUDGET {
+                    budget_hit = true;
+                    break;
+                }
             }
 
             if pin.evict_command_timeout.poll_ready(cx) {
@@ -757,6 +782,13 @@ impl Stream for Handler {
 
             if dispose {
                 return Poll::Ready(None);
+            }
+
+            if budget_hit {
+                // We hit a per-section cap — yield to the executor so
+                // other tasks get CPU time, then resume.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
 
             if done {

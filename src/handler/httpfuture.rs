@@ -52,6 +52,10 @@ where
         } else {
             match this.command.poll(cx) {
                 Poll::Ready(Ok(_command_response)) => {
+                    // Command succeeded — reset the navigation timer so it
+                    // gets a full request_timeout from NOW, not from when
+                    // HttpFuture was constructed.
+                    this.navigation.reset_deadline();
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }

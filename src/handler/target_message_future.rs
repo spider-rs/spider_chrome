@@ -22,6 +22,7 @@ pin_project! {
         target_sender: mpsc::Sender<TargetMessage>,
         #[pin]
         delay: tokio::time::Sleep,
+        request_timeout: std::time::Duration,
         message: Option<TargetMessage>,
         send_fut: Option<SendFut>,
     }
@@ -38,6 +39,7 @@ impl<T> TargetMessageFuture<T> {
             target_sender,
             rx_request,
             delay: tokio::time::sleep(request_timeout),
+            request_timeout,
             message: Some(message),
             send_fut: None,
         }
@@ -80,6 +82,15 @@ impl<T> TargetMessageFuture<T> {
         request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
         Self::wait(target_sender, request_timeout, TargetMessage::WaitForNetworkIdle)
+    }
+
+    /// Reset the internal timer deadline to `now + request_timeout`.
+    /// Used by `HttpFuture` to start the navigation timeout only after
+    /// the command phase completes, not from future creation time.
+    pub fn reset_deadline(self: Pin<&mut Self>) {
+        let this = self.project();
+        let deadline = tokio::time::Instant::now() + *this.request_timeout;
+        this.delay.reset(deadline);
     }
 
     /// Wait until the main frame reaches `networkAlmostIdle`.
