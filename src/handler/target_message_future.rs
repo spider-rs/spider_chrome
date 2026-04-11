@@ -20,6 +20,8 @@ pin_project! {
         #[pin]
         rx_request: oneshot::Receiver<T>,
         target_sender: mpsc::Sender<TargetMessage>,
+        #[pin]
+        delay: tokio::time::Sleep,
         message: Option<TargetMessage>,
         send_fut: Option<SendFut>,
     }
@@ -30,10 +32,12 @@ impl<T> TargetMessageFuture<T> {
         target_sender: TargetSender,
         message: TargetMessage,
         rx_request: oneshot::Receiver<T>,
+        request_timeout: std::time::Duration,
     ) -> Self {
         Self {
             target_sender,
             rx_request,
+            delay: tokio::time::sleep(request_timeout),
             message: Some(message),
             send_fut: None,
         }
@@ -47,19 +51,23 @@ impl<T> TargetMessageFuture<T> {
     /// (e.g. `TargetMessage::WaitForNavigation(tx)`).
     pub(crate) fn wait(
         target_sender: TargetSender,
+        request_timeout: std::time::Duration,
         make_msg: impl FnOnce(oneshot::Sender<ArcHttpRequest>) -> TargetMessage,
     ) -> TargetMessageFuture<ArcHttpRequest> {
         let (tx, rx_request) = oneshot::channel();
         let message = make_msg(tx);
-        TargetMessageFuture::new(target_sender, message, rx_request)
+        TargetMessageFuture::new(target_sender, message, rx_request, request_timeout)
     }
 
     /// Wait for the main-frame navigation to finish.
     ///
     /// This triggers a `TargetMessage::WaitForNavigation` and resolves with
     /// the final `ArcHttpRequest` associated with that navigation (if any).
-    pub fn wait_for_navigation(target_sender: TargetSender) -> TargetMessageFuture<ArcHttpRequest> {
-        Self::wait(target_sender, TargetMessage::WaitForNavigation)
+    pub fn wait_for_navigation(
+        target_sender: TargetSender,
+        request_timeout: std::time::Duration,
+    ) -> TargetMessageFuture<ArcHttpRequest> {
+        Self::wait(target_sender, request_timeout, TargetMessage::WaitForNavigation)
     }
 
     /// Wait until the main frame reaches `networkIdle`.
@@ -69,8 +77,9 @@ impl<T> TargetMessageFuture<T> {
     /// idle state (if any).
     pub fn wait_for_network_idle(
         target_sender: TargetSender,
+        request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
-        Self::wait(target_sender, TargetMessage::WaitForNetworkIdle)
+        Self::wait(target_sender, request_timeout, TargetMessage::WaitForNetworkIdle)
     }
 
     /// Wait until the main frame reaches `networkAlmostIdle`.
@@ -79,8 +88,9 @@ impl<T> TargetMessageFuture<T> {
     /// with the `ArcHttpRequest` associated with that navigation (if any).
     pub fn wait_for_network_almost_idle(
         target_sender: TargetSender,
+        request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
-        Self::wait(target_sender, TargetMessage::WaitForNetworkAlmostIdle)
+        Self::wait(target_sender, request_timeout, TargetMessage::WaitForNetworkAlmostIdle)
     }
 }
 
@@ -115,11 +125,21 @@ impl<T> Future for TargetMessageFuture<T> {
                     // Sent — fall through to phase 2.
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Enforce timeout while waiting for channel capacity.
+                    if this.delay.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(crate::error::CdpError::Timeout));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
 
         // Phase 2: wait for the result on the oneshot.
-        this.rx_request.as_mut().poll(cx).map_err(Into::into)
+        if this.delay.as_mut().poll(cx).is_ready() {
+            Poll::Ready(Err(crate::error::CdpError::Timeout))
+        } else {
+            this.rx_request.as_mut().poll(cx).map_err(Into::into)
+        }
     }
 }

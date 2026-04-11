@@ -421,6 +421,186 @@ async fn set_content_twice_replaces_content() {
     );
 }
 
+/// Verify that many concurrent CDP commands on the same page do not deadlock.
+///
+/// This stresses the target channel (capacity 100) by issuing many commands
+/// concurrently, covering the `CommandFuture` and `TargetMessageFuture`
+/// send-backpressure paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_commands_do_not_deadlock() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch_with_handler(browser_like_config("concurrent-commands")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    // Fire 200 concurrent evaluate calls — more than the channel capacity (100).
+    let futs: Vec<_> = (0..200)
+        .map(|i| {
+            let page = page.clone();
+            tokio::spawn(async move {
+                timeout(
+                    Duration::from_secs(30),
+                    page.evaluate(format!("1 + {i}")),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("evaluate({i}) timed out — possible deadlock"))
+                .unwrap_or_else(|err| panic!("evaluate({i}) failed: {err}"))
+            })
+        })
+        .collect();
+
+    for (i, fut) in futs.into_iter().enumerate() {
+        fut.await
+            .unwrap_or_else(|err| panic!("task {i} panicked: {err}"));
+    }
+}
+
+/// Verify that rapid page.url() / page.mainframe() calls under concurrency
+/// do not hang. These use raw TargetMessage sends (now protected by timeout).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_target_messages_do_not_deadlock() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch_with_handler(browser_like_config("concurrent-target-msgs")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    // Mix different TargetMessage types concurrently.
+    let futs: Vec<_> = (0..150)
+        .map(|i| {
+            let page = page.clone();
+            tokio::spawn(async move {
+                let result = match i % 3 {
+                    0 => page
+                        .url()
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("url: {e}")),
+                    1 => page
+                        .mainframe()
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("mainframe: {e}")),
+                    _ => page
+                        .evaluate("document.title")
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("evaluate: {e}")),
+                };
+                timeout(Duration::from_secs(30), std::future::ready(result))
+                    .await
+                    .expect("should not time out")
+                    .unwrap_or_else(|err| panic!("task {i} failed: {err}"));
+            })
+        })
+        .collect();
+
+    for fut in futs {
+        fut.await.expect("task join");
+    }
+}
+
+/// Verify that `goto` followed by `content()` completes without hanging.
+/// This exercises the HttpFuture path (CommandFuture + TargetMessageFuture navigation).
+#[tokio::test]
+async fn goto_then_content_does_not_hang() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch_with_handler(browser_like_config("goto-content")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    // Set content then read it back — exercises the full command pipeline.
+    let html = r#"<html><body><p>deadlock-test</p></body></html>"#;
+    timeout(Duration::from_secs(15), page.set_content(html))
+        .await
+        .expect("set_content should not time out")
+        .expect("set_content should succeed");
+
+    let content = timeout(Duration::from_secs(15), page.content())
+        .await
+        .expect("content() should not time out")
+        .expect("content() should succeed");
+
+    assert!(
+        content.contains("deadlock-test"),
+        "page should contain our test content"
+    );
+}
+
+/// Open multiple pages concurrently and interact with all of them.
+/// This tests that independent target channels don't interfere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_pages_concurrent_operations() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch_with_handler(browser_like_config("multi-page-concurrent")).await;
+
+    // Create 4 pages sequentially (Browser is not Clone).
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+            .await
+            .expect("new_page should not time out")
+            .expect("new_page should resolve");
+        pages.push(page);
+    }
+
+    // Run commands on all pages concurrently.
+    let cmd_futs: Vec<_> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, page)| {
+            let page = page.clone();
+            tokio::spawn(async move {
+                let html = format!(
+                    r#"<html><body><p>page-{i}</p></body></html>"#
+                );
+                timeout(Duration::from_secs(15), page.set_content(&html))
+                    .await
+                    .expect("set_content should not time out")
+                    .expect("set_content should succeed");
+
+                let content = timeout(Duration::from_secs(15), page.content())
+                    .await
+                    .expect("content() should not time out")
+                    .expect("content() should succeed");
+
+                assert!(
+                    content.contains(&format!("page-{i}")),
+                    "page {i} should contain its content, got: {content}"
+                );
+            })
+        })
+        .collect();
+
+    for fut in cmd_futs {
+        fut.await.expect("task join");
+    }
+}
+
 /// Navigate to a real-world URL that may involve cross-origin redirects
 /// (e.g. adding `www.` prefix or CDN routing). This exercises the fix for
 /// navigation watchers losing track of the main frame when its ID changes

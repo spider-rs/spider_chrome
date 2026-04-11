@@ -470,8 +470,7 @@ impl Page {
         let (tx, rx) = unbounded_channel();
 
         self.inner
-            .sender()
-            .send(TargetMessage::AddEventListener(
+            .send_msg(TargetMessage::AddEventListener(
                 EventListenerRequest::new::<T>(tx),
             ))
             .await?;
@@ -1011,8 +1010,7 @@ impl Page {
     pub async fn frame_name(&self, frame_id: FrameId) -> Result<Option<String>> {
         let (tx, rx) = oneshot_channel();
         self.inner
-            .sender()
-            .send(TargetMessage::Name(GetName {
+            .send_msg(TargetMessage::Name(GetName {
                 frame_id: Some(frame_id),
                 tx,
             }))
@@ -1022,8 +1020,7 @@ impl Page {
 
     pub async fn authenticate(&self, credentials: Credentials) -> Result<()> {
         self.inner
-            .sender()
-            .send(TargetMessage::Authenticate(credentials))
+            .send_msg(TargetMessage::Authenticate(credentials))
             .await?;
 
         Ok(())
@@ -1032,8 +1029,7 @@ impl Page {
     /// Control blocking network on continue fetch request paused.
     pub async fn set_blocked_networking(&self, blocked: bool) -> Result<()> {
         self.inner
-            .sender()
-            .send(TargetMessage::BlockNetwork(blocked))
+            .send_msg(TargetMessage::BlockNetwork(blocked))
             .await?;
 
         Ok(())
@@ -1042,8 +1038,7 @@ impl Page {
     /// Set the internal paused fetch interception control. Use this if you manually set your own listeners.
     pub async fn set_request_interception(&self, enabled: bool) -> Result<()> {
         self.inner
-            .sender()
-            .send(TargetMessage::EnableInterception(enabled))
+            .send_msg(TargetMessage::EnableInterception(enabled))
             .await?;
 
         Ok(())
@@ -1053,8 +1048,7 @@ impl Page {
     pub async fn url(&self) -> Result<Option<String>> {
         let (tx, rx) = oneshot_channel();
         self.inner
-            .sender()
-            .send(TargetMessage::Url(GetUrl::new(tx)))
+            .send_msg(TargetMessage::Url(GetUrl::new(tx)))
             .await?;
         Ok(rx.await?)
     }
@@ -1063,8 +1057,7 @@ impl Page {
     pub async fn frame_url(&self, frame_id: FrameId) -> Result<Option<String>> {
         let (tx, rx) = oneshot_channel();
         self.inner
-            .sender()
-            .send(TargetMessage::Url(GetUrl {
+            .send_msg(TargetMessage::Url(GetUrl {
                 frame_id: Some(frame_id),
                 tx,
             }))
@@ -1076,8 +1069,7 @@ impl Page {
     pub async fn frame_parent(&self, frame_id: FrameId) -> Result<Option<FrameId>> {
         let (tx, rx) = oneshot_channel();
         self.inner
-            .sender()
-            .send(TargetMessage::Parent(GetParent { frame_id, tx }))
+            .send_msg(TargetMessage::Parent(GetParent { frame_id, tx }))
             .await?;
         Ok(rx.await?)
     }
@@ -1086,8 +1078,7 @@ impl Page {
     pub async fn mainframe(&self) -> Result<Option<FrameId>> {
         let (tx, rx) = oneshot_channel();
         self.inner
-            .sender()
-            .send(TargetMessage::MainFrame(tx))
+            .send_msg(TargetMessage::MainFrame(tx))
             .await?;
         Ok(rx.await?)
     }
@@ -1096,8 +1087,7 @@ impl Page {
     pub async fn frames(&self) -> Result<Vec<FrameId>> {
         let (tx, rx) = oneshot_channel();
         self.inner
-            .sender()
-            .send(TargetMessage::AllFrames(tx))
+            .send_msg(TargetMessage::AllFrames(tx))
             .await?;
         Ok(rx.await?)
     }
@@ -1109,8 +1099,7 @@ impl Page {
         cache_key: (Option<String>, Option<crate::cache::BasicCachePolicy>),
     ) -> Result<()> {
         self.inner
-            .sender()
-            .send(TargetMessage::CacheKey(cache_key))
+            .send_msg(TargetMessage::CacheKey(cache_key))
             .await?;
         Ok(())
     }

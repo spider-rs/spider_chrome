@@ -24,10 +24,14 @@ pin_project! {
 }
 
 impl<T: Command> HttpFuture<T> {
-    pub fn new(sender: mpsc::Sender<TargetMessage>, command: CommandFuture<T>) -> Self {
+    pub fn new(
+        sender: mpsc::Sender<TargetMessage>,
+        command: CommandFuture<T>,
+        request_timeout: std::time::Duration,
+    ) -> Self {
         Self {
             command: command.fuse(),
-            navigation: TargetMessageFuture::<T>::wait_for_navigation(sender),
+            navigation: TargetMessageFuture::<T>::wait_for_navigation(sender, request_timeout),
         }
     }
 }

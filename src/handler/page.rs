@@ -114,12 +114,12 @@ impl Drop for PageInner {
 impl PageInner {
     /// Execute a PDL command and return its response
     pub(crate) async fn execute<T: Command>(&self, cmd: T) -> Result<CommandResponse<T::Response>> {
-        execute(cmd, self.sender.clone(), Some(self.session_id.clone())).await
+        execute(cmd, self.sender.clone(), Some(self.session_id.clone()), self.request_timeout).await
     }
 
     /// Execute a PDL command without waiting for the response.
     pub(crate) async fn send_command<T: Command>(&self, cmd: T) -> Result<&Self> {
-        let _ = send_command(cmd, self.sender.clone(), Some(self.session_id.clone())).await;
+        let _ = send_command(cmd, self.sender.clone(), Some(self.session_id.clone()), self.request_timeout).await;
         Ok(self)
     }
 
@@ -135,17 +135,17 @@ impl PageInner {
 
     /// This creates navigation future with the final http response when the page is loaded
     pub(crate) fn wait_for_navigation(&self) -> TargetMessageFuture<ArcHttpRequest> {
-        TargetMessageFuture::<ArcHttpRequest>::wait_for_navigation(self.sender.clone())
+        TargetMessageFuture::<ArcHttpRequest>::wait_for_navigation(self.sender.clone(), self.request_timeout)
     }
 
     /// This creates navigation future with the final http response when the page network is idle
     pub(crate) fn wait_for_network_idle(&self) -> TargetMessageFuture<ArcHttpRequest> {
-        TargetMessageFuture::<ArcHttpRequest>::wait_for_network_idle(self.sender.clone())
+        TargetMessageFuture::<ArcHttpRequest>::wait_for_network_idle(self.sender.clone(), self.request_timeout)
     }
 
     /// This creates navigation future with the final http response when the page network is almost idle
     pub(crate) fn wait_for_network_almost_idle(&self) -> TargetMessageFuture<ArcHttpRequest> {
-        TargetMessageFuture::<ArcHttpRequest>::wait_for_network_almost_idle(self.sender.clone())
+        TargetMessageFuture::<ArcHttpRequest>::wait_for_network_almost_idle(self.sender.clone(), self.request_timeout)
     }
 
     /// This creates HTTP future with navigation and responds with the final
@@ -154,6 +154,7 @@ impl PageInner {
         Ok(HttpFuture::new(
             self.sender.clone(),
             self.command_future(cmd)?,
+            self.request_timeout,
         ))
     }
 
@@ -172,8 +173,14 @@ impl PageInner {
         &self.opener_id
     }
 
-    pub(crate) fn sender(&self) -> &Sender<TargetMessage> {
-        &self.sender
+    /// Send a `TargetMessage` with the page's request timeout.
+    /// Prevents indefinite hangs when the target channel is full.
+    pub(crate) async fn send_msg(&self, msg: TargetMessage) -> Result<()> {
+        tokio::time::timeout(self.request_timeout, self.sender.send(msg))
+            .await
+            .map_err(|_| CdpError::Timeout)?
+            .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
+        Ok(())
     }
 
     /// Returns the first element in the node which matches the given CSS
@@ -860,14 +867,21 @@ impl PageInner {
         dom_world: DOMWorldKind,
     ) -> Result<Option<ExecutionContextId>> {
         let (tx, rx) = oneshot_channel();
-        self.sender
-            .send(TargetMessage::GetExecutionContext(GetExecutionContext {
-                dom_world,
-                frame_id,
-                tx,
-            }))
-            .await?;
-        Ok(rx.await?)
+        tokio::time::timeout(
+            self.request_timeout,
+            self.sender
+                .send(TargetMessage::GetExecutionContext(GetExecutionContext {
+                    dom_world,
+                    frame_id,
+                    tx,
+                })),
+        )
+        .await
+        .map_err(|_| CdpError::Timeout)?
+        .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
+        Ok(tokio::time::timeout(self.request_timeout, rx)
+            .await
+            .map_err(|_| CdpError::Timeout)??)
     }
 
     /// Returns metrics relating to the layout of the page
@@ -957,10 +971,13 @@ pub(crate) async fn execute<T: Command>(
     cmd: T,
     sender: Sender<TargetMessage>,
     session: Option<SessionId>,
+    request_timeout: std::time::Duration,
 ) -> Result<CommandResponse<T::Response>> {
     let method = cmd.identifier();
-    let rx = send_command(cmd, sender, session).await?;
-    let resp = rx.await??;
+    let rx = send_command(cmd, sender, session, request_timeout).await?;
+    let resp = tokio::time::timeout(request_timeout, rx)
+        .await
+        .map_err(|_| CdpError::Timeout)???;
     to_command_response::<T>(resp, method)
 }
 
@@ -969,9 +986,13 @@ pub(crate) async fn send_command<T: Command>(
     cmd: T,
     sender: Sender<TargetMessage>,
     session: Option<SessionId>,
+    request_timeout: std::time::Duration,
 ) -> Result<tokio::sync::oneshot::Receiver<Result<chromiumoxide_types::Response, CdpError>>> {
     let (tx, rx) = oneshot_channel();
     let msg = CommandMessage::with_session(cmd, tx, session)?;
-    sender.send(TargetMessage::Command(msg)).await?;
+    tokio::time::timeout(request_timeout, sender.send(TargetMessage::Command(msg)))
+        .await
+        .map_err(|_| CdpError::Timeout)?
+        .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
     Ok(rx)
 }
