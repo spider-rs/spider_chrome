@@ -132,11 +132,11 @@ impl<T> Future for TargetMessageFuture<T> {
                     // Sent — fall through to phase 2.
                 }
                 Err(mpsc::error::TrySendError::Full(msg)) => {
-                    // Channel full — park via async send instead of busy-looping.
+                    // Channel full — park via async send with timeout enforcement.
+                    // The send_fut path (below) polls both the send and the delay,
+                    // so we fall through instead of returning Pending with a spurious wake.
                     let sender = this.target_sender.clone();
                     *this.send_fut = Some(Box::pin(async move { sender.send(msg).await }));
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
                 }
                 Err(e) => return Poll::Ready(Err(e.into())),
             }
