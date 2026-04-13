@@ -18,7 +18,6 @@ use chromiumoxide_cdp::cdp::browser_protocol::{
     io::{CloseParams, ReadParams, StreamHandle},
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Semaphore;
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -40,36 +39,19 @@ fn max_body_bytes() -> Option<usize> {
 
 /// Base threshold (bytes) below which we skip streaming and let the
 /// `Network.getResponseBody` path handle the response.  This value is
-/// *lowered* dynamically as active page count rises.
-const BASE_STREAMING_THRESHOLD: usize = 262_144; // 256 KiB
+/// *lowered* dynamically as active page count rises — but only modestly,
+/// so streaming remains a pressure-relief valve rather than the hot path.
+const BASE_STREAMING_THRESHOLD: usize = 2_097_152; // 2 MiB
 
 /// The floor the threshold can be reduced to under pressure.
-const MIN_STREAMING_THRESHOLD: usize = 32_768; // 32 KiB
+const MIN_STREAMING_THRESHOLD: usize = 524_288; // 512 KiB
 
 /// Page count at which the threshold reaches `MIN_STREAMING_THRESHOLD`.
-const HIGH_PRESSURE_PAGES: usize = 64;
+const HIGH_PRESSURE_PAGES: usize = 128;
 
 // ---------------------------------------------------------------------------
-// Global concurrency controls
+// Diagnostics
 // ---------------------------------------------------------------------------
-
-/// Default concurrent stream limit when `CHROMEY_STREAM_CONCURRENCY` is unset.
-const DEFAULT_STREAM_CONCURRENCY: usize = 48;
-
-/// Timeout for acquiring a stream permit before giving up.
-const STREAM_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-lazy_static::lazy_static! {
-    /// Per-process cap on concurrent in-flight `IO.read` streams.
-    /// Configurable via `CHROMEY_STREAM_CONCURRENCY` env var (default 48).
-    static ref GLOBAL_STREAM_PERMITS: Semaphore = {
-        let n = std::env::var("CHROMEY_STREAM_CONCURRENCY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_STREAM_CONCURRENCY);
-        Semaphore::new(n)
-    };
-}
 
 /// Number of streams currently in-flight (for diagnostics / metrics).
 static INFLIGHT_STREAMS: AtomicUsize = AtomicUsize::new(0);
@@ -415,18 +397,6 @@ pub async fn read_response_body_as_stream(
     request_id: impl Into<chromiumoxide_cdp::cdp::browser_protocol::fetch::RequestId>,
     content_length_hint: Option<usize>,
 ) -> StreamResult {
-    // Acquire global permit — waits up to STREAM_PERMIT_TIMEOUT for capacity.
-    let _permit = match tokio::time::timeout(
-        STREAM_PERMIT_TIMEOUT,
-        GLOBAL_STREAM_PERMITS.acquire(),
-    )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(_)) => return StreamResult::NotStarted(StreamError::SemaphoreClosed),
-        Err(_) => return StreamResult::NotStarted(StreamError::Timeout),
-    };
-
     INFLIGHT_STREAMS.fetch_add(1, Ordering::Relaxed);
     let _dec = DecrementOnDrop(&INFLIGHT_STREAMS);
 
@@ -487,12 +457,8 @@ pub async fn read_response_body_as_stream(
 /// Errors specific to the streaming body reader.
 #[derive(Debug)]
 pub enum StreamError {
-    /// The global semaphore was closed (internal bug).
-    SemaphoreClosed,
     /// A CDP command failed.
     Cdp(crate::error::CdpError),
-    /// The overall stream read exceeded the time limit.
-    Timeout,
     /// The response body exceeded the optional `CHROMEY_STREAM_MAX_BODY_BYTES` cap.
     BodyTooLarge(usize),
     /// Base64 decoding failed on a chunk.
@@ -507,9 +473,7 @@ pub enum StreamError {
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SemaphoreClosed => write!(f, "stream semaphore closed"),
             Self::Cdp(e) => write!(f, "CDP error during stream read: {e}"),
-            Self::Timeout => write!(f, "stream read timed out"),
             Self::BodyTooLarge(n) => write!(f, "response body too large: {n} bytes"),
             Self::Base64(e) => write!(f, "base64 decode error: {e}"),
             Self::Build(e) => write!(f, "CDP param build error: {e}"),

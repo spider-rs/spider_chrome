@@ -903,10 +903,12 @@ async fn handle_fetch_response_stage(
     let threshold = super::stream::streaming_threshold_bytes();
 
     // Small responses: let the Network listener handle via getResponseBody.
+    // When Content-Length is missing (chunked encoding) skip streaming —
+    // most dynamic/chunked responses are small and the one-shot path is
+    // faster.  Only stream when we *know* the body is large.
     let should_stream = match content_length {
         Some(len) => len >= threshold,
-        // No Content-Length means chunked — stream to be safe.
-        None => true,
+        None => false,
     };
 
     if !should_stream {
