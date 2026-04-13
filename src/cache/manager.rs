@@ -1000,22 +1000,18 @@ async fn handle_fetch_response_stage(
         headers: crate::http::convert_headers(&req_headers),
     };
     let res = crate::http::HttpResponseLike {
-        status: StatusCode::from_u16(status as u16)
-            .unwrap_or(StatusCode::EXPECTATION_FAILED),
+        status: StatusCode::from_u16(status as u16).unwrap_or(StatusCode::EXPECTATION_FAILED),
         headers: crate::http::convert_headers(&resp_headers),
     };
     let policy = http_cache_semantics::CachePolicy::new(&req, &res);
 
-    let parsed_url = url::Url::parse(cache_key_url).unwrap_or_else(|_| {
-        url::Url::parse("http://localhost").expect("static URL")
-    });
+    let parsed_url = url::Url::parse(cache_key_url)
+        .unwrap_or_else(|_| url::Url::parse("http://localhost").expect("static URL"));
 
     let http_res = http_cache_reqwest::HttpResponse {
         url: parsed_url,
         body: body_bytes.clone(),
-        headers: http_cache::HttpHeaders::Modern(crate::http::headers_to_multi(
-            &resp_headers,
-        )),
+        headers: http_cache::HttpHeaders::Modern(crate::http::headers_to_multi(&resp_headers)),
         version: crate::http::HttpVersion::Http11.into(),
         status: status as u16,
         metadata: None,
@@ -1023,12 +1019,7 @@ async fn handle_fetch_response_stage(
 
     let cache_site = site_key_for_target_url(cache_key_url, auth, None);
 
-    crate::cache::remote::session_cache_insert(
-        &cache_site,
-        http_res,
-        policy,
-        &dedup_key,
-    );
+    crate::cache::remote::session_cache_insert(&cache_site, http_res, policy, &dedup_key);
 
     // Fulfill the paused request with the full body.
     let mut params = FulfillRequestParams::new(ev.request_id.clone(), status);
@@ -1036,7 +1027,11 @@ async fn handle_fetch_response_stage(
     params.response_headers = Some(headers_to_header_entries(&resp_headers));
     page.send_command(params).await?;
 
-    tracing::debug!("Stream cached: {} ({} bytes)", current_url, body_bytes.len());
+    tracing::debug!(
+        "Stream cached: {} ({} bytes)",
+        current_url,
+        body_bytes.len()
+    );
 
     Ok(())
 }
@@ -1084,9 +1079,7 @@ async fn fetch_response_body_oneshot(
 // ---------------------------------------------------------------------------
 
 /// Extract response headers from a `requestPaused` event into a HashMap.
-fn response_headers_from_event(
-    ev: &EventRequestPaused,
-) -> HashMap<String, String> {
+fn response_headers_from_event(ev: &EventRequestPaused) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Some(ref headers) = ev.response_headers {
         for entry in headers {
@@ -1097,9 +1090,7 @@ fn response_headers_from_event(
 }
 
 /// Extract request headers from a `requestPaused` event into a HashMap.
-fn request_headers_from_event(
-    ev: &EventRequestPaused,
-) -> HashMap<String, String> {
+fn request_headers_from_event(ev: &EventRequestPaused) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Some(obj) = ev.request.headers.inner().as_object() {
         for (k, v) in obj {
@@ -1115,9 +1106,7 @@ fn request_headers_from_event(
 }
 
 /// Convert a `HashMap<String, String>` to a `Vec<HeaderEntry>`.
-fn headers_to_header_entries(
-    headers: &HashMap<String, String>,
-) -> Vec<HeaderEntry> {
+fn headers_to_header_entries(headers: &HashMap<String, String>) -> Vec<HeaderEntry> {
     headers
         .iter()
         .map(|(k, v)| HeaderEntry {

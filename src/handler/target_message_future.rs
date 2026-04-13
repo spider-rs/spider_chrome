@@ -7,7 +7,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::handler::target::TargetMessage;
 use crate::{error::Result, ArcHttpRequest};
 
-type SendFut = Pin<Box<dyn Future<Output = std::result::Result<(), mpsc::error::SendError<TargetMessage>>> + Send>>;
+type SendFut = Pin<
+    Box<dyn Future<Output = std::result::Result<(), mpsc::error::SendError<TargetMessage>>> + Send>,
+>;
 
 /// Convenience alias for sending messages to a Target task/actor.
 ///
@@ -69,7 +71,11 @@ impl<T> TargetMessageFuture<T> {
         target_sender: TargetSender,
         request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
-        Self::wait(target_sender, request_timeout, TargetMessage::WaitForNavigation)
+        Self::wait(
+            target_sender,
+            request_timeout,
+            TargetMessage::WaitForNavigation,
+        )
     }
 
     /// Wait until the main frame reaches `networkIdle`.
@@ -81,7 +87,11 @@ impl<T> TargetMessageFuture<T> {
         target_sender: TargetSender,
         request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
-        Self::wait(target_sender, request_timeout, TargetMessage::WaitForNetworkIdle)
+        Self::wait(
+            target_sender,
+            request_timeout,
+            TargetMessage::WaitForNetworkIdle,
+        )
     }
 
     /// Reset the internal timer deadline to `now + request_timeout`.
@@ -101,7 +111,11 @@ impl<T> TargetMessageFuture<T> {
         target_sender: TargetSender,
         request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
-        Self::wait(target_sender, request_timeout, TargetMessage::WaitForNetworkAlmostIdle)
+        Self::wait(
+            target_sender,
+            request_timeout,
+            TargetMessage::WaitForNetworkAlmostIdle,
+        )
     }
 }
 
@@ -120,8 +134,7 @@ impl<T> Future for TargetMessageFuture<T> {
                 Err(mpsc::error::TrySendError::Full(msg)) => {
                     // Channel full — park via async send instead of busy-looping.
                     let sender = this.target_sender.clone();
-                    *this.send_fut =
-                        Some(Box::pin(async move { sender.send(msg).await }));
+                    *this.send_fut = Some(Box::pin(async move { sender.send(msg).await }));
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }

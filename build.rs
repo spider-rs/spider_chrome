@@ -13,7 +13,11 @@ mod easylist {
 
     const LISTS: &[(&str, &str, &str)] = &[
         ("easylist.to", "/easylist/easylist.txt", "easylist.txt"),
-        ("easylist.to", "/easylist/easyprivacy.txt", "easyprivacy.txt"),
+        (
+            "easylist.to",
+            "/easylist/easyprivacy.txt",
+            "easyprivacy.txt",
+        ),
     ];
 
     pub fn fetch_lists() {
@@ -61,9 +65,8 @@ mod easylist {
         stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
         let mut tls = connector.connect(host, stream)?;
 
-        let request = format!(
-            "GET {path} HTTP/1.0\r\nHost: {host}\r\nAccept-Encoding: identity\r\n\r\n"
-        );
+        let request =
+            format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nAccept-Encoding: identity\r\n\r\n");
         tls.write_all(request.as_bytes())?;
 
         let mut buf = Vec::with_capacity(4 * 1024 * 1024);
@@ -93,9 +96,8 @@ mod easylist {
         stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
         let mut tls = connector.connect(host, stream)?;
 
-        let request = format!(
-            "GET {path} HTTP/1.0\r\nHost: {host}\r\nAccept-Encoding: identity\r\n\r\n"
-        );
+        let request =
+            format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nAccept-Encoding: identity\r\n\r\n");
         tls.write_all(request.as_bytes())?;
 
         let mut buf = Vec::with_capacity(4 * 1024 * 1024);

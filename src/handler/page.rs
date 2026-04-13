@@ -114,12 +114,24 @@ impl Drop for PageInner {
 impl PageInner {
     /// Execute a PDL command and return its response
     pub(crate) async fn execute<T: Command>(&self, cmd: T) -> Result<CommandResponse<T::Response>> {
-        execute(cmd, self.sender.clone(), Some(self.session_id.clone()), self.request_timeout).await
+        execute(
+            cmd,
+            self.sender.clone(),
+            Some(self.session_id.clone()),
+            self.request_timeout,
+        )
+        .await
     }
 
     /// Execute a PDL command without waiting for the response.
     pub(crate) async fn send_command<T: Command>(&self, cmd: T) -> Result<&Self> {
-        let _ = send_command(cmd, self.sender.clone(), Some(self.session_id.clone()), self.request_timeout).await;
+        let _ = send_command(
+            cmd,
+            self.sender.clone(),
+            Some(self.session_id.clone()),
+            self.request_timeout,
+        )
+        .await;
         Ok(self)
     }
 
@@ -135,17 +147,26 @@ impl PageInner {
 
     /// This creates navigation future with the final http response when the page is loaded
     pub(crate) fn wait_for_navigation(&self) -> TargetMessageFuture<ArcHttpRequest> {
-        TargetMessageFuture::<ArcHttpRequest>::wait_for_navigation(self.sender.clone(), self.request_timeout)
+        TargetMessageFuture::<ArcHttpRequest>::wait_for_navigation(
+            self.sender.clone(),
+            self.request_timeout,
+        )
     }
 
     /// This creates navigation future with the final http response when the page network is idle
     pub(crate) fn wait_for_network_idle(&self) -> TargetMessageFuture<ArcHttpRequest> {
-        TargetMessageFuture::<ArcHttpRequest>::wait_for_network_idle(self.sender.clone(), self.request_timeout)
+        TargetMessageFuture::<ArcHttpRequest>::wait_for_network_idle(
+            self.sender.clone(),
+            self.request_timeout,
+        )
     }
 
     /// This creates navigation future with the final http response when the page network is almost idle
     pub(crate) fn wait_for_network_almost_idle(&self) -> TargetMessageFuture<ArcHttpRequest> {
-        TargetMessageFuture::<ArcHttpRequest>::wait_for_network_almost_idle(self.sender.clone(), self.request_timeout)
+        TargetMessageFuture::<ArcHttpRequest>::wait_for_network_almost_idle(
+            self.sender.clone(),
+            self.request_timeout,
+        )
     }
 
     /// This creates HTTP future with navigation and responds with the final

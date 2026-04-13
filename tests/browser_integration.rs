@@ -445,13 +445,10 @@ async fn concurrent_commands_do_not_deadlock() {
         .map(|i| {
             let page = page.clone();
             tokio::spawn(async move {
-                timeout(
-                    Duration::from_secs(30),
-                    page.evaluate(format!("1 + {i}")),
-                )
-                .await
-                .unwrap_or_else(|_| panic!("evaluate({i}) timed out — possible deadlock"))
-                .unwrap_or_else(|err| panic!("evaluate({i}) failed: {err}"))
+                timeout(Duration::from_secs(30), page.evaluate(format!("1 + {i}")))
+                    .await
+                    .unwrap_or_else(|_| panic!("evaluate({i}) timed out — possible deadlock"))
+                    .unwrap_or_else(|err| panic!("evaluate({i}) failed: {err}"))
             })
         })
         .collect();
@@ -575,9 +572,7 @@ async fn multiple_pages_concurrent_operations() {
         .map(|(i, page)| {
             let page = page.clone();
             tokio::spawn(async move {
-                let html = format!(
-                    r#"<html><body><p>page-{i}</p></body></html>"#
-                );
+                let html = format!(r#"<html><body><p>page-{i}</p></body></html>"#);
                 timeout(Duration::from_secs(15), page.set_content(&html))
                     .await
                     .expect("set_content should not time out")

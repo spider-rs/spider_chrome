@@ -182,9 +182,7 @@ impl ChunkSink {
             ChunkSink::Disk { file, path } => {
                 use tokio::io::AsyncWriteExt;
                 if let Err(err) = file.write_all(decoded).await {
-                    tracing::debug!(
-                        "stream disk write failed, falling back to memory: {err}"
-                    );
+                    tracing::debug!("stream disk write failed, falling back to memory: {err}");
                     // Best-effort flush so read-back captures as much as
                     // possible.  Ignore errors — we're already in fallback.
                     let _ = file.flush().await;
@@ -220,7 +218,10 @@ impl ChunkSink {
     /// panic.  The stream is still properly closed by the `StreamGuard`.
     async fn finish(&mut self) -> Vec<u8> {
         match self {
-            ChunkSink::Disk { ref mut file, ref path } => {
+            ChunkSink::Disk {
+                ref mut file,
+                ref path,
+            } => {
                 use tokio::io::AsyncWriteExt;
 
                 if let Err(err) = file.flush().await {
@@ -386,10 +387,7 @@ pub enum StreamResult {
     /// error, body too large, etc).  The response body IS consumed — the
     /// caller MUST `fulfillRequest` with the partial data collected so far.
     /// An empty Vec means zero bytes were recovered.
-    PartialBody {
-        body: Vec<u8>,
-        error: StreamError,
-    },
+    PartialBody { body: Vec<u8>, error: StreamError },
 }
 
 pub async fn read_response_body_as_stream(

@@ -76,8 +76,7 @@ where
                 Err(mpsc::error::TrySendError::Full(msg)) => {
                     // Channel full — park via async send instead of busy-looping.
                     let sender = this.target_sender.clone();
-                    *this.send_fut =
-                        Some(Box::pin(async move { sender.send(msg).await }));
+                    *this.send_fut = Some(Box::pin(async move { sender.send(msg).await }));
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }

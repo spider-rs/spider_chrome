@@ -24,8 +24,8 @@ use chromiumoxide_cdp::cdp::browser_protocol::{dom::*, emulation};
 use chromiumoxide_cdp::cdp::js_protocol;
 use chromiumoxide_cdp::cdp::js_protocol::debugger::GetScriptSourceParams;
 use chromiumoxide_cdp::cdp::js_protocol::runtime::{
-    AddBindingParams, CallFunctionOnParams, EvaluateParams, ExecutionContextId,
-    RemoteObjectType, ScriptId,
+    AddBindingParams, CallFunctionOnParams, EvaluateParams, ExecutionContextId, RemoteObjectType,
+    ScriptId,
 };
 use chromiumoxide_cdp::cdp::{browser_protocol, IntoEventKind};
 use chromiumoxide_types::*;
@@ -1077,18 +1077,14 @@ impl Page {
     /// Return the main frame of the page
     pub async fn mainframe(&self) -> Result<Option<FrameId>> {
         let (tx, rx) = oneshot_channel();
-        self.inner
-            .send_msg(TargetMessage::MainFrame(tx))
-            .await?;
+        self.inner.send_msg(TargetMessage::MainFrame(tx)).await?;
         self.inner.recv_msg(rx).await
     }
 
     /// Return the frames of the page
     pub async fn frames(&self) -> Result<Vec<FrameId>> {
         let (tx, rx) = oneshot_channel();
-        self.inner
-            .send_msg(TargetMessage::AllFrames(tx))
-            .await?;
+        self.inner.send_msg(TargetMessage::AllFrames(tx)).await?;
         self.inner.recv_msg(rx).await
     }
 

@@ -1346,20 +1346,20 @@ impl NetworkManager {
             return;
         }
         self.offline = value;
-        if let Ok(network) = EmulateNetworkConditionsByRuleParams::builder()
-            .offline(self.offline)
-            .matched_network_condition(
-                NetworkConditions::builder()
-                    .url_pattern("")
-                    .latency(0)
-                    .download_throughput(-1.)
-                    .upload_throughput(-1.)
-                    .build()
-                    .unwrap(),
-            )
+        if let Ok(condition) = NetworkConditions::builder()
+            .url_pattern("")
+            .latency(0)
+            .download_throughput(-1.)
+            .upload_throughput(-1.)
             .build()
         {
-            self.push_cdp_request(network);
+            if let Ok(network) = EmulateNetworkConditionsByRuleParams::builder()
+                .offline(self.offline)
+                .matched_network_condition(condition)
+                .build()
+            {
+                self.push_cdp_request(network);
+            }
         }
     }
 
@@ -1674,10 +1674,10 @@ mod tests {
         resource_type: chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType,
         is_same_site: bool,
     ) -> chromiumoxide_cdp::cdp::browser_protocol::fetch::EventRequestPaused {
-        use chromiumoxide_cdp::cdp::browser_protocol::network::{
-            Headers, Request, ResourcePriority, RequestReferrerPolicy,
-        };
         use chromiumoxide_cdp::cdp::browser_protocol::fetch::EventRequestPaused;
+        use chromiumoxide_cdp::cdp::browser_protocol::network::{
+            Headers, Request, RequestReferrerPolicy, ResourcePriority,
+        };
 
         EventRequestPaused {
             request_id: chromiumoxide_cdp::cdp::browser_protocol::network::RequestId::from(
@@ -1808,7 +1808,12 @@ mod tests {
     /// Helper: run a URL through the full `on_fetch_request_paused` pipeline
     /// and return whether it was blocked (true) or allowed (false).
     #[cfg(feature = "adblock")]
-    fn run_full_interception(nm: &mut NetworkManager, url: &str, resource_type: chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType, is_same_site: bool) -> bool {
+    fn run_full_interception(
+        nm: &mut NetworkManager,
+        url: &str,
+        resource_type: chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType,
+        is_same_site: bool,
+    ) -> bool {
         use super::NetworkEvent;
 
         // Drain any prior events.
