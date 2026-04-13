@@ -605,10 +605,16 @@ impl Target {
         // Prune senders whose receivers have been dropped (caller
         // timed out or was cancelled) so the vecs don't grow unbounded.
         // Done once per poll() call, outside the inner loop.
-        self.wait_for_frame_navigation.retain(|tx| !tx.is_closed());
-        self.wait_for_network_idle.retain(|tx| !tx.is_closed());
-        self.wait_for_network_almost_idle
-            .retain(|tx| !tx.is_closed());
+        if !self.wait_for_frame_navigation.is_empty() {
+            self.wait_for_frame_navigation.retain(|tx| !tx.is_closed());
+        }
+        if !self.wait_for_network_idle.is_empty() {
+            self.wait_for_network_idle.retain(|tx| !tx.is_closed());
+        }
+        if !self.wait_for_network_almost_idle.is_empty() {
+            self.wait_for_network_almost_idle
+                .retain(|tx| !tx.is_closed());
+        }
 
         loop {
             if self.init_state == TargetInit::Closing {

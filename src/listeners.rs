@@ -124,6 +124,8 @@ impl EventListeners {
     /// Drains all queued events and does housekeeping when the receiver is dropped.
     pub fn poll(&mut self, cx: &mut Context<'_>) {
         let _ = cx;
+        let mut any_disconnected = false;
+
         for subscriptions in self.listeners.values_mut() {
             for n in (0..subscriptions.len()).rev() {
                 let mut sub = subscriptions.swap_remove(n);
@@ -131,12 +133,15 @@ impl EventListeners {
                     Ok(()) => subscriptions.push(sub),
                     Err(_) => {
                         // disconnected — drop the listener
+                        any_disconnected = true;
                     }
                 }
             }
         }
 
-        self.listeners.retain(|_, v| !v.is_empty());
+        if any_disconnected {
+            self.listeners.retain(|_, v| !v.is_empty());
+        }
     }
 }
 

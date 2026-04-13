@@ -238,6 +238,13 @@ pub(crate) fn is_redirect_status(status: i64) -> bool {
 /// milliseconds.
 const STALE_BUFFER_SECS: u64 = 30;
 
+/// How long an in-flight request entry (`requests` map) can live without
+/// being resolved by a `loadingFinished` / `loadingFailed` / `loadingCanceled`
+/// event before it is considered orphaned and evicted.  Longer than the
+/// race-condition buffer timeout because real requests can legitimately take
+/// tens of seconds (streaming, slow origins, etc.).
+const STALE_REQUEST_SECS: u64 = 120;
+
 /// Wrapper around `adblock::Engine` that implements `Debug`.
 #[cfg(feature = "adblock")]
 pub struct AdblockEngine(std::sync::Arc<adblock::Engine>);
@@ -569,12 +576,20 @@ impl NetworkManager {
     /// `attempted_authentications`. Call this periodically (e.g. from the
     /// handler's eviction tick) so that lost CDP events cannot cause unbounded
     /// map growth.
-    pub fn evict_stale_entries(&mut self) {
-        let cutoff = Instant::now() - Duration::from_secs(STALE_BUFFER_SECS);
+    pub fn evict_stale_entries(&mut self, now: Instant) {
+        let cutoff = now - Duration::from_secs(STALE_BUFFER_SECS);
 
         self.requests_will_be_sent.retain(|_, (_, ts)| *ts > cutoff);
         self.request_id_to_interception_id
             .retain(|_, (_, ts)| *ts > cutoff);
+
+        // Evict orphaned in-flight requests whose completion events
+        // (`loadingFinished` / `loadingFailed` / `loadingCanceled`) were
+        // never received.  Uses a longer timeout than the race-condition
+        // buffers since real requests can legitimately be long-lived.
+        let request_cutoff = now - Duration::from_secs(STALE_REQUEST_SECS);
+        self.requests
+            .retain(|_, req| req.created_at > request_cutoff);
 
         // `attempted_authentications` entries reference interception IDs that
         // are cleaned up on loading-finished / loading-failed. If those events

@@ -597,8 +597,9 @@ impl Stream for Handler {
         // hit we break out, re-wake, and let other sections run.
         const POLL_BUDGET: usize = 256;
 
+        let now = Instant::now();
+
         loop {
-            let now = Instant::now();
             let mut budget_hit = false;
 
             // temporary pinning of the browser receiver should be safe as we are pinning
@@ -711,13 +712,15 @@ impl Stream for Handler {
 
                     // poll the target's event listeners
                     target.event_listeners_mut().poll(cx);
-                    // poll the handler's event listeners
-                    pin.event_listeners_mut().poll(cx);
 
                     pin.targets.insert(id, target);
                     pin.target_ids.push(target_id);
                 }
             }
+
+            // poll the handler-level event listeners once per iteration,
+            // not once per target.
+            pin.event_listeners_mut().poll(cx);
 
             let mut done = true;
             let mut ws_msgs = 0usize;
@@ -771,7 +774,7 @@ impl Stream for Handler {
                 // evict stale network race-condition buffers and
                 // orphaned context_ids / frame entries
                 for t in pin.targets.values_mut() {
-                    t.network_manager.evict_stale_entries();
+                    t.network_manager.evict_stale_entries(now);
                     t.frame_manager_mut().evict_stale_context_ids();
                 }
             }

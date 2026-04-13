@@ -1,7 +1,9 @@
+use std::time::Instant;
+
 use chromiumoxide_cdp::cdp::browser_protocol::network::{InterceptionId, RequestId, Response};
 use chromiumoxide_cdp::cdp::browser_protocol::page::FrameId;
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct HttpRequest {
     /// Unique ID of the request.
     pub request_id: RequestId,
@@ -33,6 +35,32 @@ pub struct HttpRequest {
     pub post_data: Option<String>,
     /// List of redirect requests leading to this one.
     pub redirect_chain: Vec<HttpRequest>,
+    /// When this entry was created — used to evict orphaned requests whose
+    /// `loadingFinished` / `loadingFailed` events were never received.
+    pub created_at: Instant,
+}
+
+impl Default for HttpRequest {
+    fn default() -> Self {
+        Self {
+            request_id: Default::default(),
+            from_memory_cache: false,
+            failure_text: None,
+            interception_id: None,
+            response: None,
+            headers: Default::default(),
+            frame: None,
+            is_navigation_request: false,
+            allow_interception: false,
+            interception_handled: false,
+            method: None,
+            url: None,
+            resource_type: None,
+            post_data: None,
+            redirect_chain: Vec::new(),
+            created_at: Instant::now(),
+        }
+    }
 }
 
 impl HttpRequest {
@@ -60,6 +88,7 @@ impl HttpRequest {
             resource_type: None,
             post_data: None,
             redirect_chain,
+            created_at: Instant::now(),
         }
     }
     /// Returns the request ID.
