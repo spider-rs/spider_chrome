@@ -768,9 +768,11 @@ impl Stream for Handler {
             if pin.evict_command_timeout.poll_ready(cx) {
                 // evict all commands that timed out
                 pin.evict_timed_out_commands(now);
-                // evict stale network race-condition buffers
+                // evict stale network race-condition buffers and
+                // orphaned context_ids / frame entries
                 for t in pin.targets.values_mut() {
                     t.network_manager.evict_stale_entries();
+                    t.frame_manager_mut().evict_stale_context_ids();
                 }
             }
 

@@ -602,6 +602,14 @@ impl Target {
             TargetInit::Closing => return None,
         };
 
+        // Prune senders whose receivers have been dropped (caller
+        // timed out or was cancelled) so the vecs don't grow unbounded.
+        // Done once per poll() call, outside the inner loop.
+        self.wait_for_frame_navigation.retain(|tx| !tx.is_closed());
+        self.wait_for_network_idle.retain(|tx| !tx.is_closed());
+        self.wait_for_network_almost_idle
+            .retain(|tx| !tx.is_closed());
+
         loop {
             if self.init_state == TargetInit::Closing {
                 break None;
@@ -633,6 +641,10 @@ impl Target {
             }
 
             if let Some(handle) = self.page.as_mut() {
+                // Budget: don't drain more than 64 messages per poll to avoid
+                // starving other targets and the websocket section in the
+                // handler's main loop.
+                let mut recv_budget = 64usize;
                 while let Poll::Ready(Some(msg)) = handle.rx.poll_recv(cx) {
                     if self.init_state == TargetInit::Closing {
                         break;
@@ -781,6 +793,11 @@ impl Target {
                             // if interception is enabled disable the user facing handling.
                             self.network_manager.user_request_interception_enabled = !enabled;
                         }
+                    }
+
+                    recv_budget -= 1;
+                    if recv_budget == 0 {
+                        break;
                     }
                 }
             }

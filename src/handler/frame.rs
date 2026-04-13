@@ -576,6 +576,13 @@ impl FrameManager {
         self.context_ids.clear()
     }
 
+    /// Remove `context_ids` entries that reference frames which no longer
+    /// exist.  Called periodically from the handler's eviction tick — a
+    /// single O(n) pass instead of per-frame cleanup during recursive removal.
+    pub fn evict_stale_context_ids(&mut self) {
+        self.context_ids.retain(|_, fid| self.frames.contains_key(fid));
+    }
+
     /// Fired for top level page lifecycle events (nav, load, paint, etc.)
     pub fn on_page_lifecycle_event(&mut self, event: &EventLifecycleEvent) {
         if let Some(frame) = self.frames.get_mut(&event.frame_id) {
@@ -587,7 +594,7 @@ impl FrameManager {
         }
     }
 
-    /// Detach all child frames
+    /// Detach all child frames.
     fn remove_frames_recursively(&mut self, id: &FrameId) -> Option<Frame> {
         if let Some(mut frame) = self.frames.remove(id) {
             for child in &frame.child_frames {
