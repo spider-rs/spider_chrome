@@ -552,13 +552,10 @@ fn is_body_empty_for_cache(body: &[u8]) -> bool {
     // Detect pages with HTML structure but empty <body> (small pages only)
     if trimmed.len() <= 2048 {
         let lower: Vec<u8> = trimmed.iter().map(|c| c.to_ascii_lowercase()).collect();
-        if let Some(body_open) = lower.windows(5).position(|w| w == b"<body") {
-            if let Some(gt) = lower[body_open..].iter().position(|&c| c == b'>') {
+        if let Some(body_open) = memchr::memmem::find(&lower, b"<body") {
+            if let Some(gt) = memchr::memchr(b'>', &lower[body_open..]) {
                 let content_start = body_open + gt + 1;
-                if let Some(close) = lower[content_start..]
-                    .windows(7)
-                    .position(|w| w == b"</body>")
-                {
+                if let Some(close) = memchr::memmem::find(&lower[content_start..], b"</body>") {
                     let content_end = content_start + close;
                     if trimmed[content_start..content_end]
                         .iter()

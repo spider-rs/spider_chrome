@@ -759,11 +759,12 @@ impl NetworkManager {
     #[inline]
     fn url_path_with_leading_slash(url: &str) -> Option<&str> {
         // find scheme separator
-        let idx = url.find("//")?;
+        let bytes = url.as_bytes();
+        let idx = memchr::memmem::find(bytes, b"//")?;
         let after_slashes = idx + 2;
 
         // find first slash after host
-        let slash_rel = url[after_slashes..].find('/')?;
+        let slash_rel = memchr::memchr(b'/', &bytes[after_slashes..])?;
         let slash_idx = after_slashes + slash_rel;
 
         if slash_idx < url.len() {
@@ -779,14 +780,9 @@ impl NetworkManager {
     /// - "/a/b.js?x=1#y" -> "/a/b.js"
     #[inline]
     fn strip_query_fragment(s: &str) -> &str {
-        let q = s.find('?');
-        let h = s.find('#');
-
-        match (q, h) {
-            (None, None) => s,
-            (Some(i), None) => &s[..i],
-            (None, Some(i)) => &s[..i],
-            (Some(i), Some(j)) => &s[..i.min(j)],
+        match memchr::memchr2(b'?', b'#', s.as_bytes()) {
+            Some(i) => &s[..i],
+            None => s,
         }
     }
 
@@ -814,7 +810,7 @@ impl NetworkManager {
 
                 let mut block_request = false;
 
-                if let Some(position) = request_url.rfind('.') {
+                if let Some(position) = memchr::memrchr(b'.', request_url.as_bytes()) {
                     let hlen = request_url.len();
                     let has_asset = hlen - position;
 
@@ -1298,10 +1294,12 @@ impl NetworkManager {
             .or_else(|| u.strip_prefix("http://"))
             .and_then(|rest| rest.split('/').next())
             // Strip userinfo (user:pass@) if present.
-            .map(|authority| match authority.rfind('@') {
-                Some(i) => &authority[i + 1..],
-                None => authority,
-            })
+            .map(
+                |authority| match memchr::memrchr(b'@', authority.as_bytes()) {
+                    Some(i) => &authority[i + 1..],
+                    None => authority,
+                },
+            )
             // Strip port (:8080) if present.
             .and_then(|host_port| host_port.split(':').next())
             .unwrap_or(source_domain);

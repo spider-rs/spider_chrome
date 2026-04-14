@@ -1,6 +1,6 @@
 [package]
 name = "chromey"
-version = "2.46.19"
+version = "2.46.20"
 rust-version = "1.70"
 authors = ["j-mendez <jeff@spider.cloud>"]
 edition = "2021"
@@ -46,6 +46,7 @@ rand = "0.10"
 case_insensitive_string = { version = "0.2", features = ["compact", "serde"] }
 hashbrown = { version = "0.16", default-features = true }
 aho-corasick = "1"
+memchr = "2"
 sonic-rs = { version = "0.5", optional = true, features = ["utf8_lossy"] }
 spider_network_blocker = "0"
 spider_chromiumoxide_types = { path = "types", version = "0.7" }
@@ -176,4 +177,8 @@ required-features = ["_fetcher-native-tokio"]
 
 [[bench]]
 name = "handler_bench"
+harness = false
+
+[[bench]]
+name = "simd_comparison"
 harness = false

@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use memchr::{memchr, memchr3, memrchr};
+
 #[inline]
 fn strip_special_schemes(url: &str) -> &str {
     let url = url.strip_prefix("blob:").unwrap_or(url);
@@ -11,26 +13,25 @@ fn strip_special_schemes(url: &str) -> &str {
 #[inline]
 pub fn host_and_rest(url: &str) -> Option<(&str, &str)> {
     let url = strip_special_schemes(url);
+    let bytes = url.as_bytes();
 
-    let host_start = if let Some(pos) = url.find("://") {
-        pos + 3
-    } else if url.starts_with("//") {
+    let host_start = if let Some(pos) = memchr(b':', bytes) {
+        if bytes.get(pos + 1) == Some(&b'/') && bytes.get(pos + 2) == Some(&b'/') {
+            pos + 3
+        } else if bytes.starts_with(b"//") {
+            2
+        } else {
+            return None;
+        }
+    } else if bytes.starts_with(b"//") {
         2
     } else {
         return None;
     };
 
-    // End of authority (first / ? # after host_start)
-    let mut rest_start = url.len();
-    if let Some(i) = url[host_start..].find('/') {
-        rest_start = host_start + i;
-    }
-    if let Some(i) = url[host_start..].find('?') {
-        rest_start = rest_start.min(host_start + i);
-    }
-    if let Some(i) = url[host_start..].find('#') {
-        rest_start = rest_start.min(host_start + i);
-    }
+    // End of authority: find first of / ? # after host_start in one SIMD pass.
+    let rest_start =
+        memchr3(b'/', b'?', b'#', &bytes[host_start..]).map_or(url.len(), |i| host_start + i);
 
     let authority = &url[host_start..rest_start];
     if authority.is_empty() {
@@ -38,17 +39,22 @@ pub fn host_and_rest(url: &str) -> Option<(&str, &str)> {
     }
 
     // Drop userinfo if present: user:pass@host
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let authority = match memrchr(b'@', authority.as_bytes()) {
+        Some(pos) => &authority[pos + 1..],
+        None => authority,
+    };
+
+    let ab = authority.as_bytes();
 
     // IPv6: [::1]:8080
-    if authority.as_bytes().first() == Some(&b'[') {
-        let close = authority.find(']')?;
+    if ab.first() == Some(&b'[') {
+        let close = memchr(b']', ab)?;
         let host = &authority[1..close];
         return Some((host, &url[rest_start..]));
     }
 
     // IPv4/hostname: host:port
-    let host_end = authority.find(':').unwrap_or(authority.len());
+    let host_end = memchr(b':', ab).unwrap_or(ab.len());
     let host = &authority[..host_end];
     if host.is_empty() {
         return None;
@@ -82,7 +88,7 @@ pub fn base_domain_from_any(s: &str) -> &str {
 #[inline]
 pub fn first_label(host: &str) -> &str {
     let h = host.trim_end_matches('.');
-    match h.find('.') {
+    match memchr(b'.', h.as_bytes()) {
         Some(i) => &h[..i],
         None => h,
     }
@@ -100,23 +106,25 @@ pub fn host_contains_label_icase(host: &str, label: &str) -> bool {
     let hb = host.as_bytes();
     let lb = label.as_bytes();
 
-    let mut i = 0usize;
-    while i < hb.len() {
-        while i < hb.len() && hb[i] == b'.' {
-            i += 1;
-        }
-        if i >= hb.len() {
-            break;
-        }
+    // Use memchr to jump between dots instead of scanning byte-by-byte.
+    let mut start = 0usize;
 
-        let start = i;
-        while i < hb.len() && hb[i] != b'.' {
-            i += 1;
-        }
-        let end = i;
+    // Skip leading dots.
+    while start < hb.len() && hb[start] == b'.' {
+        start += 1;
+    }
+
+    while start < hb.len() {
+        let end = memchr(b'.', &hb[start..]).map_or(hb.len(), |i| start + i);
 
         if end - start == lb.len() && hb[start..end].eq_ignore_ascii_case(lb) {
             return true;
+        }
+
+        // Skip past the dot and any consecutive dots.
+        start = end + 1;
+        while start < hb.len() && hb[start] == b'.' {
+            start += 1;
         }
     }
 
@@ -164,8 +172,20 @@ fn is_common_subdomain_label(lbl: &str) -> bool {
     if lbl.is_empty() {
         return false;
     }
-    let lower = lbl.to_ascii_lowercase(); // alloc
-    COMMON_SUBDOMAIN_LABELS.contains(lower.as_str())
+    // Stack-based lowercasing avoids heap allocation for typical short labels.
+    let bytes = lbl.as_bytes();
+    let mut buf = [0u8; 32];
+    if bytes.len() <= buf.len() {
+        for (i, &b) in bytes.iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        // SAFETY: ASCII lowercasing of valid UTF-8 is still valid UTF-8.
+        let lower = unsafe { std::str::from_utf8_unchecked(&buf[..bytes.len()]) };
+        COMMON_SUBDOMAIN_LABELS.contains(lower)
+    } else {
+        let lower = lbl.to_ascii_lowercase();
+        COMMON_SUBDOMAIN_LABELS.contains(lower.as_str())
+    }
 }
 
 #[inline]
@@ -266,12 +286,13 @@ pub fn base_domain_from_host(host: &str) -> &str {
         h = x;
     }
 
-    // Find last two dots
-    let last_dot = match h.rfind('.') {
+    // Find last two dots using SIMD-accelerated reverse search.
+    let hb = h.as_bytes();
+    let last_dot = match memrchr(b'.', hb) {
         Some(p) => p,
         None => return h,
     };
-    let prev_dot = match h[..last_dot].rfind('.') {
+    let prev_dot = match memrchr(b'.', &hb[..last_dot]) {
         Some(p) => p,
         None => return h, // only 1 dot
     };
@@ -282,7 +303,7 @@ pub fn base_domain_from_host(host: &str) -> &str {
     let mut base = &h[prev_dot + 1..]; // "example.com" or "co.uk"
 
     if tld.len() == 2 && is_common_cc_sld(sld) {
-        if let Some(prev2_dot) = h[..prev_dot].rfind('.') {
+        if let Some(prev2_dot) = memrchr(b'.', &hb[..prev_dot]) {
             base = &h[prev2_dot + 1..]; // "example.co.uk"
         }
     }
@@ -290,10 +311,10 @@ pub fn base_domain_from_host(host: &str) -> &str {
     if h.len() > base.len() + 1 {
         let base_start = h.len() - base.len();
         let boundary = base_start - 1;
-        if h.as_bytes().get(boundary) == Some(&b'.') {
+        if hb.get(boundary) == Some(&b'.') {
             let left_part = &h[..boundary];
             // label immediately to the left of base
-            let (lbl_start, lbl) = match left_part.rfind('.') {
+            let (lbl_start, lbl) = match memrchr(b'.', left_part.as_bytes()) {
                 Some(p) => (p + 1, &left_part[p + 1..]),
                 None => (0, left_part),
             };
@@ -423,5 +444,124 @@ mod tests {
             rel_for_ignore_script(main_host, u).as_ref(),
             "/concierge-js/cjs/concierge.js"
         );
+    }
+
+    // --- Additional edge-case tests for SIMD-accelerated paths ---
+
+    #[test]
+    fn test_host_and_rest_edge_cases() {
+        // Protocol-relative URL
+        let (h, rest) = host_and_rest("//example.com/path").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(rest, "/path");
+
+        // No path, query, or fragment
+        let (h, rest) = host_and_rest("https://example.com").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(rest, "");
+
+        // Query only (no path)
+        let (h, rest) = host_and_rest("https://example.com?q=1").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(rest, "?q=1");
+
+        // Fragment only (no path)
+        let (h, rest) = host_and_rest("https://example.com#frag").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(rest, "#frag");
+
+        // No scheme returns None
+        assert!(host_and_rest("example.com/path").is_none());
+        assert!(host_and_rest("").is_none());
+
+        // blob: + filesystem: schemes
+        let (h, _) = host_and_rest("filesystem:https://example.com/path").unwrap();
+        assert_eq!(h, "example.com");
+
+        // Port only, no path
+        let (h, rest) = host_and_rest("https://example.com:8080").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(rest, "");
+
+        // Userinfo with port
+        let (h, _) = host_and_rest("https://user@example.com:443/x").unwrap();
+        assert_eq!(h, "example.com");
+
+        // IPv6 without port
+        let (h, rest) = host_and_rest("http://[::1]/path").unwrap();
+        assert_eq!(h, "::1");
+        assert_eq!(rest, "/path");
+
+        // Empty authority
+        assert!(host_and_rest("http:///path").is_none());
+    }
+
+    #[test]
+    fn test_host_contains_label_icase_edge_cases() {
+        // Basic match
+        assert!(host_contains_label_icase("www.example.com", "example"));
+        assert!(host_contains_label_icase("www.example.com", "EXAMPLE"));
+        assert!(host_contains_label_icase("www.example.com", "www"));
+        assert!(host_contains_label_icase("www.example.com", "com"));
+
+        // Exact single-label host
+        assert!(host_contains_label_icase("localhost", "localhost"));
+        assert!(host_contains_label_icase("LOCALHOST", "localhost"));
+
+        // No partial matches
+        assert!(!host_contains_label_icase("www.example.com", "exam"));
+        assert!(!host_contains_label_icase("www.example.com", "ample"));
+
+        // Empty inputs
+        assert!(!host_contains_label_icase("", "example"));
+        assert!(!host_contains_label_icase("example.com", ""));
+
+        // Trailing dots
+        assert!(host_contains_label_icase("example.com.", "com"));
+        assert!(host_contains_label_icase("example.com.", "example"));
+    }
+
+    #[test]
+    fn test_first_label_edge_cases() {
+        assert_eq!(first_label("www.example.com"), "www");
+        assert_eq!(first_label("example.com"), "example");
+        assert_eq!(first_label("localhost"), "localhost");
+        assert_eq!(first_label("example.com."), "example");
+    }
+
+    #[test]
+    fn test_base_domain_from_host_edge_cases() {
+        // Simple two-label
+        assert_eq!(base_domain_from_host("example.com"), "example.com");
+
+        // Strip www/m
+        assert_eq!(base_domain_from_host("www.example.com"), "example.com");
+        assert_eq!(base_domain_from_host("m.example.com"), "example.com");
+
+        // ccTLD
+        assert_eq!(base_domain_from_host("example.co.uk"), "example.co.uk");
+        assert_eq!(base_domain_from_host("www.example.co.uk"), "example.co.uk");
+
+        // Single label
+        assert_eq!(base_domain_from_host("localhost"), "localhost");
+
+        // Trailing dot
+        assert_eq!(base_domain_from_host("example.com."), "example.com");
+    }
+
+    #[test]
+    fn test_host_is_subdomain_of_edge_cases() {
+        // Trailing dots
+        assert!(host_is_subdomain_of("example.com.", "example.com."));
+        assert!(host_is_subdomain_of("sub.example.com.", "example.com."));
+
+        // Empty base
+        assert!(!host_is_subdomain_of("example.com", ""));
+
+        // Exact match
+        assert!(host_is_subdomain_of("example.com", "example.com"));
+
+        // Shorter host than base
+        assert!(!host_is_subdomain_of("com", "example.com"));
     }
 }

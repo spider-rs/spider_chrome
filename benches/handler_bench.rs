@@ -32,8 +32,9 @@ fn bench_command_message_creation(c: &mut Criterion) {
     c.bench_function("CommandMessage::new (NavigateParams)", |b| {
         b.iter(|| {
             let cmd = NavigateParams::new("https://example.com");
-            let (tx, _rx) =
-                tokio::sync::oneshot::channel::<chromiumoxide::error::Result<chromiumoxide_types::Response>>();
+            let (tx, _rx) = tokio::sync::oneshot::channel::<
+                chromiumoxide::error::Result<chromiumoxide_types::Response>,
+            >();
             let msg = CommandMessage::new(cmd, tx).unwrap();
             black_box(msg);
         });
@@ -45,8 +46,9 @@ fn bench_command_message_with_session(c: &mut Criterion) {
     c.bench_function("CommandMessage::with_session (NavigateParams)", |b| {
         b.iter(|| {
             let cmd = NavigateParams::new("https://example.com");
-            let (tx, _rx) =
-                tokio::sync::oneshot::channel::<chromiumoxide::error::Result<chromiumoxide_types::Response>>();
+            let (tx, _rx) = tokio::sync::oneshot::channel::<
+                chromiumoxide::error::Result<chromiumoxide_types::Response>,
+            >();
             let session = Some(SessionId::from("session-1".to_string()));
             let msg = CommandMessage::with_session(cmd, tx, session).unwrap();
             black_box(msg);
@@ -81,12 +83,9 @@ fn bench_try_send_fast_path(c: &mut Criterion) {
                 let (tx, _rx) = tokio::sync::mpsc::channel::<TargetMessage>(2048);
                 let cmd = NavigateParams::new("https://example.com");
                 let (otx, _orx) = tokio::sync::oneshot::channel();
-                let msg = CommandMessage::with_session(
-                    cmd,
-                    otx,
-                    Some(SessionId::from("s1".to_string())),
-                )
-                .unwrap();
+                let msg =
+                    CommandMessage::with_session(cmd, otx, Some(SessionId::from("s1".to_string())))
+                        .unwrap();
                 let result = tx.send(TargetMessage::Command(msg)).await;
                 let _ = black_box(result);
             });
@@ -108,13 +107,9 @@ fn bench_command_future_creation(c: &mut Criterion) {
             let sender = PageSender::new(tx, None);
             let cmd = NavigateParams::new("https://example.com");
             let session = Some(SessionId::from("session-1".to_string()));
-            let fut = CommandFuture::<NavigateParams>::new(
-                cmd,
-                sender,
-                session,
-                Duration::from_secs(30),
-            )
-            .unwrap();
+            let fut =
+                CommandFuture::<NavigateParams>::new(cmd, sender, session, Duration::from_secs(30))
+                    .unwrap();
             black_box(fut);
         });
     });
@@ -135,8 +130,7 @@ fn bench_event_listeners_dispatch(c: &mut Criterion) {
             let mut receivers = Vec::new();
             for _ in 0..10 {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                listeners
-                    .add_listener(EventListenerRequest::new::<EventAnimationCanceled>(tx));
+                listeners.add_listener(EventListenerRequest::new::<EventAnimationCanceled>(tx));
                 receivers.push(rx);
             }
 
@@ -163,8 +157,7 @@ fn bench_event_listeners_dispatch(c: &mut Criterion) {
             // Register 50 listeners then drop all receivers
             for _ in 0..50 {
                 let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-                listeners
-                    .add_listener(EventListenerRequest::new::<EventAnimationCanceled>(tx));
+                listeners.add_listener(EventListenerRequest::new::<EventAnimationCanceled>(tx));
                 // _rx dropped here — listener is disconnected
             }
 
@@ -260,8 +253,7 @@ fn bench_concurrent_independent_channels(c: &mut Criterion) {
                         let mut handles = Vec::with_capacity(num_pages);
 
                         for _ in 0..num_pages {
-                            let (tx, mut rx) =
-                                tokio::sync::mpsc::channel::<TargetMessage>(2048);
+                            let (tx, mut rx) = tokio::sync::mpsc::channel::<TargetMessage>(2048);
                             let sender = PageSender::new(tx, None);
 
                             // Consumer: drain the channel
@@ -281,9 +273,7 @@ fn bench_concurrent_independent_channels(c: &mut Criterion) {
                                 for _ in 0..100u64 {
                                     let cmd = NavigateParams::new("https://example.com");
                                     let (otx, _orx) = tokio::sync::oneshot::channel::<
-                                        chromiumoxide::error::Result<
-                                            chromiumoxide_types::Response,
-                                        >,
+                                        chromiumoxide::error::Result<chromiumoxide_types::Response>,
                                     >();
                                     let msg = CommandMessage::with_session(
                                         cmd,
@@ -326,8 +316,7 @@ fn bench_concurrent_shared_channel(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     rt.block_on(async {
-                        let (tx, mut rx) =
-                            tokio::sync::mpsc::channel::<TargetMessage>(4096);
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<TargetMessage>(4096);
 
                         // Consumer
                         let consumer = tokio::spawn(async move {
@@ -349,9 +338,7 @@ fn bench_concurrent_shared_channel(c: &mut Criterion) {
                                 for _ in 0..100u64 {
                                     let cmd = NavigateParams::new("https://example.com");
                                     let (otx, _orx) = tokio::sync::oneshot::channel::<
-                                        chromiumoxide::error::Result<
-                                            chromiumoxide_types::Response,
-                                        >,
+                                        chromiumoxide::error::Result<chromiumoxide_types::Response>,
                                     >();
                                     let msg = CommandMessage::with_session(
                                         cmd,
@@ -457,8 +444,7 @@ fn bench_ws_cmd_channel_throughput(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     rt.block_on(async {
-                        let (tx, mut rx) =
-                            tokio::sync::mpsc::channel::<MethodCall>(2048);
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<MethodCall>(2048);
 
                         // Producer: burst-send commands via try_send (non-blocking).
                         let producer = tokio::spawn(async move {
@@ -562,8 +548,7 @@ fn bench_ws_cmd_backpressure(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     rt.block_on(async {
-                        let (tx, mut rx) =
-                            tokio::sync::mpsc::channel::<MethodCall>(capacity);
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<MethodCall>(capacity);
 
                         // Slow consumer: simulate serialization cost per message.
                         let consumer = tokio::spawn(async move {
@@ -614,6 +599,141 @@ fn bench_ws_cmd_backpressure(c: &mut Criterion) {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  Network-utils benchmarks — SIMD-accelerated URL / host parsing
+// ---------------------------------------------------------------------------
+
+use chromiumoxide::handler::network_utils::{
+    base_domain_from_any, base_domain_from_host, first_label, host_and_rest,
+    host_contains_label_icase, host_is_subdomain_of, rel_for_ignore_script,
+};
+
+fn bench_host_and_rest(c: &mut Criterion) {
+    let urls = [
+        "https://user:pass@staging.mainr.com:8443/a.js?x=1#y",
+        "https://example.com/path/to/resource",
+        "http://[::1]:8080/path",
+        "blob:https://example.com/path/to/blob",
+        "https://cdn.assets.example.co.uk/js/app.min.js?v=42",
+        "//protocol-relative.example.com/resource",
+    ];
+
+    c.bench_function("host_and_rest: 6 diverse URLs", |b| {
+        b.iter(|| {
+            for url in &urls {
+                black_box(host_and_rest(black_box(url)));
+            }
+        });
+    });
+}
+
+fn bench_host_contains_label_icase(c: &mut Criterion) {
+    c.bench_function("host_contains_label_icase: 5-label host", |b| {
+        b.iter(|| {
+            let host = "a.b.c.mainr.example.com";
+            black_box(host_contains_label_icase(
+                black_box(host),
+                black_box("mainr"),
+            ));
+            black_box(host_contains_label_icase(
+                black_box(host),
+                black_box("EXAMPLE"),
+            ));
+            black_box(host_contains_label_icase(
+                black_box(host),
+                black_box("notfound"),
+            ));
+        });
+    });
+}
+
+fn bench_base_domain_from_host(c: &mut Criterion) {
+    let hosts = [
+        "www.example.com",
+        "staging.mainr.com",
+        "a.b.example.co.uk",
+        "mainr.chilipiper.com",
+        "localhost",
+        "cdn.assets.example.com",
+    ];
+
+    c.bench_function("base_domain_from_host: 6 hosts", |b| {
+        b.iter(|| {
+            for host in &hosts {
+                black_box(base_domain_from_host(black_box(host)));
+            }
+        });
+    });
+}
+
+fn bench_host_is_subdomain_of(c: &mut Criterion) {
+    c.bench_function("host_is_subdomain_of: mixed match/miss", |b| {
+        b.iter(|| {
+            black_box(host_is_subdomain_of(
+                black_box("staging.mainr.com"),
+                black_box("mainr.com"),
+            ));
+            black_box(host_is_subdomain_of(
+                black_box("a.b.c.mainr.com"),
+                black_box("mainr.com"),
+            ));
+            black_box(host_is_subdomain_of(
+                black_box("evil-mainr.com"),
+                black_box("mainr.com"),
+            ));
+            black_box(host_is_subdomain_of(
+                black_box("mainr.co"),
+                black_box("mainr.com"),
+            ));
+        });
+    });
+}
+
+fn bench_rel_for_ignore_script(c: &mut Criterion) {
+    let base = "mainr.com";
+    let urls = [
+        "https://mainr.com/careers",
+        "https://staging.mainr.com/mainr.min.js",
+        "https://cdn.other.com/app.js",
+        "/static/app.js",
+        "https://mainr.chilipiper.com/concierge-js/cjs/concierge.js",
+    ];
+
+    c.bench_function("rel_for_ignore_script: 5 URLs", |b| {
+        b.iter(|| {
+            for url in &urls {
+                black_box(rel_for_ignore_script(black_box(base), black_box(url)));
+            }
+        });
+    });
+}
+
+fn bench_first_label(c: &mut Criterion) {
+    c.bench_function("first_label: mixed hosts", |b| {
+        b.iter(|| {
+            black_box(first_label(black_box("www.example.com")));
+            black_box(first_label(black_box("localhost")));
+            black_box(first_label(black_box("a.b.c.d.e.f.example.com.")));
+        });
+    });
+}
+
+fn bench_base_domain_from_any(c: &mut Criterion) {
+    let inputs = [
+        "https://www.example.co.uk/path?q=1",
+        "mainr.chilipiper.com",
+        "https://staging.mainr.com:8080/resource",
+    ];
+
+    c.bench_function("base_domain_from_any: 3 inputs", |b| {
+        b.iter(|| {
+            for input in &inputs {
+                black_box(base_domain_from_any(black_box(input)));
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_command_message_creation,
@@ -629,5 +749,12 @@ criterion_group!(
     bench_ws_cmd_channel_throughput,
     bench_ws_method_call_serialization,
     bench_ws_cmd_backpressure,
+    bench_host_and_rest,
+    bench_host_contains_label_icase,
+    bench_base_domain_from_host,
+    bench_host_is_subdomain_of,
+    bench_rel_for_ignore_script,
+    bench_first_label,
+    bench_base_domain_from_any,
 );
 criterion_main!(benches);
