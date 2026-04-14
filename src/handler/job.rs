@@ -23,8 +23,7 @@ impl PeriodicJob {
     }
 
     pub fn new(period: Duration) -> Self {
-        let mut interval =
-            tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         // If ticks are missed (e.g. handler was busy), skip them instead of
         // firing a burst of catch-up ticks.
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);

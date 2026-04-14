@@ -1,14 +1,14 @@
+use crate::handler::commandfuture::CommandFuture;
+use crate::handler::sender::PageSender;
+use crate::handler::target_message_future::TargetMessageFuture;
+use crate::{ArcHttpRequest, Result};
+use chromiumoxide_types::Command;
 use futures_util::future::{Fuse, FusedFuture};
 use futures_util::FutureExt;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use crate::handler::commandfuture::CommandFuture;
-use crate::handler::sender::PageSender;
-use crate::handler::target_message_future::TargetMessageFuture;
-use crate::{ArcHttpRequest, Result};
-use chromiumoxide_types::Command;
 
 type ArcRequest = ArcHttpRequest;
 

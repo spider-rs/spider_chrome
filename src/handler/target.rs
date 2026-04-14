@@ -804,7 +804,6 @@ impl Target {
                             self.network_manager.user_request_interception_enabled = !enabled;
                         }
                     }
-
                 }
             }
 
@@ -892,7 +891,12 @@ impl Target {
                 let _ = tx.send(self.frame_manager.main_frame().map(|f| f.id().clone()));
             }
             TargetMessage::AllFrames(tx) => {
-                let _ = tx.send(self.frame_manager.frames().map(|f| f.id().clone()).collect());
+                let _ = tx.send(
+                    self.frame_manager
+                        .frames()
+                        .map(|f| f.id().clone())
+                        .collect(),
+                );
             }
             #[cfg(feature = "_cache")]
             TargetMessage::CacheKey((cache_key, cache_policy)) => {
@@ -1149,7 +1153,8 @@ impl Target {
             self.wait_for_network_idle.retain(|tx| !tx.is_closed());
         }
         if !self.wait_for_network_almost_idle.is_empty() {
-            self.wait_for_network_almost_idle.retain(|tx| !tx.is_closed());
+            self.wait_for_network_almost_idle
+                .retain(|tx| !tx.is_closed());
         }
 
         // Drain events loop (same as poll's inner loop, minus page channel reading)
@@ -1212,10 +1217,12 @@ impl Target {
                 }
                 match event {
                     FrameEvent::NavigationResult(res) => {
-                        self.queued_events.push_back(TargetEvent::NavigationResult(res));
+                        self.queued_events
+                            .push_back(TargetEvent::NavigationResult(res));
                     }
                     FrameEvent::NavigationRequest(id, req) => {
-                        self.queued_events.push_back(TargetEvent::NavigationRequest(id, req));
+                        self.queued_events
+                            .push_back(TargetEvent::NavigationRequest(id, req));
                     }
                 }
             }

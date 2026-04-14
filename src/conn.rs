@@ -288,12 +288,16 @@ async fn ws_write_loop(
 ) -> Result<()> {
     while let Some(call) = rx.recv().await {
         let msg = crate::serde_json::to_string(&call)?;
-        sink.feed(WsMessage::Text(msg.into())).await.map_err(CdpError::Ws)?;
+        sink.feed(WsMessage::Text(msg.into()))
+            .await
+            .map_err(CdpError::Ws)?;
 
         // Batch: drain all buffered commands without waiting.
         while let Ok(call) = rx.try_recv() {
             let msg = crate::serde_json::to_string(&call)?;
-            sink.feed(WsMessage::Text(msg.into())).await.map_err(CdpError::Ws)?;
+            sink.feed(WsMessage::Text(msg.into()))
+                .await
+                .map_err(CdpError::Ws)?;
         }
 
         // Flush the entire batch in one write.

@@ -312,9 +312,9 @@ impl Handler {
         msg: CommandMessage,
         now: Instant,
     ) -> Result<()> {
-        let call_id = self
-            .conn()?
-            .submit_command(msg.method.clone(), msg.session_id, msg.params)?;
+        let call_id =
+            self.conn()?
+                .submit_command(msg.method.clone(), msg.session_id, msg.params)?;
         self.pending_commands.insert(
             call_id,
             (PendingRequest::ExternalCommand(msg.sender), msg.method, now),
@@ -640,8 +640,8 @@ impl Handler {
     /// # }
     /// ```
     pub async fn run(mut self) -> Result<()> {
-        use tokio::time::MissedTickBehavior;
         use chromiumoxide_types::Message;
+        use tokio::time::MissedTickBehavior;
         use tokio_tungstenite::tungstenite::{self, error::ProtocolError};
 
         // --- set up page notification ---
@@ -756,18 +756,12 @@ impl Handler {
                                     ) {
                                         self.pending_commands.insert(
                                             call_id,
-                                            (
-                                                PendingRequest::Navigate(nav_id),
-                                                req.method,
-                                                now,
-                                            ),
+                                            (PendingRequest::Navigate(nav_id), req.method, now),
                                         );
                                     }
                                     self.navigations.insert(
                                         nav_id,
-                                        NavigationRequest::Navigate(
-                                            NavigationInProgress::new(tx),
-                                        ),
+                                        NavigationRequest::Navigate(NavigationInProgress::new(tx)),
                                     );
                                 } else {
                                     if let Ok(call_id) = ws_submit!(
@@ -997,13 +991,13 @@ impl Handler {
                     };
                     match ws_tx.try_send(call) {
                         Ok(()) => {
-                            self.pending_commands.insert(
-                                id,
-                                (PendingRequest::CreateTarget(tx), method, now),
-                            );
+                            self.pending_commands
+                                .insert(id, (PendingRequest::CreateTarget(tx), method, now));
                         }
                         Err(_) => {
-                            let _ = tx.send(Err(CdpError::msg("WS command channel full or closed"))).ok();
+                            let _ = tx
+                                .send(Err(CdpError::msg("WS command channel full or closed")))
+                                .ok();
                         }
                     }
                 }
@@ -1144,7 +1138,9 @@ impl Stream for Handler {
             let mut ws_err = None;
             {
                 let Some(conn) = pin.conn.as_mut() else {
-                    return Poll::Ready(Some(Err(CdpError::msg("connection consumed by Handler::run()"))));
+                    return Poll::Ready(Some(Err(CdpError::msg(
+                        "connection consumed by Handler::run()",
+                    ))));
                 };
                 while let Poll::Ready(Some(ev)) = Pin::new(&mut *conn).poll_next(cx) {
                     match ev {
