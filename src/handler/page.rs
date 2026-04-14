@@ -905,18 +905,23 @@ impl PageInner {
         dom_world: DOMWorldKind,
     ) -> Result<Option<ExecutionContextId>> {
         let (tx, rx) = oneshot_channel();
-        tokio::time::timeout(
-            self.request_timeout,
-            self.sender
-                .send(TargetMessage::GetExecutionContext(GetExecutionContext {
-                    dom_world,
-                    frame_id,
-                    tx,
-                })),
-        )
-        .await
-        .map_err(|_| CdpError::Timeout)?
-        .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
+        let msg = TargetMessage::GetExecutionContext(GetExecutionContext {
+            dom_world,
+            frame_id,
+            tx,
+        });
+        match self.sender.try_send(msg) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                tokio::time::timeout(self.request_timeout, self.sender.send(msg))
+                    .await
+                    .map_err(|_| CdpError::Timeout)?
+                    .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(CdpError::ChannelSendError(crate::error::ChannelError::Send));
+            }
+        }
         Ok(tokio::time::timeout(self.request_timeout, rx)
             .await
             .map_err(|_| CdpError::Timeout)??)
@@ -1019,7 +1024,10 @@ pub(crate) async fn execute<T: Command>(
     to_command_response::<T>(resp, method)
 }
 
-/// Execute a command without waiting
+/// Execute a command without waiting.
+///
+/// Uses a `try_send` fast path to avoid async overhead when the channel has
+/// capacity (common case). Falls back to an async send with timeout when full.
 pub(crate) async fn send_command<T: Command>(
     cmd: T,
     sender: Sender<TargetMessage>,
@@ -1028,9 +1036,18 @@ pub(crate) async fn send_command<T: Command>(
 ) -> Result<tokio::sync::oneshot::Receiver<Result<chromiumoxide_types::Response, CdpError>>> {
     let (tx, rx) = oneshot_channel();
     let msg = CommandMessage::with_session(cmd, tx, session)?;
-    tokio::time::timeout(request_timeout, sender.send(TargetMessage::Command(msg)))
-        .await
-        .map_err(|_| CdpError::Timeout)?
-        .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
+    let target_msg = TargetMessage::Command(msg);
+    match sender.try_send(target_msg) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+            tokio::time::timeout(request_timeout, sender.send(msg))
+                .await
+                .map_err(|_| CdpError::Timeout)?
+                .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err(CdpError::ChannelSendError(crate::error::ChannelError::Send));
+        }
+    }
     Ok(rx)
 }

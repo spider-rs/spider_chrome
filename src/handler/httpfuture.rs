@@ -43,7 +43,7 @@ where
     type Output = Result<ArcRequest>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
+        let mut this = self.project();
 
         // 1. First complete command request future
         // 2. Switch polls navigation
@@ -54,10 +54,10 @@ where
                 Poll::Ready(Ok(_command_response)) => {
                     // Command succeeded — reset the navigation timer so it
                     // gets a full request_timeout from NOW, not from when
-                    // HttpFuture was constructed.
-                    this.navigation.reset_deadline();
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    // HttpFuture was constructed, then immediately start
+                    // polling navigation (avoids a full wake round-trip).
+                    this.navigation.as_mut().reset_deadline();
+                    this.navigation.poll(cx)
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                 Poll::Pending => Poll::Pending,

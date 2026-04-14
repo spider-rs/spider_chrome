@@ -122,21 +122,21 @@ impl EventListeners {
     }
 
     /// Drains all queued events and does housekeeping when the receiver is dropped.
+    ///
+    /// Uses `retain_mut` for a single-pass flush + prune instead of the
+    /// swap-remove/push pattern, avoiding per-listener Vec reshuffling.
     pub fn poll(&mut self, cx: &mut Context<'_>) {
         let _ = cx;
         let mut any_disconnected = false;
 
         for subscriptions in self.listeners.values_mut() {
-            for n in (0..subscriptions.len()).rev() {
-                let mut sub = subscriptions.swap_remove(n);
-                match sub.flush() {
-                    Ok(()) => subscriptions.push(sub),
-                    Err(_) => {
-                        // disconnected — drop the listener
-                        any_disconnected = true;
-                    }
+            subscriptions.retain_mut(|sub| match sub.flush() {
+                Ok(()) => true,
+                Err(_) => {
+                    any_disconnected = true;
+                    false
                 }
-            }
+            });
         }
 
         if any_disconnected {

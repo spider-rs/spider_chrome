@@ -70,7 +70,7 @@ pub mod cache;
 #[cfg(feature = "_cache")]
 pub mod http;
 
-pub(crate) mod cmd;
+pub mod cmd;
 pub mod conn;
 pub mod detection;
 pub mod element;

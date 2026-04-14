@@ -1,38 +1,34 @@
-use std::pin::Pin;
 use std::task::Context;
 use std::time::Duration;
 
-use std::future::Future;
-use tokio::time::Sleep;
+use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::handler::REQUEST_TIMEOUT;
 
 /// A background job run periodically.
+///
+/// Uses `tokio::time::Interval` instead of a boxed `Sleep` to avoid
+/// heap indirection and manual deadline resets.
 #[derive(Debug)]
 pub(crate) struct PeriodicJob {
-    /// The interval between job executions.
-    interval: Duration,
-    /// The delay timer used to wait between executions.
-    delay: Pin<Box<Sleep>>,
+    /// The interval timer that fires periodically.
+    interval: Interval,
 }
 
 impl PeriodicJob {
     /// Returns `true` if the job is currently not running but ready
     /// to be run, `false` otherwise.
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> bool {
-        if !Future::poll(self.delay.as_mut(), cx).is_pending() {
-            self.delay
-                .as_mut()
-                .reset(tokio::time::Instant::now() + self.interval);
-            return true;
-        }
-        false
+        self.interval.poll_tick(cx).is_ready()
     }
-    pub fn new(interval: Duration) -> Self {
-        Self {
-            delay: Box::pin(tokio::time::sleep(interval)),
-            interval,
-        }
+
+    pub fn new(period: Duration) -> Self {
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        // If ticks are missed (e.g. handler was busy), skip them instead of
+        // firing a burst of catch-up ticks.
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        Self { interval }
     }
 }
 
