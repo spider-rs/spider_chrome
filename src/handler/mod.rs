@@ -170,6 +170,15 @@ impl Handler {
         }
     }
 
+    /// Borrow the WebSocket connection, returning an error if it has been
+    /// consumed by [`Handler::run()`].
+    #[inline]
+    fn conn(&mut self) -> Result<&mut Connection<CdpEventMessage>> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| CdpError::msg("connection consumed by Handler::run()"))
+    }
+
     /// Return the target with the matching `target_id`
     pub fn get_target(&self, target_id: &TargetId) -> Option<&Target> {
         self.targets.get(target_id)
@@ -304,9 +313,7 @@ impl Handler {
         now: Instant,
     ) -> Result<()> {
         let call_id = self
-            .conn
-            .as_mut()
-            .unwrap()
+            .conn()?
             .submit_command(msg.method.clone(), msg.session_id, msg.params)?;
         self.pending_commands.insert(
             call_id,
@@ -321,7 +328,7 @@ impl Handler {
         req: CdpRequest,
         now: Instant,
     ) -> Result<()> {
-        let call_id = self.conn.as_mut().unwrap().submit_command(
+        let call_id = self.conn()?.submit_command(
             req.method.clone(),
             req.session_id.map(Into::into),
             req.params,
@@ -336,38 +343,39 @@ impl Handler {
     fn submit_fetch_targets(&mut self, tx: OneshotSender<Result<Vec<TargetInfo>>>, now: Instant) {
         let msg = TARGET_PARAMS_ID.clone();
 
-        if let Ok(call_id) = self.conn.as_mut().unwrap().submit_command(msg.0.clone(), None, msg.1) {
-            self.pending_commands
-                .insert(call_id, (PendingRequest::GetTargets(tx), msg.0, now));
+        if let Some(conn) = self.conn.as_mut() {
+            if let Ok(call_id) = conn.submit_command(msg.0.clone(), None, msg.1) {
+                self.pending_commands
+                    .insert(call_id, (PendingRequest::GetTargets(tx), msg.0, now));
+            }
         }
     }
 
     /// Send the Request over to the server and store its identifier to handle
     /// the response once received.
     fn submit_navigation(&mut self, id: NavigationId, req: CdpRequest, now: Instant) {
-        if let Ok(call_id) = self.conn.as_mut().unwrap().submit_command(
-            req.method.clone(),
-            req.session_id.map(Into::into),
-            req.params,
-        ) {
-            self.pending_commands
-                .insert(call_id, (PendingRequest::Navigate(id), req.method, now));
+        if let Some(conn) = self.conn.as_mut() {
+            if let Ok(call_id) = conn.submit_command(
+                req.method.clone(),
+                req.session_id.map(Into::into),
+                req.params,
+            ) {
+                self.pending_commands
+                    .insert(call_id, (PendingRequest::Navigate(id), req.method, now));
+            }
         }
     }
 
     fn submit_close(&mut self, tx: OneshotSender<Result<CloseReturns>>, now: Instant) {
         let close_msg = CLOSE_PARAMS_ID.clone();
 
-        if let Ok(call_id) = self
-            .conn
-            .as_mut()
-            .unwrap()
-            .submit_command(close_msg.0.clone(), None, close_msg.1)
-        {
-            self.pending_commands.insert(
-                call_id,
-                (PendingRequest::CloseBrowser(tx), close_msg.0, now),
-            );
+        if let Some(conn) = self.conn.as_mut() {
+            if let Ok(call_id) = conn.submit_command(close_msg.0.clone(), None, close_msg.1) {
+                self.pending_commands.insert(
+                    call_id,
+                    (PendingRequest::CloseBrowser(tx), close_msg.0, now),
+                );
+            }
         }
     }
 
@@ -417,8 +425,12 @@ impl Handler {
         if about_blank || http_check {
             let method = params.identifier();
 
+            let Some(conn) = self.conn.as_mut() else {
+                let _ = tx.send(Err(CdpError::msg("connection consumed"))).ok();
+                return;
+            };
             match serde_json::to_value(params) {
-                Ok(params) => match self.conn.as_mut().unwrap().submit_command(method.clone(), None, params) {
+                Ok(params) => match conn.submit_command(method.clone(), None, params) {
                     Ok(call_id) => {
                         self.pending_commands.insert(
                             call_id,
@@ -637,7 +649,10 @@ impl Handler {
         self.page_wake = Some(page_wake.clone());
 
         // --- split WebSocket ---
-        let conn = self.conn.take().expect("Handler::run() called with no connection");
+        let conn = self
+            .conn
+            .take()
+            .ok_or_else(|| CdpError::msg("Handler::run() called with no connection"))?;
         let async_conn = conn.into_async();
         let mut ws_reader = async_conn.reader;
         let ws_tx = async_conn.cmd_tx;
@@ -1112,42 +1127,59 @@ impl Stream for Handler {
 
             let mut done = true;
 
-            while let Poll::Ready(Some(ev)) = Pin::new(pin.conn.as_mut().unwrap()).poll_next(cx) {
-                match ev {
-                    Ok(boxed_msg) => match *boxed_msg {
-                        Message::Response(resp) => {
-                            pin.on_response(resp);
-                            if pin.closing {
-                                return Poll::Ready(None);
-                            }
+            // Read WS messages into a temporary buffer so the conn borrow
+            // is released before we process them (which needs &mut pin).
+            let mut ws_msgs = Vec::new();
+            let mut ws_err = None;
+            {
+                let Some(conn) = pin.conn.as_mut() else {
+                    return Poll::Ready(Some(Err(CdpError::msg("connection consumed by Handler::run()"))));
+                };
+                while let Poll::Ready(Some(ev)) = Pin::new(&mut *conn).poll_next(cx) {
+                    match ev {
+                        Ok(msg) => ws_msgs.push(msg),
+                        Err(err) => {
+                            ws_err = Some(err);
+                            break;
                         }
-                        Message::Event(ev) => {
-                            pin.on_event(ev);
+                    }
+                }
+            }
+
+            for boxed_msg in ws_msgs {
+                match *boxed_msg {
+                    Message::Response(resp) => {
+                        pin.on_response(resp);
+                        if pin.closing {
+                            return Poll::Ready(None);
                         }
-                    },
-                    Err(err) => {
-                        tracing::error!("WS Connection error: {:?}", err);
-                        if let CdpError::Ws(ref ws_error) = err {
-                            match ws_error {
-                                Error::AlreadyClosed => {
-                                    pin.closing = true;
-                                    dispose = true;
-                                    break;
-                                }
-                                Error::Protocol(detail)
-                                    if detail == &ProtocolError::ResetWithoutClosingHandshake =>
-                                {
-                                    pin.closing = true;
-                                    dispose = true;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Message::Event(ev) => {
+                        pin.on_event(ev);
                     }
                 }
                 done = false;
+            }
+
+            if let Some(err) = ws_err {
+                tracing::error!("WS Connection error: {:?}", err);
+                if let CdpError::Ws(ref ws_error) = err {
+                    match ws_error {
+                        Error::AlreadyClosed => {
+                            pin.closing = true;
+                            dispose = true;
+                        }
+                        Error::Protocol(detail)
+                            if detail == &ProtocolError::ResetWithoutClosingHandshake =>
+                        {
+                            pin.closing = true;
+                            dispose = true;
+                        }
+                        _ => return Poll::Ready(Some(Err(err))),
+                    }
+                } else {
+                    return Poll::Ready(Some(Err(err)));
+                }
             }
 
             if pin.evict_command_timeout.poll_ready(cx) {
