@@ -172,20 +172,8 @@ fn is_common_subdomain_label(lbl: &str) -> bool {
     if lbl.is_empty() {
         return false;
     }
-    // Stack-based lowercasing avoids heap allocation for typical short labels.
-    let bytes = lbl.as_bytes();
-    let mut buf = [0u8; 32];
-    if bytes.len() <= buf.len() {
-        for (i, &b) in bytes.iter().enumerate() {
-            buf[i] = b.to_ascii_lowercase();
-        }
-        // SAFETY: ASCII lowercasing of valid UTF-8 is still valid UTF-8.
-        let lower = unsafe { std::str::from_utf8_unchecked(&buf[..bytes.len()]) };
-        COMMON_SUBDOMAIN_LABELS.contains(lower)
-    } else {
-        let lower = lbl.to_ascii_lowercase();
-        COMMON_SUBDOMAIN_LABELS.contains(lower.as_str())
-    }
+    let lower = lbl.to_ascii_lowercase();
+    COMMON_SUBDOMAIN_LABELS.contains(lower.as_str())
 }
 
 #[inline]
