@@ -62,6 +62,10 @@ impl<T: EventMessage + Unpin> Connection<T> {
     pub async fn connect_with_retries(debug_ws_url: impl AsRef<str>, retries: u32) -> Result<Self> {
         let mut config = WebSocketConfig::default();
 
+        // Cap the internal write buffer so a slow receiver cannot cause
+        // unbounded memory growth (default is usize::MAX).
+        config.max_write_buffer_size = 4 * 1024 * 1024;
+
         if !*WEBSOCKET_DEFAULTS {
             config.max_message_size = None;
             config.max_frame_size = None;
@@ -232,13 +236,18 @@ impl<T: EventMessage> Connection<T> {
     }
 }
 
+/// Capacity of the bounded channel feeding the background WS writer task.
+/// Large enough that bursts of CDP commands never block the handler, small
+/// enough to apply back-pressure before memory grows without bound.
+const WS_CMD_CHANNEL_CAPACITY: usize = 2048;
+
 /// Split parts returned by [`Connection::into_async`].
 #[derive(Debug)]
 pub struct AsyncConnection<T: EventMessage> {
     /// WebSocket read stream — yields decoded CDP messages.
     pub reader: WsReader<T>,
     /// Sender half for submitting outgoing CDP commands.
-    pub cmd_tx: mpsc::UnboundedSender<MethodCall>,
+    pub cmd_tx: mpsc::Sender<MethodCall>,
     /// Handle to the background writer task.
     pub writer_handle: tokio::task::JoinHandle<Result<()>>,
     /// Next command-call-id counter (continue numbering from where Connection left off).
@@ -254,7 +263,7 @@ impl<T: EventMessage + Unpin> Connection<T> {
     /// write.
     pub fn into_async(self) -> AsyncConnection<T> {
         let (ws_sink, ws_stream) = self.ws.split();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(WS_CMD_CHANNEL_CAPACITY);
 
         let writer_handle = tokio::spawn(ws_write_loop(ws_sink, cmd_rx));
 
@@ -275,7 +284,7 @@ impl<T: EventMessage + Unpin> Connection<T> {
 /// Background task that batches and flushes outgoing CDP commands.
 async fn ws_write_loop(
     mut sink: SplitSink<WebSocketStream<ConnectStream>, WsMessage>,
-    mut rx: mpsc::UnboundedReceiver<MethodCall>,
+    mut rx: mpsc::Receiver<MethodCall>,
 ) -> Result<()> {
     while let Some(call) = rx.recv().await {
         let msg = crate::serde_json::to_string(&call)?;

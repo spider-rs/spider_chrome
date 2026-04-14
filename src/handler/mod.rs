@@ -683,8 +683,16 @@ impl Handler {
                     session_id: $session_id,
                     params: $params,
                 };
-                let _ = ws_tx.send(call);
-                Ok::<_, CdpError>(id)
+                match ws_tx.try_send(call) {
+                    Ok(()) => Ok::<_, CdpError>(id),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!("WS command channel full — dropping command");
+                        Err(CdpError::msg("WS command channel full"))
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err(CdpError::msg("WS writer closed"))
+                    }
+                }
             }};
         }
 
@@ -969,7 +977,7 @@ impl Handler {
         params: CreateTargetParams,
         tx: OneshotSender<Result<Page>>,
         alloc_call_id: &mut impl FnMut() -> chromiumoxide_types::CallId,
-        ws_tx: &tokio::sync::mpsc::UnboundedSender<chromiumoxide_types::MethodCall>,
+        ws_tx: &tokio::sync::mpsc::Sender<chromiumoxide_types::MethodCall>,
         now: std::time::Instant,
     ) {
         let about_blank = params.url == "about:blank";
@@ -987,13 +995,16 @@ impl Handler {
                         session_id: None,
                         params,
                     };
-                    if ws_tx.send(call).is_ok() {
-                        self.pending_commands.insert(
-                            id,
-                            (PendingRequest::CreateTarget(tx), method, now),
-                        );
-                    } else {
-                        let _ = tx.send(Err(CdpError::msg("WS writer closed"))).ok();
+                    match ws_tx.try_send(call) {
+                        Ok(()) => {
+                            self.pending_commands.insert(
+                                id,
+                                (PendingRequest::CreateTarget(tx), method, now),
+                            );
+                        }
+                        Err(_) => {
+                            let _ = tx.send(Err(CdpError::msg("WS command channel full or closed"))).ok();
+                        }
                     }
                 }
                 Err(err) => {
