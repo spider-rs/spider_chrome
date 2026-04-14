@@ -436,6 +436,184 @@ fn bench_notify_wakeup(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+//  WS connection-layer benchmarks — bounded channel + batched serialization
+// ---------------------------------------------------------------------------
+
+/// Benchmark: Bounded WS command channel throughput (handler → writer path).
+/// Measures try_send + recv + try_recv drain, matching the real ws_write_loop.
+fn bench_ws_cmd_channel_throughput(c: &mut Criterion) {
+    use chromiumoxide_types::{CallId, MethodCall, MethodId};
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    for batch_size in [1, 10, 100, 500] {
+        c.bench_function(
+            &format!("ws_cmd channel: {batch_size} cmds (try_send → recv+drain)"),
+            |b| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::channel::<MethodCall>(2048);
+
+                        // Producer: burst-send commands via try_send (non-blocking).
+                        let producer = tokio::spawn(async move {
+                            for i in 0..batch_size {
+                                let call = MethodCall {
+                                    id: CallId::new(i),
+                                    method: MethodId::from("Page.navigate"),
+                                    session_id: None,
+                                    params: serde_json::json!({"url": "https://example.com"}),
+                                };
+                                let _ = tx.try_send(call);
+                            }
+                        });
+
+                        // Consumer: recv first, then drain via try_recv (matches ws_write_loop).
+                        let consumer = tokio::spawn(async move {
+                            let mut count = 0usize;
+                            while let Some(call) = rx.recv().await {
+                                let msg = serde_json::to_string(&call).unwrap();
+                                black_box(&msg);
+                                count += 1;
+
+                                // Drain batch.
+                                while let Ok(call) = rx.try_recv() {
+                                    let msg = serde_json::to_string(&call).unwrap();
+                                    black_box(&msg);
+                                    count += 1;
+                                }
+
+                                if count >= batch_size {
+                                    break;
+                                }
+                            }
+                            count
+                        });
+
+                        let _ = producer.await;
+                        let count = consumer.await.unwrap();
+                        black_box(count);
+                    });
+                });
+            },
+        );
+    }
+}
+
+/// Benchmark: Serialization throughput for MethodCall (the per-message cost
+/// in the WS write loop).
+fn bench_ws_method_call_serialization(c: &mut Criterion) {
+    use chromiumoxide_types::{CallId, MethodCall, MethodId};
+
+    // Small payload (typical CDP command).
+    let small_call = MethodCall {
+        id: CallId::new(1),
+        method: MethodId::from("Page.navigate"),
+        session_id: None,
+        params: serde_json::json!({"url": "https://example.com"}),
+    };
+
+    // Larger payload (e.g. Page.addScriptToEvaluateOnNewDocument).
+    let large_call = MethodCall {
+        id: CallId::new(2),
+        method: MethodId::from("Page.addScriptToEvaluateOnNewDocument"),
+        session_id: Some("session-abc-123".to_string()),
+        params: serde_json::json!({
+            "source": "x".repeat(4096),
+            "worldName": "isolated",
+        }),
+    };
+
+    c.bench_function("MethodCall serialize (small ~100B)", |b| {
+        b.iter(|| {
+            let msg = serde_json::to_string(black_box(&small_call)).unwrap();
+            black_box(msg);
+        });
+    });
+
+    c.bench_function("MethodCall serialize (large ~4KB)", |b| {
+        b.iter(|| {
+            let msg = serde_json::to_string(black_box(&large_call)).unwrap();
+            black_box(msg);
+        });
+    });
+}
+
+/// Benchmark: Bounded channel back-pressure — producer sending faster than
+/// consumer can drain. Measures how the bounded channel (try_send) degrades
+/// gracefully vs. building up unbounded memory.
+fn bench_ws_cmd_backpressure(c: &mut Criterion) {
+    use chromiumoxide_types::{CallId, MethodCall, MethodId};
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    for capacity in [256, 2048] {
+        c.bench_function(
+            &format!("ws_cmd backpressure: 1000 cmds, capacity {capacity}"),
+            |b| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::channel::<MethodCall>(capacity);
+
+                        // Slow consumer: simulate serialization cost per message.
+                        let consumer = tokio::spawn(async move {
+                            let mut count = 0usize;
+                            while let Some(call) = rx.recv().await {
+                                let msg = serde_json::to_string(&call).unwrap();
+                                black_box(&msg);
+                                count += 1;
+                                // Drain batch.
+                                while let Ok(call) = rx.try_recv() {
+                                    let msg = serde_json::to_string(&call).unwrap();
+                                    black_box(&msg);
+                                    count += 1;
+                                }
+                                if count >= 1000 {
+                                    break;
+                                }
+                            }
+                            count
+                        });
+
+                        // Fast producer: try_send, count drops.
+                        let producer = tokio::spawn(async move {
+                            let mut sent = 0usize;
+                            let mut dropped = 0usize;
+                            for i in 0..1000usize {
+                                let call = MethodCall {
+                                    id: CallId::new(i),
+                                    method: MethodId::from("Page.navigate"),
+                                    session_id: None,
+                                    params: serde_json::json!({"url": "https://example.com"}),
+                                };
+                                match tx.try_send(call) {
+                                    Ok(()) => sent += 1,
+                                    Err(_) => dropped += 1,
+                                }
+                            }
+                            (sent, dropped)
+                        });
+
+                        let (sent, dropped) = producer.await.unwrap();
+                        let received = consumer.await.unwrap();
+                        black_box((sent, dropped, received));
+                    });
+                });
+            },
+        );
+    }
+}
+
 criterion_group!(
     benches,
     bench_command_message_creation,
@@ -448,5 +626,8 @@ criterion_group!(
     bench_concurrent_independent_channels,
     bench_concurrent_shared_channel,
     bench_notify_wakeup,
+    bench_ws_cmd_channel_throughput,
+    bench_ws_method_call_serialization,
+    bench_ws_cmd_backpressure,
 );
 criterion_main!(benches);
