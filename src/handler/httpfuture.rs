@@ -4,10 +4,8 @@ use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::sync::mpsc;
-
 use crate::handler::commandfuture::CommandFuture;
-use crate::handler::target::TargetMessage;
+use crate::handler::sender::PageSender;
 use crate::handler::target_message_future::TargetMessageFuture;
 use crate::{ArcHttpRequest, Result};
 use chromiumoxide_types::Command;
@@ -25,7 +23,7 @@ pin_project! {
 
 impl<T: Command> HttpFuture<T> {
     pub fn new(
-        sender: mpsc::Sender<TargetMessage>,
+        sender: PageSender,
         command: CommandFuture<T>,
         request_timeout: std::time::Duration,
     ) -> Self {

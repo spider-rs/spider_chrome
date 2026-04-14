@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use chromiumoxide::cmd::CommandMessage;
 use chromiumoxide::handler::commandfuture::CommandFuture;
+use chromiumoxide::handler::sender::PageSender;
 use chromiumoxide::handler::target::TargetMessage;
 use chromiumoxide::listeners::{EventListenerRequest, EventListeners};
 
@@ -104,11 +105,12 @@ fn bench_command_future_creation(c: &mut Criterion) {
         b.iter(|| {
             let _guard = rt.enter();
             let (tx, _rx) = tokio::sync::mpsc::channel::<TargetMessage>(2048);
+            let sender = PageSender::new(tx, None);
             let cmd = NavigateParams::new("https://example.com");
             let session = Some(SessionId::from("session-1".to_string()));
             let fut = CommandFuture::<NavigateParams>::new(
                 cmd,
-                tx,
+                sender,
                 session,
                 Duration::from_secs(30),
             )

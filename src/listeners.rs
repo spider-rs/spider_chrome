@@ -143,6 +143,28 @@ impl EventListeners {
             self.listeners.retain(|_, v| !v.is_empty());
         }
     }
+
+    /// Flush all queued events without requiring a waker `Context`.
+    ///
+    /// Identical to [`poll`](Self::poll) but usable from the
+    /// `Handler::run()` async path where no `Context` is available.
+    pub fn flush(&mut self) {
+        let mut any_disconnected = false;
+
+        for subscriptions in self.listeners.values_mut() {
+            subscriptions.retain_mut(|sub| match sub.flush() {
+                Ok(()) => true,
+                Err(_) => {
+                    any_disconnected = true;
+                    false
+                }
+            });
+        }
+
+        if any_disconnected {
+            self.listeners.retain(|_, v| !v.is_empty());
+        }
+    }
 }
 
 pub struct EventListenerRequest {

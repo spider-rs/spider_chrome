@@ -3,8 +3,10 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::ready;
 
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, Stream, StreamExt};
 use std::task::{Context, Poll};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::{tungstenite::protocol::WebSocketConfig, WebSocketStream};
@@ -227,6 +229,122 @@ impl<T: EventMessage> Connection<T> {
         }
 
         Ok(())
+    }
+}
+
+/// Split parts returned by [`Connection::into_async`].
+#[derive(Debug)]
+pub struct AsyncConnection<T: EventMessage> {
+    /// WebSocket read stream — yields decoded CDP messages.
+    pub reader: WsReader<T>,
+    /// Sender half for submitting outgoing CDP commands.
+    pub cmd_tx: mpsc::UnboundedSender<MethodCall>,
+    /// Handle to the background writer task.
+    pub writer_handle: tokio::task::JoinHandle<Result<()>>,
+    /// Next command-call-id counter (continue numbering from where Connection left off).
+    pub next_id: usize,
+}
+
+impl<T: EventMessage + Unpin> Connection<T> {
+    /// Consume the connection and split into an async reader + background writer.
+    ///
+    /// The writer task batches outgoing commands: it `recv()`s the first
+    /// command, then drains all immediately-available commands via
+    /// `try_recv()` before flushing the batch to the WebSocket in one
+    /// write.
+    pub fn into_async(self) -> AsyncConnection<T> {
+        let (ws_sink, ws_stream) = self.ws.split();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        let writer_handle = tokio::spawn(ws_write_loop(ws_sink, cmd_rx));
+
+        let reader = WsReader {
+            inner: ws_stream,
+            _marker: PhantomData,
+        };
+
+        AsyncConnection {
+            reader,
+            cmd_tx,
+            writer_handle,
+            next_id: self.next_id,
+        }
+    }
+}
+
+/// Background task that batches and flushes outgoing CDP commands.
+async fn ws_write_loop(
+    mut sink: SplitSink<WebSocketStream<ConnectStream>, WsMessage>,
+    mut rx: mpsc::UnboundedReceiver<MethodCall>,
+) -> Result<()> {
+    while let Some(call) = rx.recv().await {
+        let msg = crate::serde_json::to_string(&call)?;
+        sink.feed(WsMessage::Text(msg.into())).await.map_err(CdpError::Ws)?;
+
+        // Batch: drain all buffered commands without waiting.
+        while let Ok(call) = rx.try_recv() {
+            let msg = crate::serde_json::to_string(&call)?;
+            sink.feed(WsMessage::Text(msg.into())).await.map_err(CdpError::Ws)?;
+        }
+
+        // Flush the entire batch in one write.
+        sink.flush().await.map_err(CdpError::Ws)?;
+    }
+    Ok(())
+}
+
+/// Read half of a split WebSocket connection.
+///
+/// Decodes incoming WS frames into typed CDP messages, skipping pings/pongs
+/// and malformed data frames.
+#[derive(Debug)]
+pub struct WsReader<T: EventMessage> {
+    inner: SplitStream<WebSocketStream<ConnectStream>>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: EventMessage + Unpin> WsReader<T> {
+    /// Read the next CDP message from the WebSocket.
+    ///
+    /// Returns `None` when the connection is closed.
+    pub async fn next_message(&mut self) -> Option<Result<Box<Message<T>>>> {
+        loop {
+            match self.inner.next().await? {
+                Ok(WsMessage::Text(text)) => {
+                    match decode_message::<T>(text.as_bytes(), Some(&text)) {
+                        Ok(msg) => return Some(Ok(msg)),
+                        Err(err) => {
+                            tracing::debug!(
+                                target: "chromiumoxide::conn::raw_ws::parse_errors",
+                                "Dropping malformed text WS frame: {err}",
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Ok(WsMessage::Binary(buf)) => match decode_message::<T>(&buf, None) {
+                    Ok(msg) => return Some(Ok(msg)),
+                    Err(err) => {
+                        tracing::debug!(
+                            target: "chromiumoxide::conn::raw_ws::parse_errors",
+                            "Dropping malformed binary WS frame: {err}",
+                        );
+                        continue;
+                    }
+                },
+                Ok(WsMessage::Close(_)) => return None,
+                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => continue,
+                Ok(msg) => {
+                    tracing::debug!(
+                        target: "chromiumoxide::conn::raw_ws::parse_errors",
+                        "Unexpected WS message type: {:?}",
+                        msg
+                    );
+                    continue;
+                }
+                Err(err) => return Some(Err(CdpError::Ws(err))),
+            }
+        }
     }
 }
 

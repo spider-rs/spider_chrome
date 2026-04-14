@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cmd::{to_command_response, CommandMessage};
 use crate::error::Result;
+use crate::handler::sender::PageSender;
 use crate::handler::target::TargetMessage;
 use chromiumoxide_cdp::cdp::browser_protocol::target::SessionId;
 use chromiumoxide_types::{Command, CommandResponse, MethodId, Response};
@@ -16,7 +17,7 @@ pin_project! {
     pub struct CommandFuture<T, M = Result<Response>> {
         #[pin]
         rx_command: oneshot::Receiver<M>,
-        target_sender: mpsc::Sender<TargetMessage>,
+        target_sender: PageSender,
         #[pin]
         delay: tokio::time::Sleep,
 
@@ -33,7 +34,7 @@ impl<T: Command> CommandFuture<T> {
     /// A new command future.
     pub fn new(
         cmd: T,
-        target_sender: mpsc::Sender<TargetMessage>,
+        target_sender: PageSender,
         session: Option<SessionId>,
         request_timeout: std::time::Duration,
     ) -> Result<Self> {

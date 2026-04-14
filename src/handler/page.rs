@@ -5,8 +5,9 @@ use chromiumoxide_cdp::cdp::browser_protocol::accessibility::{
     GetFullAxTreeParamsBuilder, GetFullAxTreeReturns, GetPartialAxTreeParamsBuilder,
     GetPartialAxTreeReturns,
 };
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::oneshot::channel as oneshot_channel;
+use tokio::sync::Notify;
 
 use chromiumoxide_cdp::cdp::browser_protocol::browser::{GetVersionParams, GetVersionReturns};
 use chromiumoxide_cdp::cdp::browser_protocol::dom::{
@@ -36,6 +37,7 @@ use crate::error::{CdpError, Result};
 use crate::handler::commandfuture::CommandFuture;
 use crate::handler::domworld::DOMWorldKind;
 use crate::handler::httpfuture::HttpFuture;
+use crate::handler::sender::PageSender;
 use crate::handler::target::{GetExecutionContext, TargetMessage};
 use crate::handler::target_message_future::TargetMessageFuture;
 use crate::js::EvaluationResult;
@@ -67,13 +69,14 @@ impl PageHandle {
         session_id: SessionId,
         opener_id: Option<TargetId>,
         request_timeout: std::time::Duration,
+        page_wake: Option<Arc<Notify>>,
     ) -> Self {
         let (commands, rx) = channel(2048);
         let page = PageInner {
             target_id,
             session_id,
             opener_id,
-            sender: commands,
+            sender: PageSender::new(commands, page_wake),
             smart_mouse: SmartMouse::new(),
             request_timeout,
         };
@@ -97,8 +100,8 @@ pub(crate) struct PageInner {
     session_id: SessionId,
     /// The opener ID.
     opener_id: Option<TargetId>,
-    /// The sender for the target.
-    sender: Sender<TargetMessage>,
+    /// The sender for the target (with optional handler notification).
+    sender: PageSender,
     /// Smart mouse with position tracking and human-like movement.
     pub(crate) smart_mouse: SmartMouse,
     /// The request timeout for CDP commands issued from this page.
@@ -1012,7 +1015,7 @@ impl PageInner {
 
 pub(crate) async fn execute<T: Command>(
     cmd: T,
-    sender: Sender<TargetMessage>,
+    sender: PageSender,
     session: Option<SessionId>,
     request_timeout: std::time::Duration,
 ) -> Result<CommandResponse<T::Response>> {
@@ -1030,7 +1033,7 @@ pub(crate) async fn execute<T: Command>(
 /// capacity (common case). Falls back to an async send with timeout when full.
 pub(crate) async fn send_command<T: Command>(
     cmd: T,
-    sender: Sender<TargetMessage>,
+    sender: PageSender,
     session: Option<SessionId>,
     request_timeout: std::time::Duration,
 ) -> Result<tokio::sync::oneshot::Receiver<Result<chromiumoxide_types::Response, CdpError>>> {

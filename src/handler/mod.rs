@@ -17,6 +17,9 @@ use tokio::sync::oneshot::Sender as OneshotSender;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::Error;
 
+use std::sync::Arc;
+use tokio::sync::Notify;
+
 use crate::cmd::{to_command_response, CommandMessage};
 use crate::conn::Connection;
 use crate::error::{CdpError, Result};
@@ -46,6 +49,7 @@ mod job;
 pub mod network;
 pub mod network_utils;
 pub mod page;
+pub mod sender;
 mod session;
 pub mod target;
 pub mod target_message_future;
@@ -74,8 +78,9 @@ pub struct Handler {
     ///
     /// There can be multiple sessions per target.
     sessions: HashMap<SessionId, Session>,
-    /// The websocket connection to the chromium instance
-    conn: Connection<CdpEventMessage>,
+    /// The websocket connection to the chromium instance.
+    /// `Option` so that `run()` can `.take()` it for splitting.
+    conn: Option<Connection<CdpEventMessage>>,
     /// Evicts timed out requests periodically
     evict_command_timeout: PeriodicJob,
     /// The internal identifier for a specific navigation
@@ -92,6 +97,9 @@ pub struct Handler {
     budget_exhausted: bool,
     /// Tracks which targets we've already attached to, to avoid multiple sessions per target.
     attached_targets: HashSet<TargetId>,
+    /// Optional notify for waking `Handler::run()`'s `tokio::select!` loop
+    /// when a page sends a message.  `None` when using the `Stream` API.
+    page_wake: Option<Arc<Notify>>,
 }
 
 lazy_static::lazy_static! {
@@ -132,6 +140,7 @@ impl Handler {
     ) -> Self {
         let discover = DISCOVER_ID.clone();
         let _ = conn.submit_command(discover.0, None, discover.1);
+        let conn = Some(conn);
 
         let browser_contexts = config
             .context_ids
@@ -157,6 +166,7 @@ impl Handler {
             remaining_bytes: None,
             budget_exhausted: false,
             attached_targets: Default::default(),
+            page_wake: None,
         }
     }
 
@@ -295,6 +305,8 @@ impl Handler {
     ) -> Result<()> {
         let call_id = self
             .conn
+            .as_mut()
+            .unwrap()
             .submit_command(msg.method.clone(), msg.session_id, msg.params)?;
         self.pending_commands.insert(
             call_id,
@@ -309,7 +321,7 @@ impl Handler {
         req: CdpRequest,
         now: Instant,
     ) -> Result<()> {
-        let call_id = self.conn.submit_command(
+        let call_id = self.conn.as_mut().unwrap().submit_command(
             req.method.clone(),
             req.session_id.map(Into::into),
             req.params,
@@ -324,7 +336,7 @@ impl Handler {
     fn submit_fetch_targets(&mut self, tx: OneshotSender<Result<Vec<TargetInfo>>>, now: Instant) {
         let msg = TARGET_PARAMS_ID.clone();
 
-        if let Ok(call_id) = self.conn.submit_command(msg.0.clone(), None, msg.1) {
+        if let Ok(call_id) = self.conn.as_mut().unwrap().submit_command(msg.0.clone(), None, msg.1) {
             self.pending_commands
                 .insert(call_id, (PendingRequest::GetTargets(tx), msg.0, now));
         }
@@ -333,7 +345,7 @@ impl Handler {
     /// Send the Request over to the server and store its identifier to handle
     /// the response once received.
     fn submit_navigation(&mut self, id: NavigationId, req: CdpRequest, now: Instant) {
-        if let Ok(call_id) = self.conn.submit_command(
+        if let Ok(call_id) = self.conn.as_mut().unwrap().submit_command(
             req.method.clone(),
             req.session_id.map(Into::into),
             req.params,
@@ -348,6 +360,8 @@ impl Handler {
 
         if let Ok(call_id) = self
             .conn
+            .as_mut()
+            .unwrap()
             .submit_command(close_msg.0.clone(), None, close_msg.1)
         {
             self.pending_commands.insert(
@@ -404,7 +418,7 @@ impl Handler {
             let method = params.identifier();
 
             match serde_json::to_value(params) {
-                Ok(params) => match self.conn.submit_command(method.clone(), None, params) {
+                Ok(params) => match self.conn.as_mut().unwrap().submit_command(method.clone(), None, params) {
                     Ok(call_id) => {
                         self.pending_commands.insert(
                             call_id,
@@ -491,6 +505,7 @@ impl Handler {
                 blacklist_patterns: self.config.blacklist_patterns.clone(),
                 #[cfg(feature = "adblock")]
                 adblock_filter_rules: self.config.adblock_filter_rules.clone(),
+                page_wake: self.page_wake.clone(),
             },
             browser_ctx,
         );
@@ -581,6 +596,398 @@ impl Handler {
 
     pub fn event_listeners_mut(&mut self) -> &mut EventListeners {
         &mut self.event_listeners
+    }
+
+    // ------------------------------------------------------------------
+    //  Tokio-native async entry point
+    // ------------------------------------------------------------------
+
+    /// Run the handler as a fully async tokio task.
+    ///
+    /// This is the high-performance alternative to polling `Handler` as a
+    /// `Stream`.  Internally it:
+    ///
+    /// * Splits the WebSocket into independent read/write halves — the
+    ///   writer runs in its own tokio task with natural batching.
+    /// * Uses `tokio::select!` to multiplex the browser channel, page
+    ///   notifications, WebSocket reads, the eviction timer, and writer
+    ///   health.
+    /// * Drains every target's page channel via `try_recv()` (non-blocking)
+    ///   after each event, with an `Arc<Notify>` ensuring the select loop
+    ///   wakes up whenever a page sends a message.
+    ///
+    /// # Usage
+    ///
+    /// ```rust,no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use chromiumoxide::Browser;
+    /// let (browser, handler) = Browser::launch(Default::default()).await?;
+    /// let handler_task = tokio::spawn(handler.run());
+    /// // … use browser …
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run(mut self) -> Result<()> {
+        use tokio::time::MissedTickBehavior;
+        use chromiumoxide_types::Message;
+        use tokio_tungstenite::tungstenite::{self, error::ProtocolError};
+
+        // --- set up page notification ---
+        let page_wake = Arc::new(Notify::new());
+        self.page_wake = Some(page_wake.clone());
+
+        // --- split WebSocket ---
+        let conn = self.conn.take().expect("Handler::run() called with no connection");
+        let async_conn = conn.into_async();
+        let mut ws_reader = async_conn.reader;
+        let ws_tx = async_conn.cmd_tx;
+        let mut writer_handle = async_conn.writer_handle;
+        let mut next_call_id = async_conn.next_id;
+
+        // Helper to mint call-ids without &mut self.conn.
+        let mut alloc_call_id = || {
+            let id = chromiumoxide_types::CallId::new(next_call_id);
+            next_call_id = next_call_id.wrapping_add(1);
+            id
+        };
+
+        // --- eviction timer ---
+        let mut evict_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.config.request_timeout,
+            self.config.request_timeout,
+        );
+        evict_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        // Helper closure: submit a MethodCall through the WS writer.
+        macro_rules! ws_submit {
+            ($method:expr, $session_id:expr, $params:expr) => {{
+                let id = alloc_call_id();
+                let call = chromiumoxide_types::MethodCall {
+                    id,
+                    method: $method,
+                    session_id: $session_id,
+                    params: $params,
+                };
+                let _ = ws_tx.send(call);
+                Ok::<_, CdpError>(id)
+            }};
+        }
+
+        // ---- main event loop ----
+        loop {
+            let now = std::time::Instant::now();
+
+            // 1. Drain all target page channels (non-blocking) & advance
+            //    state machines.
+            for n in (0..self.target_ids.len()).rev() {
+                let target_id = self.target_ids.swap_remove(n);
+
+                if let Some((id, mut target)) = self.targets.remove_entry(&target_id) {
+                    // Drain page channel (non-blocking — waker is the Notify).
+                    {
+                        let mut msgs = Vec::new();
+                        if let Some(handle) = target.page_mut() {
+                            while let Ok(msg) = handle.rx.try_recv() {
+                                msgs.push(msg);
+                            }
+                        }
+                        for msg in msgs {
+                            target.on_page_message(msg);
+                        }
+                    }
+
+                    // Advance target state machine & process events.
+                    while let Some(event) = target.advance(now) {
+                        match event {
+                            TargetEvent::Request(req) => {
+                                if let Ok(call_id) = ws_submit!(
+                                    req.method.clone(),
+                                    req.session_id.map(Into::into),
+                                    req.params
+                                ) {
+                                    self.pending_commands.insert(
+                                        call_id,
+                                        (
+                                            PendingRequest::InternalCommand(
+                                                target.target_id().clone(),
+                                            ),
+                                            req.method,
+                                            now,
+                                        ),
+                                    );
+                                }
+                            }
+                            TargetEvent::Command(msg) => {
+                                if msg.is_navigation() {
+                                    let (req, tx) = msg.split();
+                                    let nav_id = self.next_navigation_id();
+                                    target.goto(FrameRequestedNavigation::new(
+                                        nav_id,
+                                        req.clone(),
+                                        self.config.request_timeout,
+                                    ));
+                                    if let Ok(call_id) = ws_submit!(
+                                        req.method.clone(),
+                                        req.session_id.map(Into::into),
+                                        req.params
+                                    ) {
+                                        self.pending_commands.insert(
+                                            call_id,
+                                            (
+                                                PendingRequest::Navigate(nav_id),
+                                                req.method,
+                                                now,
+                                            ),
+                                        );
+                                    }
+                                    self.navigations.insert(
+                                        nav_id,
+                                        NavigationRequest::Navigate(
+                                            NavigationInProgress::new(tx),
+                                        ),
+                                    );
+                                } else {
+                                    if let Ok(call_id) = ws_submit!(
+                                        msg.method.clone(),
+                                        msg.session_id.map(Into::into),
+                                        msg.params
+                                    ) {
+                                        self.pending_commands.insert(
+                                            call_id,
+                                            (
+                                                PendingRequest::ExternalCommand(msg.sender),
+                                                msg.method,
+                                                now,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                            TargetEvent::NavigationRequest(nav_id, req) => {
+                                if let Ok(call_id) = ws_submit!(
+                                    req.method.clone(),
+                                    req.session_id.map(Into::into),
+                                    req.params
+                                ) {
+                                    self.pending_commands.insert(
+                                        call_id,
+                                        (PendingRequest::Navigate(nav_id), req.method, now),
+                                    );
+                                }
+                            }
+                            TargetEvent::NavigationResult(res) => {
+                                self.on_navigation_lifecycle_completed(res);
+                            }
+                            TargetEvent::BytesConsumed(n) => {
+                                if let Some(rem) = self.remaining_bytes.as_mut() {
+                                    *rem = rem.saturating_sub(n);
+                                    if *rem == 0 {
+                                        self.budget_exhausted = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Flush event listeners (no Context needed).
+                    target.event_listeners_mut().flush();
+
+                    self.targets.insert(id, target);
+                    self.target_ids.push(target_id);
+                }
+            }
+
+            // Flush handler-level event listeners.
+            self.event_listeners.flush();
+
+            if self.budget_exhausted {
+                for t in self.targets.values_mut() {
+                    t.network_manager.set_block_all(true);
+                }
+            }
+
+            if self.closing {
+                break;
+            }
+
+            // 2. Multiplex all event sources via tokio::select!
+            tokio::select! {
+                msg = self.from_browser.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            match msg {
+                                HandlerMessage::Command(cmd) => {
+                                    if let Ok(call_id) = ws_submit!(
+                                        cmd.method.clone(),
+                                        cmd.session_id.map(Into::into),
+                                        cmd.params
+                                    ) {
+                                        self.pending_commands.insert(
+                                            call_id,
+                                            (PendingRequest::ExternalCommand(cmd.sender), cmd.method, now),
+                                        );
+                                    }
+                                }
+                                HandlerMessage::FetchTargets(tx) => {
+                                    let msg = TARGET_PARAMS_ID.clone();
+                                    if let Ok(call_id) = ws_submit!(msg.0.clone(), None, msg.1) {
+                                        self.pending_commands.insert(
+                                            call_id,
+                                            (PendingRequest::GetTargets(tx), msg.0, now),
+                                        );
+                                    }
+                                }
+                                HandlerMessage::CloseBrowser(tx) => {
+                                    let close_msg = CLOSE_PARAMS_ID.clone();
+                                    if let Ok(call_id) = ws_submit!(close_msg.0.clone(), None, close_msg.1) {
+                                        self.pending_commands.insert(
+                                            call_id,
+                                            (PendingRequest::CloseBrowser(tx), close_msg.0, now),
+                                        );
+                                    }
+                                }
+                                HandlerMessage::CreatePage(params, tx) => {
+                                    if let Some(ref id) = params.browser_context_id {
+                                        self.browser_contexts.insert(BrowserContext::from(id.clone()));
+                                    }
+                                    self.create_page_async(params, tx, &mut alloc_call_id, &ws_tx, now);
+                                }
+                                HandlerMessage::GetPages(tx) => {
+                                    let pages: Vec<_> = self.targets.values_mut()
+                                        .filter(|p| p.is_page())
+                                        .filter_map(|target| target.get_or_create_page())
+                                        .map(|page| Page::from(page.clone()))
+                                        .collect();
+                                    let _ = tx.send(pages);
+                                }
+                                HandlerMessage::InsertContext(ctx) => {
+                                    if self.default_browser_context.id().is_none() {
+                                        self.default_browser_context = ctx.clone();
+                                    }
+                                    self.browser_contexts.insert(ctx);
+                                }
+                                HandlerMessage::DisposeContext(ctx) => {
+                                    self.browser_contexts.remove(&ctx);
+                                    self.attached_targets.retain(|tid| {
+                                        self.targets.get(tid)
+                                            .and_then(|t| t.browser_context_id())
+                                            .map(|id| Some(id) != ctx.id())
+                                            .unwrap_or(true)
+                                    });
+                                    self.closing = true;
+                                }
+                                HandlerMessage::GetPage(target_id, tx) => {
+                                    let page = self.targets.get_mut(&target_id)
+                                        .and_then(|target| target.get_or_create_page())
+                                        .map(|page| Page::from(page.clone()));
+                                    let _ = tx.send(page);
+                                }
+                                HandlerMessage::AddEventListener(req) => {
+                                    self.event_listeners.add_listener(req);
+                                }
+                            }
+                        }
+                        None => break, // browser handle dropped
+                    }
+                }
+
+                frame = ws_reader.next_message() => {
+                    match frame {
+                        Some(Ok(boxed_msg)) => match *boxed_msg {
+                            Message::Response(resp) => {
+                                self.on_response(resp);
+                            }
+                            Message::Event(ev) => {
+                                self.on_event(ev);
+                            }
+                        },
+                        Some(Err(err)) => {
+                            tracing::error!("WS Connection error: {:?}", err);
+                            if let CdpError::Ws(ref ws_error) = err {
+                                match ws_error {
+                                    tungstenite::Error::AlreadyClosed => break,
+                                    tungstenite::Error::Protocol(detail)
+                                        if detail == &ProtocolError::ResetWithoutClosingHandshake =>
+                                    {
+                                        break;
+                                    }
+                                    _ => return Err(err),
+                                }
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                        None => break, // WS closed
+                    }
+                }
+
+                _ = page_wake.notified() => {
+                    // A page sent a message — loop back to drain targets.
+                }
+
+                _ = evict_timer.tick() => {
+                    self.evict_timed_out_commands(now);
+                    for t in self.targets.values_mut() {
+                        t.network_manager.evict_stale_entries(now);
+                        t.frame_manager_mut().evict_stale_context_ids();
+                    }
+                }
+
+                result = &mut writer_handle => {
+                    // WS writer exited — propagate error or break.
+                    match result {
+                        Ok(Ok(())) => break,
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => return Err(CdpError::msg(format!("WS writer panicked: {e}"))),
+                    }
+                }
+            }
+        }
+
+        writer_handle.abort();
+        Ok(())
+    }
+
+    /// `create_page` variant for the `run()` path that submits via `ws_tx`.
+    fn create_page_async(
+        &mut self,
+        params: CreateTargetParams,
+        tx: OneshotSender<Result<Page>>,
+        alloc_call_id: &mut impl FnMut() -> chromiumoxide_types::CallId,
+        ws_tx: &tokio::sync::mpsc::UnboundedSender<chromiumoxide_types::MethodCall>,
+        now: std::time::Instant,
+    ) {
+        let about_blank = params.url == "about:blank";
+        let http_check =
+            !about_blank && params.url.starts_with("http") || params.url.starts_with("file://");
+
+        if about_blank || http_check {
+            let method = params.identifier();
+            match serde_json::to_value(params) {
+                Ok(params) => {
+                    let id = alloc_call_id();
+                    let call = chromiumoxide_types::MethodCall {
+                        id,
+                        method: method.clone(),
+                        session_id: None,
+                        params,
+                    };
+                    if ws_tx.send(call).is_ok() {
+                        self.pending_commands.insert(
+                            id,
+                            (PendingRequest::CreateTarget(tx), method, now),
+                        );
+                    } else {
+                        let _ = tx.send(Err(CdpError::msg("WS writer closed"))).ok();
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err.into())).ok();
+                }
+            }
+        } else {
+            let _ = tx.send(Err(CdpError::NotFound)).ok();
+        }
     }
 }
 
@@ -705,7 +1112,7 @@ impl Stream for Handler {
 
             let mut done = true;
 
-            while let Poll::Ready(Some(ev)) = Pin::new(&mut pin.conn).poll_next(cx) {
+            while let Poll::Ready(Some(ev)) = Pin::new(pin.conn.as_mut().unwrap()).poll_next(cx) {
                 match ev {
                     Ok(boxed_msg) => match *boxed_msg {
                         Message::Response(resp) => {

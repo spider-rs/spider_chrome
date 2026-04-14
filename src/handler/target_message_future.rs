@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::handler::sender::PageSender;
 use crate::handler::target::TargetMessage;
 use crate::{error::Result, ArcHttpRequest};
 
@@ -11,17 +12,11 @@ type SendFut = Pin<
     Box<dyn Future<Output = std::result::Result<(), mpsc::error::SendError<TargetMessage>>> + Send>,
 >;
 
-/// Convenience alias for sending messages to a Target task/actor.
-///
-/// This channel is typically owned by the Target event loop and accepts
-/// `TargetMessage` commands to be processed serially.
-type TargetSender = mpsc::Sender<TargetMessage>;
-
 pin_project! {
     pub struct TargetMessageFuture<T> {
         #[pin]
         rx_request: oneshot::Receiver<T>,
-        target_sender: mpsc::Sender<TargetMessage>,
+        target_sender: PageSender,
         #[pin]
         delay: tokio::time::Sleep,
         request_timeout: std::time::Duration,
@@ -32,7 +27,7 @@ pin_project! {
 
 impl<T> TargetMessageFuture<T> {
     pub fn new(
-        target_sender: TargetSender,
+        target_sender: PageSender,
         message: TargetMessage,
         rx_request: oneshot::Receiver<T>,
         request_timeout: std::time::Duration,
@@ -54,7 +49,7 @@ impl<T> TargetMessageFuture<T> {
     /// must wrap it into the appropriate `TargetMessage` variant
     /// (e.g. `TargetMessage::WaitForNavigation(tx)`).
     pub(crate) fn wait(
-        target_sender: TargetSender,
+        target_sender: PageSender,
         request_timeout: std::time::Duration,
         make_msg: impl FnOnce(oneshot::Sender<ArcHttpRequest>) -> TargetMessage,
     ) -> TargetMessageFuture<ArcHttpRequest> {
@@ -68,7 +63,7 @@ impl<T> TargetMessageFuture<T> {
     /// This triggers a `TargetMessage::WaitForNavigation` and resolves with
     /// the final `ArcHttpRequest` associated with that navigation (if any).
     pub fn wait_for_navigation(
-        target_sender: TargetSender,
+        target_sender: PageSender,
         request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
         Self::wait(
@@ -84,7 +79,7 @@ impl<T> TargetMessageFuture<T> {
     /// the `ArcHttpRequest` associated with the navigation that led to the
     /// idle state (if any).
     pub fn wait_for_network_idle(
-        target_sender: TargetSender,
+        target_sender: PageSender,
         request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
         Self::wait(
@@ -108,7 +103,7 @@ impl<T> TargetMessageFuture<T> {
     /// This triggers a `TargetMessage::WaitForNetworkAlmostIdle` and resolves
     /// with the `ArcHttpRequest` associated with that navigation (if any).
     pub fn wait_for_network_almost_idle(
-        target_sender: TargetSender,
+        target_sender: PageSender,
         request_timeout: std::time::Duration,
     ) -> TargetMessageFuture<ArcHttpRequest> {
         Self::wait(

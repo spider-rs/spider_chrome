@@ -6,6 +6,8 @@ use chromiumoxide_cdp::cdp::browser_protocol::target::DetachFromTargetParams;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot::Sender;
 
+use tokio::sync::Notify;
+
 use crate::auth::Credentials;
 use crate::cdp::browser_protocol::target::CloseTargetParams;
 use crate::cmd::CommandChain;
@@ -282,6 +284,7 @@ impl Target {
                     session,
                     self.opener_id().cloned(),
                     self.config.request_timeout,
+                    self.config.page_wake.clone(),
                 );
                 self.page = Some(handle);
             }
@@ -292,6 +295,11 @@ impl Target {
     pub(crate) fn get_or_create_page(&mut self) -> Option<&Arc<PageInner>> {
         self.create_page();
         self.page.as_ref().map(|p| p.inner())
+    }
+
+    /// Mutable access to the page handle (for `try_recv` in `Handler::run()`).
+    pub(crate) fn page_mut(&mut self) -> Option<&mut PageHandle> {
+        self.page.as_mut()
     }
 
     /// Is the target a page?
@@ -849,6 +857,375 @@ impl Target {
         }
     }
 
+    /// Process a single message from the page channel.
+    ///
+    /// Used by `Handler::run()` after `try_recv()` drains the page channel.
+    pub(crate) fn on_page_message(&mut self, msg: TargetMessage) {
+        if self.init_state == TargetInit::Closing {
+            return;
+        }
+        match msg {
+            TargetMessage::Command(cmd) => {
+                if cmd.method == "Network.setBlockedURLs" {
+                    if let Some(arr) = cmd.params.get("urls").and_then(|v| v.as_array()) {
+                        let mut unblock_all = false;
+                        let mut block_all = false;
+                        for s in arr.iter().filter_map(|v| v.as_str()) {
+                            if s == "!*" {
+                                unblock_all = true;
+                                break;
+                            }
+                            if s.contains('*') {
+                                block_all = true;
+                            }
+                        }
+                        if unblock_all {
+                            self.network_manager.set_block_all(false);
+                        } else if block_all {
+                            self.network_manager.set_block_all(true);
+                        }
+                    }
+                }
+                self.queued_events.push_back(TargetEvent::Command(cmd));
+            }
+            TargetMessage::MainFrame(tx) => {
+                let _ = tx.send(self.frame_manager.main_frame().map(|f| f.id().clone()));
+            }
+            TargetMessage::AllFrames(tx) => {
+                let _ = tx.send(self.frame_manager.frames().map(|f| f.id().clone()).collect());
+            }
+            #[cfg(feature = "_cache")]
+            TargetMessage::CacheKey((cache_key, cache_policy)) => {
+                self.network_manager.set_cache_site_key(cache_key);
+                self.network_manager.set_cache_policy(cache_policy);
+            }
+            TargetMessage::Url(req) => {
+                let GetUrl { frame_id, tx } = req;
+                let frame = if let Some(frame_id) = frame_id {
+                    self.frame_manager.frame(&frame_id)
+                } else {
+                    self.frame_manager.main_frame()
+                };
+                let _ = tx.send(frame.and_then(|f| f.url().map(str::to_string)));
+            }
+            TargetMessage::Name(req) => {
+                let GetName { frame_id, tx } = req;
+                let frame = if let Some(frame_id) = frame_id {
+                    self.frame_manager.frame(&frame_id)
+                } else {
+                    self.frame_manager.main_frame()
+                };
+                let _ = tx.send(frame.and_then(|f| f.name().map(str::to_string)));
+            }
+            TargetMessage::Parent(req) => {
+                let GetParent { frame_id, tx } = req;
+                let frame = self.frame_manager.frame(&frame_id);
+                let _ = tx.send(frame.and_then(|f| f.parent_id().cloned()));
+            }
+            TargetMessage::WaitForNavigation(tx) => {
+                if let Some(frame) = self.frame_manager.main_frame() {
+                    if frame.is_loaded() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    } else {
+                        self.wait_for_frame_navigation.push(tx);
+                    }
+                } else {
+                    self.wait_for_frame_navigation.push(tx);
+                }
+            }
+            TargetMessage::WaitForNetworkIdle(tx) => {
+                if let Some(frame) = self.frame_manager.main_frame() {
+                    if frame.is_network_idle() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    } else {
+                        self.wait_for_network_idle.push(tx);
+                    }
+                } else {
+                    self.wait_for_network_idle.push(tx);
+                }
+            }
+            TargetMessage::WaitForNetworkAlmostIdle(tx) => {
+                if let Some(frame) = self.frame_manager.main_frame() {
+                    if frame.is_network_almost_idle() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    } else {
+                        self.wait_for_network_almost_idle.push(tx);
+                    }
+                } else {
+                    self.wait_for_network_almost_idle.push(tx);
+                }
+            }
+            TargetMessage::AddEventListener(req) => {
+                if req.method == "Fetch.requestPaused" {
+                    self.network_manager.enable_request_intercept();
+                }
+                self.event_listeners.add_listener(req);
+            }
+            TargetMessage::GetExecutionContext(ctx) => {
+                let GetExecutionContext {
+                    dom_world,
+                    frame_id,
+                    tx,
+                } = ctx;
+                let frame = if let Some(frame_id) = frame_id {
+                    self.frame_manager.frame(&frame_id)
+                } else {
+                    self.frame_manager.main_frame()
+                };
+                if let Some(frame) = frame {
+                    match dom_world {
+                        DOMWorldKind::Main => {
+                            let _ = tx.send(frame.main_world().execution_context());
+                        }
+                        DOMWorldKind::Secondary => {
+                            let _ = tx.send(frame.secondary_world().execution_context());
+                        }
+                    }
+                } else {
+                    let _ = tx.send(None);
+                }
+            }
+            TargetMessage::Authenticate(credentials) => {
+                self.network_manager.authenticate(credentials);
+            }
+            TargetMessage::BlockNetwork(blocked) => {
+                self.network_manager.set_block_all(blocked);
+            }
+            TargetMessage::EnableInterception(enabled) => {
+                self.network_manager.user_request_interception_enabled = !enabled;
+            }
+        }
+    }
+
+    /// Advance the target's state machine and drain queued events.
+    ///
+    /// Like [`poll`](Self::poll) but does **not** read from the page channel
+    /// (that is handled externally by `Handler::run()` via `try_recv`).
+    pub(crate) fn advance(&mut self, now: Instant) -> Option<TargetEvent> {
+        if !self.is_page() {
+            return None;
+        }
+
+        // Init state machine
+        match &mut self.init_state {
+            TargetInit::AttachToTarget => {
+                self.init_state = TargetInit::InitializingFrame(FrameManager::init_commands(
+                    self.config.request_timeout,
+                ));
+                if let Ok(params) = AttachToTargetParams::builder()
+                    .target_id(self.target_id().clone())
+                    .flatten(true)
+                    .build()
+                {
+                    return Some(TargetEvent::Request(Request::new(
+                        params.identifier(),
+                        serde_json::to_value(params).unwrap_or_default(),
+                    )));
+                } else {
+                    return None;
+                }
+            }
+            TargetInit::InitializingFrame(cmds) => {
+                self.session_id.as_ref()?;
+                if let Poll::Ready(poll) = cmds.poll(now) {
+                    return match poll {
+                        None => {
+                            if let Some(world_name) = self.frame_manager.get_isolated_world_name() {
+                                let world_name = world_name.clone();
+                                if let Some(isolated_world_cmds) =
+                                    self.frame_manager.ensure_isolated_world(&world_name)
+                                {
+                                    *cmds = isolated_world_cmds;
+                                } else {
+                                    self.init_state = TargetInit::InitializingNetwork(
+                                        self.network_manager.init_commands(),
+                                    );
+                                }
+                            } else {
+                                self.init_state = TargetInit::InitializingNetwork(
+                                    self.network_manager.init_commands(),
+                                );
+                            }
+                            self.advance(now)
+                        }
+                        Some(Ok((method, params))) => Some(TargetEvent::Request(Request {
+                            method,
+                            session_id: self.session_id.clone().map(Into::into),
+                            params,
+                        })),
+                        Some(Err(_)) => Some(self.on_initialization_failed()),
+                    };
+                } else {
+                    return None;
+                }
+            }
+            TargetInit::InitializingNetwork(cmds) => {
+                if let Poll::Ready(poll) = cmds.poll(now) {
+                    return match poll {
+                        None => {
+                            self.init_state = TargetInit::InitializingPage(
+                                Self::page_init_commands(self.config.request_timeout),
+                            );
+                            self.advance(now)
+                        }
+                        Some(Ok((method, params))) => Some(TargetEvent::Request(Request {
+                            method,
+                            session_id: self.session_id.clone().map(Into::into),
+                            params,
+                        })),
+                        Some(Err(_)) => Some(self.on_initialization_failed()),
+                    };
+                } else {
+                    return None;
+                }
+            }
+            TargetInit::InitializingPage(cmds) => {
+                if let Poll::Ready(poll) = cmds.poll(now) {
+                    return match poll {
+                        None => {
+                            self.init_state = match self.config.viewport.as_ref() {
+                                Some(viewport) => TargetInit::InitializingEmulation(
+                                    self.emulation_manager.init_commands(viewport),
+                                ),
+                                None => TargetInit::Initialized,
+                            };
+                            self.advance(now)
+                        }
+                        Some(Ok((method, params))) => Some(TargetEvent::Request(Request {
+                            method,
+                            session_id: self.session_id.clone().map(Into::into),
+                            params,
+                        })),
+                        Some(Err(_)) => Some(self.on_initialization_failed()),
+                    };
+                } else {
+                    return None;
+                }
+            }
+            TargetInit::InitializingEmulation(cmds) => {
+                if let Poll::Ready(poll) = cmds.poll(now) {
+                    return match poll {
+                        None => {
+                            self.init_state = TargetInit::Initialized;
+                            self.advance(now)
+                        }
+                        Some(Ok((method, params))) => Some(TargetEvent::Request(Request {
+                            method,
+                            session_id: self.session_id.clone().map(Into::into),
+                            params,
+                        })),
+                        Some(Err(_)) => Some(self.on_initialization_failed()),
+                    };
+                } else {
+                    return None;
+                }
+            }
+            TargetInit::Initialized => {
+                if let Some(initiator) = self.initiator.take() {
+                    if self
+                        .frame_manager
+                        .main_frame()
+                        .map(|frame| frame.is_loaded())
+                        .unwrap_or_default()
+                    {
+                        if let Some(page) = self.get_or_create_page() {
+                            let _ = initiator.send(Ok(page.clone().into()));
+                        } else {
+                            self.initiator = Some(initiator);
+                        }
+                    } else {
+                        self.initiator = Some(initiator);
+                    }
+                }
+            }
+            TargetInit::Closing => return None,
+        };
+
+        // Prune dead waiters
+        if !self.wait_for_frame_navigation.is_empty() {
+            self.wait_for_frame_navigation.retain(|tx| !tx.is_closed());
+        }
+        if !self.wait_for_network_idle.is_empty() {
+            self.wait_for_network_idle.retain(|tx| !tx.is_closed());
+        }
+        if !self.wait_for_network_almost_idle.is_empty() {
+            self.wait_for_network_almost_idle.retain(|tx| !tx.is_closed());
+        }
+
+        // Drain events loop (same as poll's inner loop, minus page channel reading)
+        loop {
+            if self.init_state == TargetInit::Closing {
+                break None;
+            }
+
+            if let Some(frame) = self.frame_manager.main_frame() {
+                if frame.is_loaded() {
+                    while let Some(tx) = self.wait_for_frame_navigation.pop() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    }
+                }
+                if frame.is_network_idle() {
+                    while let Some(tx) = self.wait_for_network_idle.pop() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    }
+                }
+                if frame.is_network_almost_idle() {
+                    while let Some(tx) = self.wait_for_network_almost_idle.pop() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    }
+                }
+            }
+
+            if let Some(ev) = self.queued_events.pop_front() {
+                return Some(ev);
+            }
+
+            while let Some(event) = self.network_manager.poll() {
+                if self.init_state == TargetInit::Closing {
+                    break;
+                }
+                match event {
+                    NetworkEvent::SendCdpRequest((method, params)) => {
+                        self.queued_events.push_back(TargetEvent::Request(Request {
+                            method,
+                            session_id: self.session_id.clone().map(Into::into),
+                            params,
+                        }));
+                    }
+                    NetworkEvent::Request(_) => {}
+                    NetworkEvent::Response(_) => {}
+                    NetworkEvent::RequestFailed(request) => {
+                        self.frame_manager.on_http_request_finished(request);
+                    }
+                    NetworkEvent::RequestFinished(request) => {
+                        self.frame_manager.on_http_request_finished(request);
+                    }
+                    NetworkEvent::BytesConsumed(n) => {
+                        self.queued_events.push_back(TargetEvent::BytesConsumed(n));
+                    }
+                }
+            }
+
+            while let Some(event) = self.frame_manager.poll(now) {
+                if self.init_state == TargetInit::Closing {
+                    break;
+                }
+                match event {
+                    FrameEvent::NavigationResult(res) => {
+                        self.queued_events.push_back(TargetEvent::NavigationResult(res));
+                    }
+                    FrameEvent::NavigationRequest(id, req) => {
+                        self.queued_events.push_back(TargetEvent::NavigationRequest(id, req));
+                    }
+                }
+            }
+
+            if self.queued_events.is_empty() {
+                return None;
+            }
+        }
+    }
+
     /// Set the sender half of the channel who requested the creation of this
     /// target
     pub fn set_initiator(&mut self, tx: Sender<Result<Page>>) {
@@ -914,6 +1291,9 @@ pub struct TargetConfig {
     /// Extra ABP/uBO filter rules for the adblock engine.
     #[cfg(feature = "adblock")]
     pub adblock_filter_rules: Option<Vec<String>>,
+    /// Optional notify handle for waking `Handler::run()`'s select loop.
+    /// `None` when using the `impl Stream for Handler` path (no overhead).
+    pub page_wake: Option<Arc<Notify>>,
 }
 
 impl Default for TargetConfig {
@@ -938,6 +1318,7 @@ impl Default for TargetConfig {
             blacklist_patterns: None,
             #[cfg(feature = "adblock")]
             adblock_filter_rules: None,
+            page_wake: None,
         }
     }
 }
