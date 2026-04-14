@@ -68,7 +68,7 @@ impl PageHandle {
         opener_id: Option<TargetId>,
         request_timeout: std::time::Duration,
     ) -> Self {
-        let (commands, rx) = channel(100);
+        let (commands, rx) = channel(2048);
         let page = PageInner {
             target_id,
             session_id,
@@ -195,13 +195,22 @@ impl PageInner {
     }
 
     /// Send a `TargetMessage` with the page's request timeout.
-    /// Prevents indefinite hangs when the target channel is full.
+    /// Uses a `try_send` fast path to avoid the async overhead when
+    /// the channel has capacity (common case under normal load).
     pub(crate) async fn send_msg(&self, msg: TargetMessage) -> Result<()> {
-        tokio::time::timeout(self.request_timeout, self.sender.send(msg))
-            .await
-            .map_err(|_| CdpError::Timeout)?
-            .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
-        Ok(())
+        match self.sender.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                tokio::time::timeout(self.request_timeout, self.sender.send(msg))
+                    .await
+                    .map_err(|_| CdpError::Timeout)?
+                    .map_err(|_| CdpError::ChannelSendError(crate::error::ChannelError::Send))?;
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(CdpError::ChannelSendError(crate::error::ChannelError::Send))
+            }
+        }
     }
 
     /// Await a oneshot response with the page's request timeout.

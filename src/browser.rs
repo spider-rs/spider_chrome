@@ -1025,7 +1025,7 @@ impl Default for BrowserConfigBuilder {
             blacklist_patterns: None,
             #[cfg(feature = "adblock")]
             adblock_filter_rules: None,
-            channel_capacity: 1000,
+            channel_capacity: 4096,
             connection_retries: crate::conn::DEFAULT_CONNECTION_RETRIES,
         }
     }

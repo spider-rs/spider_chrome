@@ -1005,8 +1005,11 @@ async fn handle_fetch_response_stage(
     };
     let policy = http_cache_semantics::CachePolicy::new(&req, &res);
 
-    let parsed_url = url::Url::parse(cache_key_url)
-        .unwrap_or_else(|_| url::Url::parse("http://localhost").expect("static URL"));
+    let parsed_url = url::Url::parse(cache_key_url).unwrap_or_else(|_| {
+        // "http://localhost" is a known-valid static URL.
+        #[allow(clippy::expect_used)]
+        url::Url::parse("http://localhost").expect("static URL")
+    });
 
     let http_res = http_cache_reqwest::HttpResponse {
         url: parsed_url,

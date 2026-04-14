@@ -241,52 +241,46 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
             return Poll::Ready(Some(Err(err)));
         }
 
-        // read from the websocket
-        match ready!(pin.ws.poll_next_unpin(cx)) {
-            Some(Ok(WsMessage::Text(text))) => {
-                match decode_message::<T>(text.as_bytes(), Some(&text)) {
-                    Ok(msg) => Poll::Ready(Some(Ok(msg))),
+        // Read from the websocket, skipping non-data frames (pings,
+        // pongs, malformed messages) without yielding back to the
+        // executor.  This avoids a full round-trip per skipped frame.
+        loop {
+            match ready!(pin.ws.poll_next_unpin(cx)) {
+                Some(Ok(WsMessage::Text(text))) => {
+                    match decode_message::<T>(text.as_bytes(), Some(&text)) {
+                        Ok(msg) => return Poll::Ready(Some(Ok(msg))),
+                        Err(err) => {
+                            tracing::debug!(
+                                target: "chromiumoxide::conn::raw_ws::parse_errors",
+                                "Dropping malformed text WS frame: {err}",
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Some(Ok(WsMessage::Binary(buf))) => match decode_message::<T>(&buf, None) {
+                    Ok(msg) => return Poll::Ready(Some(Ok(msg))),
                     Err(err) => {
                         tracing::debug!(
                             target: "chromiumoxide::conn::raw_ws::parse_errors",
-                            "Dropping malformed text WS frame: {err}",
+                            "Dropping malformed binary WS frame: {err}",
                         );
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
+                        continue;
                     }
-                }
-            }
-            Some(Ok(WsMessage::Binary(buf))) => match decode_message::<T>(&buf, None) {
-                Ok(msg) => Poll::Ready(Some(Ok(msg))),
-                Err(err) => {
+                },
+                Some(Ok(WsMessage::Close(_))) => return Poll::Ready(None),
+                // skip ping, pong, and unexpected types without yielding
+                Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+                Some(Ok(msg)) => {
                     tracing::debug!(
                         target: "chromiumoxide::conn::raw_ws::parse_errors",
-                        "Dropping malformed binary WS frame: {err}",
+                        "Unexpected WS message type: {:?}",
+                        msg
                     );
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    continue;
                 }
-            },
-            Some(Ok(WsMessage::Close(_))) => Poll::Ready(None),
-            // ignore ping and pong
-            Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Some(Ok(msg)) => {
-                // Unexpected WS message type, but not fatal.
-                tracing::debug!(
-                    target: "chromiumoxide::conn::raw_ws::parse_errors",
-                    "Unexpected WS message type: {:?}",
-                    msg
-                );
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Some(Err(err)) => Poll::Ready(Some(Err(CdpError::Ws(err)))),
-            None => {
-                // ws connection closed
-                Poll::Ready(None)
+                Some(Err(err)) => return Poll::Ready(Some(Err(CdpError::Ws(err)))),
+                None => return Poll::Ready(None),
             }
         }
     }

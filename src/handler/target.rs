@@ -647,10 +647,6 @@ impl Target {
             }
 
             if let Some(handle) = self.page.as_mut() {
-                // Budget: don't drain more than 64 messages per poll to avoid
-                // starving other targets and the websocket section in the
-                // handler's main loop.
-                let mut recv_budget = 64usize;
                 while let Poll::Ready(Some(msg)) = handle.rx.poll_recv(cx) {
                     if self.init_state == TargetInit::Closing {
                         break;
@@ -801,10 +797,6 @@ impl Target {
                         }
                     }
 
-                    recv_budget -= 1;
-                    if recv_budget == 0 {
-                        break;
-                    }
                 }
             }
 
