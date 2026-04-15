@@ -136,6 +136,8 @@ pub struct Target {
     wait_for_frame_navigation: Vec<Sender<ArcHttpRequest>>,
     /// Senders notified once `DOMContentLoaded` fires (before `load`).
     wait_for_dom_content_loaded: Vec<Sender<ArcHttpRequest>>,
+    /// Senders notified once the `load` event fires (all subresources done).
+    wait_for_load: Vec<Sender<ArcHttpRequest>>,
     /// Senders that need to be notified once the main frame reaches `networkIdle`.
     wait_for_network_idle: Vec<Sender<ArcHttpRequest>>,
     /// (Optional) for `networkAlmostIdle` if you want it as well.
@@ -216,6 +218,7 @@ impl Target {
             init_state: TargetInit::AttachToTarget,
             wait_for_frame_navigation: Default::default(),
             wait_for_dom_content_loaded: Default::default(),
+            wait_for_load: Default::default(),
             wait_for_network_idle: Default::default(),
             wait_for_network_almost_idle: Default::default(),
             queued_events: Default::default(),
@@ -623,6 +626,9 @@ impl Target {
             self.wait_for_dom_content_loaded
                 .retain(|tx| !tx.is_closed());
         }
+        if !self.wait_for_load.is_empty() {
+            self.wait_for_load.retain(|tx| !tx.is_closed());
+        }
         if !self.wait_for_network_idle.is_empty() {
             self.wait_for_network_idle.retain(|tx| !tx.is_closed());
         }
@@ -641,10 +647,13 @@ impl Target {
                     while let Some(tx) = self.wait_for_dom_content_loaded.pop() {
                         let _ = tx.send(frame.http_request().cloned());
                     }
-                    // Navigation resolves on DOMContentLoaded — HTML parsed
-                    // and sync scripts executed, without waiting for
-                    // subresources (images, fonts, XHRs).
                     while let Some(tx) = self.wait_for_frame_navigation.pop() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    }
+                }
+
+                if frame.is_loaded() {
+                    while let Some(tx) = self.wait_for_load.pop() {
                         let _ = tx.send(frame.http_request().cloned());
                     }
                 }
@@ -760,6 +769,17 @@ impl Target {
                                 }
                             } else {
                                 self.wait_for_dom_content_loaded.push(tx);
+                            }
+                        }
+                        TargetMessage::WaitForLoad(tx) => {
+                            if let Some(frame) = self.frame_manager.main_frame() {
+                                if frame.is_loaded() {
+                                    let _ = tx.send(frame.http_request().cloned());
+                                } else {
+                                    self.wait_for_load.push(tx);
+                                }
+                            } else {
+                                self.wait_for_load.push(tx);
                             }
                         }
                         TargetMessage::WaitForNetworkIdle(tx) => {
@@ -970,6 +990,17 @@ impl Target {
                     }
                 } else {
                     self.wait_for_dom_content_loaded.push(tx);
+                }
+            }
+            TargetMessage::WaitForLoad(tx) => {
+                if let Some(frame) = self.frame_manager.main_frame() {
+                    if frame.is_loaded() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    } else {
+                        self.wait_for_load.push(tx);
+                    }
+                } else {
+                    self.wait_for_load.push(tx);
                 }
             }
             TargetMessage::WaitForNetworkIdle(tx) => {
@@ -1188,6 +1219,9 @@ impl Target {
             self.wait_for_dom_content_loaded
                 .retain(|tx| !tx.is_closed());
         }
+        if !self.wait_for_load.is_empty() {
+            self.wait_for_load.retain(|tx| !tx.is_closed());
+        }
         if !self.wait_for_network_idle.is_empty() {
             self.wait_for_network_idle.retain(|tx| !tx.is_closed());
         }
@@ -1208,6 +1242,11 @@ impl Target {
                         let _ = tx.send(frame.http_request().cloned());
                     }
                     while let Some(tx) = self.wait_for_frame_navigation.pop() {
+                        let _ = tx.send(frame.http_request().cloned());
+                    }
+                }
+                if frame.is_loaded() {
+                    while let Some(tx) = self.wait_for_load.pop() {
                         let _ = tx.send(frame.http_request().cloned());
                     }
                 }
@@ -1539,6 +1578,9 @@ pub enum TargetMessage {
     /// Resolves when `DOMContentLoaded` fires (HTML parsed, sync scripts
     /// executed) — before `load`, so subresources may still be in-flight.
     WaitForDomContentLoaded(Sender<ArcHttpRequest>),
+    /// Resolves when the `load` event fires — all subresources (images,
+    /// fonts, XHRs) are done. Slower than `WaitForNavigation` through proxies.
+    WaitForLoad(Sender<ArcHttpRequest>),
     /// A Message that resolves when the frame network is idle
     WaitForNetworkIdle(Sender<ArcHttpRequest>),
     /// A Message that resolves when the frame network is almost idle

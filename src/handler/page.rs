@@ -164,6 +164,14 @@ impl PageInner {
         )
     }
 
+    /// Resolves once the `load` event fires (all subresources done).
+    pub(crate) fn wait_for_load(&self) -> TargetMessageFuture<ArcHttpRequest> {
+        TargetMessageFuture::<ArcHttpRequest>::wait_for_load(
+            self.sender.clone(),
+            self.request_timeout,
+        )
+    }
+
     /// This creates navigation future with the final http response when the page network is idle
     pub(crate) fn wait_for_network_idle(&self) -> TargetMessageFuture<ArcHttpRequest> {
         TargetMessageFuture::<ArcHttpRequest>::wait_for_network_idle(

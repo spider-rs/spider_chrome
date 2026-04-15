@@ -526,6 +526,19 @@ impl Page {
         self.inner.wait_for_dom_content_loaded().await
     }
 
+    /// Wait for the `load` event — all subresources (images, fonts, XHRs)
+    /// have finished loading. Use `wait_for_navigation` instead unless you
+    /// specifically need all subresources to complete.
+    pub async fn wait_for_load(&self) -> Result<&Self> {
+        self.inner.wait_for_load().await?;
+        Ok(self)
+    }
+
+    /// Same as `wait_for_load` but returns the HTTP response.
+    pub async fn wait_for_load_response(&self) -> Result<ArcHttpRequest> {
+        self.inner.wait_for_load().await
+    }
+
     /// Controls whether page will emit lifecycle events
     pub async fn set_page_lifecycles_enabled(&self, enabled: bool) -> Result<&Self> {
         self.execute(SetLifecycleEventsEnabledParams::new(enabled))

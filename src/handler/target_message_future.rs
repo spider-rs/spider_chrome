@@ -88,6 +88,16 @@ impl<T> TargetMessageFuture<T> {
         )
     }
 
+    /// Wait for the `load` event — all subresources (images, fonts, XHRs)
+    /// have finished loading. Slower than `wait_for_navigation` /
+    /// `wait_for_dom_content_loaded` through proxies.
+    pub fn wait_for_load(
+        target_sender: PageSender,
+        request_timeout: std::time::Duration,
+    ) -> TargetMessageFuture<ArcHttpRequest> {
+        Self::wait(target_sender, request_timeout, TargetMessage::WaitForLoad)
+    }
+
     /// Wait until the main frame reaches `networkIdle`.
     ///
     /// This triggers a `TargetMessage::WaitForNetworkIdle` and resolves with
