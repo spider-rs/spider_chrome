@@ -702,6 +702,11 @@ impl Handler {
 
             // 1. Drain all target page channels (non-blocking) & advance
             //    state machines.
+            //
+            // Budget: drain at most 128 messages per target per iteration
+            // so a single chatty page cannot starve the rest.
+            const PER_TARGET_DRAIN_BUDGET: usize = 128;
+
             for n in (0..self.target_ids.len()).rev() {
                 let target_id = self.target_ids.swap_remove(n);
 
@@ -710,8 +715,11 @@ impl Handler {
                     {
                         let mut msgs = Vec::new();
                         if let Some(handle) = target.page_mut() {
-                            while let Ok(msg) = handle.rx.try_recv() {
-                                msgs.push(msg);
+                            while msgs.len() < PER_TARGET_DRAIN_BUDGET {
+                                match handle.rx.try_recv() {
+                                    Ok(msg) => msgs.push(msg),
+                                    Err(_) => break,
+                                }
                             }
                         }
                         for msg in msgs {

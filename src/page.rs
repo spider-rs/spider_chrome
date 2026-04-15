@@ -555,7 +555,11 @@ impl Page {
         selector: impl Into<String>,
         timeout: Option<std::time::Duration>,
     ) -> Result<Element> {
+        /// Default timeout when the caller passes `None` — prevents an
+        /// infinite polling loop when the selector never matches.
+        const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         const BACKOFF: [u64; 6] = [0, 20, 50, 100, 100, 500];
+
         let selector = selector.into();
         let poll = async {
             let mut i = 0;
@@ -570,12 +574,10 @@ impl Page {
                 i += 1;
             }
         };
-        match timeout {
-            Some(t) => tokio::time::timeout(t, poll)
-                .await
-                .map_err(|_| CdpError::Timeout)?,
-            None => poll.await,
-        }
+        let t = timeout.unwrap_or(DEFAULT_TIMEOUT);
+        tokio::time::timeout(t, poll)
+            .await
+            .map_err(|_| CdpError::Timeout)?
     }
 
     /// Sleep for a fixed duration. Useful as a floor in wait chains.
@@ -3130,8 +3132,16 @@ impl Page {
         // Eagerly init the remote cache worker so uploads are ready before
         // the first response arrives.  set_client + init are both idempotent
         // (OnceLock / OnceCell — first call wins).
+        //
+        // Wrap in a timeout so a slow network / DNS issue cannot block page
+        // creation indefinitely — the worker will auto-init as a fallback
+        // when the first dump job is enqueued.
         if dump_remote.is_some() {
-            crate::cache::dump_remote::init_default_cache_worker().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::cache::dump_remote::init_default_cache_worker(),
+            )
+            .await;
         }
 
         let cache_site =

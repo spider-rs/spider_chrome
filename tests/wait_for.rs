@@ -884,6 +884,239 @@ async fn wait_for_selector_times_out_for_missing_element() {
     );
 }
 
+/// wait_for_selector with `None` timeout must NOT hang forever — the default
+/// 30s timeout kicks in.  We verify it returns `Err(Timeout)` within a
+/// reasonable outer bound (well under 30s is fine; the key is it doesn't block
+/// forever).
+#[tokio::test]
+async fn wait_for_selector_none_timeout_does_not_hang() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("wfs-none-timeout")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    timeout(Duration::from_secs(30), page.goto(TARGET))
+        .await
+        .expect("goto should not time out")
+        .expect("goto should succeed");
+
+    timeout(Duration::from_secs(30), page.wait_for_navigation())
+        .await
+        .expect("wait_for_navigation should not time out")
+        .expect("wait_for_navigation should succeed");
+
+    // Pass `None` — must not loop forever; the 30s default timeout fires.
+    // We wrap in a 35s outer timeout so the test itself does not hang if
+    // the fix regresses.
+    let result = timeout(
+        Duration::from_secs(35),
+        page.wait_for_selector("#absolutely-does-not-exist-xyz", None),
+    )
+    .await;
+
+    match result {
+        Ok(Err(_cdp_err)) => {
+            // Expected: CdpError::Timeout from the default 30s timeout.
+        }
+        Ok(Ok(_)) => panic!("selector should not have been found"),
+        Err(_elapsed) => {
+            panic!(
+                "outer 35s timeout fired — wait_for_selector(None) did not \
+                 apply the default 30s timeout, possible infinite loop regression"
+            );
+        }
+    }
+}
+
+/// wait_for_selector with `None` still finds existing elements normally.
+#[tokio::test]
+async fn wait_for_selector_none_timeout_finds_existing_element() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("wfs-none-exists")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    timeout(Duration::from_secs(30), page.goto(TARGET))
+        .await
+        .expect("goto should not time out")
+        .expect("goto should succeed");
+
+    timeout(Duration::from_secs(30), page.wait_for_navigation())
+        .await
+        .expect("wait_for_navigation should not time out")
+        .expect("wait_for_navigation should succeed");
+
+    // h1 exists on example.com — None timeout should still find it quickly.
+    let el = timeout(
+        Duration::from_secs(15),
+        page.wait_for_selector("h1", None),
+    )
+    .await
+    .expect("should not time out")
+    .expect("should find h1 with None timeout");
+
+    let text = timeout(Duration::from_secs(10), el.inner_text())
+        .await
+        .expect("inner_text should not time out")
+        .expect("inner_text should succeed");
+
+    assert!(
+        text.as_deref()
+            .is_some_and(|t| t.contains("Example Domain")),
+        "h1 should contain 'Example Domain', got: {text:?}"
+    );
+}
+
+/// Many concurrent wait_for_selector calls on the same page must not
+/// deadlock the handler or cause starvation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_wait_for_selector_does_not_deadlock() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("concurrent-wfs")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    timeout(Duration::from_secs(30), page.goto(TARGET))
+        .await
+        .expect("goto should not time out")
+        .expect("goto should succeed");
+
+    timeout(Duration::from_secs(30), page.wait_for_navigation())
+        .await
+        .expect("wait_for_navigation should not time out")
+        .expect("wait_for_navigation should succeed");
+
+    // Fire 10 concurrent wait_for_selector calls — mix of hits and misses.
+    // Use a generous timeout since each polling iteration sends a CDP command
+    // and many concurrent callers compete for the handler.
+    let futs: Vec<_> = (0..10)
+        .map(|i| {
+            let page = page.clone();
+            tokio::spawn(async move {
+                let selector = if i % 2 == 0 { "h1" } else { "#nonexistent" };
+                let result = page
+                    .wait_for_selector(selector, Some(Duration::from_secs(15)))
+                    .await;
+                if i % 2 == 0 {
+                    assert!(
+                        result.is_ok(),
+                        "task {i}: wait_for_selector('h1') should succeed"
+                    );
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "task {i}: wait_for_selector('#nonexistent') should timeout"
+                    );
+                }
+            })
+        })
+        .collect();
+
+    let outer = timeout(Duration::from_secs(60), async {
+        for (i, fut) in futs.into_iter().enumerate() {
+            fut.await
+                .unwrap_or_else(|err| panic!("task {i} panicked: {err}"));
+        }
+    })
+    .await;
+
+    assert!(
+        outer.is_ok(),
+        "concurrent wait_for_selector timed out — possible deadlock"
+    );
+}
+
+/// Handler drain budget: many rapid commands from a single page must not
+/// starve other pages. We verify by running two pages concurrently — one
+/// flooding with JS evaluations, the other doing a simple navigation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handler_drain_budget_does_not_starve_other_pages() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("drain-budget")).await;
+
+    let page_flood = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("flood page: new_page should not time out")
+        .expect("flood page: new_page should resolve");
+
+    let page_simple = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("simple page: new_page should not time out")
+        .expect("simple page: new_page should resolve");
+
+    // Start both pages at once: one floods the handler, the other navigates.
+    let flood_handle = tokio::spawn({
+        let page = page_flood.clone();
+        async move {
+            // Send many rapid evaluate calls to flood the handler channel.
+            for i in 0..200 {
+                let _ = timeout(
+                    Duration::from_secs(5),
+                    page.evaluate(format!("1 + {i}")),
+                )
+                .await;
+            }
+        }
+    });
+
+    let simple_handle = tokio::spawn({
+        let page = page_simple.clone();
+        async move {
+            let start = std::time::Instant::now();
+            timeout(Duration::from_secs(15), page.goto(TARGET))
+                .await
+                .expect("simple page: goto should not time out")
+                .expect("simple page: goto should succeed");
+
+            timeout(Duration::from_secs(15), page.wait_for_navigation())
+                .await
+                .expect("simple page: wait_for_navigation should not time out")
+                .expect("simple page: wait_for_navigation should succeed");
+
+            let elapsed = start.elapsed();
+            eprintln!("simple page navigated in {elapsed:?} despite flood");
+            elapsed
+        }
+    });
+
+    let (flood_result, simple_result) = tokio::join!(flood_handle, simple_handle);
+    flood_result.expect("flood task should not panic");
+    let nav_time = simple_result.expect("simple task should not panic");
+
+    // The simple page should complete within a reasonable time even under
+    // handler pressure. If the drain budget fix regresses, the flood page
+    // would starve the simple page.
+    assert!(
+        nav_time < Duration::from_secs(15),
+        "simple page took {nav_time:?} — handler may be starved by flood page"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 15. wait_for_delay — simple floor delay
 // ---------------------------------------------------------------------------

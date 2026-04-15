@@ -228,8 +228,31 @@ pub fn session_cache_insert(
     cache_policy: CachePolicy,
     entry_key: &str,
 ) {
-    use dashmap::mapref::entry::Entry;
+    // Fast path: key already exists — no eviction needed.
+    if let Some(mut inner) = LOCAL_SESSION_CACHE.get_mut(cache_key) {
+        if inner.len() < SESSION_CACHE_MAX_PER_SITE {
+            inner.insert(entry_key.into(), (http_res, cache_policy));
+        }
+        return;
+    }
 
+    // Slow path: new site key — evict oldest entries *before* acquiring
+    // the entry lock so we never call `.len()` / `.iter()` / `.remove()`
+    // while a shard write-lock is held (which would deadlock DashMap).
+    if LOCAL_SESSION_CACHE.len() >= SESSION_CACHE_MAX_SITES {
+        let to_remove: Vec<String> = LOCAL_SESSION_CACHE
+            .iter()
+            .take(SESSION_CACHE_MAX_SITES / 4)
+            .map(|r| r.key().clone())
+            .collect();
+        for key in to_remove {
+            LOCAL_SESSION_CACHE.remove(&key);
+        }
+    }
+
+    // Insert the new site key.  Another thread may have raced us, so use
+    // `entry()` to handle the occupied case gracefully.
+    use dashmap::mapref::entry::Entry;
     match LOCAL_SESSION_CACHE.entry(cache_key.to_string()) {
         Entry::Occupied(mut occ) => {
             let inner = occ.get_mut();
@@ -238,22 +261,9 @@ pub fn session_cache_insert(
             }
         }
         Entry::Vacant(vac) => {
-            if LOCAL_SESSION_CACHE.len() >= SESSION_CACHE_MAX_SITES {
-                let to_remove: Vec<String> = LOCAL_SESSION_CACHE
-                    .iter()
-                    .take(SESSION_CACHE_MAX_SITES / 4)
-                    .map(|r| r.key().clone())
-                    .collect();
-                for key in to_remove {
-                    LOCAL_SESSION_CACHE.remove(&key);
-                }
-            }
-
             let mut m: HashMap<String, (http_cache_reqwest::HttpResponse, CachePolicy)> =
                 HashMap::new();
-
             m.insert(entry_key.into(), (http_res, cache_policy));
-
             vac.insert(m);
         }
     }
