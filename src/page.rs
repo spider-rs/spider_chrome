@@ -3127,6 +3127,13 @@ impl Page {
         dump_remote: Option<String>,
         namespace: Option<&str>,
     ) -> Result<tokio::task::JoinHandle<()>, crate::error::CdpError> {
+        // Eagerly init the remote cache worker so uploads are ready before
+        // the first response arrives.  set_client + init are both idempotent
+        // (OnceLock / OnceCell — first call wins).
+        if dump_remote.is_some() {
+            crate::cache::dump_remote::init_default_cache_worker().await;
+        }
+
         let cache_site =
             crate::cache::manager::site_key_for_target_url(target_url, auth.as_deref(), namespace);
 

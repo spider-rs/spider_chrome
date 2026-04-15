@@ -385,12 +385,15 @@ pub async fn put_hybrid_cache(
 
             if super::dump_remote::worke_inited() {
                 if !super::dump_remote::try_enqueue(job) {
-                    tracing::debug!("remote dump skipped (worker not initialized or queue full)");
+                    tracing::debug!("remote dump skipped (queue full)");
                 }
             } else {
+                // First enqueue — inject chromey's client so the worker
+                // shares the connection pool and TLS config.
+                spider_remote_cache::set_client(crate::browser::request_client().clone());
                 if let Err(err) = super::dump_remote::enqueue(job).await {
                     tracing::debug!(
-                        "remote dump skipped (worker not initialized or queue full) - {:?}",
+                        "remote dump skipped (queue full) - {:?}",
                         err
                     );
                 }
@@ -699,12 +702,13 @@ async fn handle_single_response(
 
         if super::dump_remote::worke_inited() {
             if !super::dump_remote::try_enqueue(job) {
-                tracing::debug!("remote dump skipped (worker not initialized or queue full)");
+                tracing::debug!("remote dump skipped (queue full)");
             }
         } else {
+            spider_remote_cache::set_client(crate::browser::request_client().clone());
             if let Err(err) = super::dump_remote::enqueue(job).await {
                 tracing::debug!(
-                    "remote dump skipped (worker not initialized or queue full) - {:?}",
+                    "remote dump skipped (queue full) - {:?}",
                     err
                 );
             }
