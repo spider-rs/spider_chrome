@@ -754,3 +754,98 @@ async fn concurrent_dom_content_loaded_does_not_deadlock() {
             .unwrap_or_else(|err| panic!("task {i} panicked: {err}"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// 13. goto_dom_content_loaded — navigate without blocking on subresources
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn goto_dom_content_loaded_unblocks_pipeline() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("goto-dcl")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    // goto_dom_content_loaded resolves as soon as HTML is parsed —
+    // the page pipeline is unblocked without waiting for subresources.
+    timeout(
+        Duration::from_secs(30),
+        page.goto_dom_content_loaded(TARGET),
+    )
+    .await
+    .expect("goto_dom_content_loaded should not time out")
+    .expect("goto_dom_content_loaded should succeed");
+
+    // Content should already be available — no extra wait needed.
+    let content = timeout(Duration::from_secs(15), page.content())
+        .await
+        .expect("content() should not time out")
+        .expect("content() should succeed");
+
+    assert!(
+        content.contains("Example Domain"),
+        "page should contain 'Example Domain' after goto_dom_content_loaded"
+    );
+    eprintln!("goto_dom_content_loaded: {} bytes ready", content.len());
+}
+
+/// Verify goto_dom_content_loaded doesn't deadlock under concurrency.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn goto_dom_content_loaded_concurrent_pages() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("goto-dcl-concurrent")).await;
+
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+            .await
+            .expect("new_page should not time out")
+            .expect("new_page should resolve");
+        pages.push(page);
+    }
+
+    let futs: Vec<_> = pages
+        .into_iter()
+        .enumerate()
+        .map(|(i, page)| {
+            tokio::spawn(async move {
+                timeout(
+                    Duration::from_secs(30),
+                    page.goto_dom_content_loaded(TARGET),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("page {i}: goto_dom_content_loaded timed out"))
+                .unwrap_or_else(|e| panic!("page {i}: goto_dom_content_loaded failed: {e}"));
+
+                let content = timeout(Duration::from_secs(15), page.content())
+                    .await
+                    .unwrap_or_else(|_| panic!("page {i}: content() timed out"))
+                    .unwrap_or_else(|e| panic!("page {i}: content() failed: {e}"));
+
+                assert!(
+                    content.contains("Example Domain"),
+                    "page {i}: should contain 'Example Domain'"
+                );
+                eprintln!(
+                    "page {i}: {} bytes via goto_dom_content_loaded",
+                    content.len()
+                );
+            })
+        })
+        .collect();
+
+    for fut in futs {
+        fut.await.expect("task join");
+    }
+}

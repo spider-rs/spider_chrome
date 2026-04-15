@@ -32,6 +32,23 @@ impl<T: Command> HttpFuture<T> {
             navigation: TargetMessageFuture::<T>::wait_for_navigation(sender, request_timeout),
         }
     }
+
+    /// Like `new` but resolves on `DOMContentLoaded` instead of `load`.
+    /// Does not wait for subresources (images, fonts, XHRs) — significantly
+    /// faster through slow proxies.
+    pub fn new_dom_content_loaded(
+        sender: PageSender,
+        command: CommandFuture<T>,
+        request_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            command: command.fuse(),
+            navigation: TargetMessageFuture::<T>::wait_for_dom_content_loaded(
+                sender,
+                request_timeout,
+            ),
+        }
+    }
 }
 
 impl<T> Future for HttpFuture<T>

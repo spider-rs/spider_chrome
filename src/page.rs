@@ -402,6 +402,13 @@ impl Page {
         self.inner.http_future(cmd)
     }
 
+    /// Like `http_future` but resolves on `DOMContentLoaded` instead of
+    /// `load`. Does not block on subresources (images, fonts, XHRs) —
+    /// significantly faster through slow proxies.
+    pub fn http_future_dom_content_loaded<T: Command>(&self, cmd: T) -> Result<HttpFuture<T>> {
+        self.inner.http_future_dom_content_loaded(cmd)
+    }
+
     /// Adds an event listener to the `Target` and returns the receiver part as
     /// `EventStream`
     ///
@@ -1003,6 +1010,23 @@ impl Page {
         }
 
         Ok(self)
+    }
+
+    /// Navigate and wait only for `DOMContentLoaded` (HTML parsed, sync
+    /// scripts executed). Unlike `goto` + `wait_for_navigation`, this does
+    /// **not** block on subresources (images, fonts, XHRs). Through slow
+    /// proxies this unblocks the page pipeline much earlier.
+    pub async fn goto_dom_content_loaded(
+        &self,
+        params: impl Into<NavigateParams>,
+    ) -> Result<&Self> {
+        let res = self.execute(params.into()).await?;
+
+        if let Some(err) = res.result.error_text {
+            return Err(CdpError::ChromeMessage(err));
+        }
+
+        self.wait_for_dom_content_loaded().await
     }
 
     /// The identifier of the `Target` this page belongs to
