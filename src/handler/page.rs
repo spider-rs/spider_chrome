@@ -190,19 +190,6 @@ impl PageInner {
         ))
     }
 
-    /// Like `http_future` but resolves on `DOMContentLoaded` instead of
-    /// `load` — does not wait for subresources.
-    pub(crate) fn http_future_dom_content_loaded<T: Command>(
-        &self,
-        cmd: T,
-    ) -> Result<HttpFuture<T>> {
-        Ok(HttpFuture::new_dom_content_loaded(
-            self.sender.clone(),
-            self.command_future(cmd)?,
-            self.request_timeout,
-        ))
-    }
-
     /// The identifier of this page's target
     pub fn target_id(&self) -> &TargetId {
         &self.target_id

@@ -402,13 +402,6 @@ impl Page {
         self.inner.http_future(cmd)
     }
 
-    /// Like `http_future` but resolves on `DOMContentLoaded` instead of
-    /// `load`. Does not block on subresources (images, fonts, XHRs) —
-    /// significantly faster through slow proxies.
-    pub fn http_future_dom_content_loaded<T: Command>(&self, cmd: T) -> Result<HttpFuture<T>> {
-        self.inner.http_future_dom_content_loaded(cmd)
-    }
-
     /// Adds an event listener to the `Target` and returns the receiver part as
     /// `EventStream`
     ///
@@ -505,11 +498,13 @@ impl Page {
         Ok(())
     }
 
-    /// This resolves once the navigation finished and the page is loaded.
+    /// Resolves once `DOMContentLoaded` fires — HTML is parsed and
+    /// synchronous scripts have executed. Does **not** wait for subresources
+    /// (images, fonts, XHRs), so the page pipeline is unblocked as soon as
+    /// useful content is available.
     ///
-    /// This is necessary after an interaction with the page that may trigger a
-    /// navigation (`click`, `press_key`) in order to wait until the new browser
-    /// page is loaded
+    /// Use after an interaction that triggers a navigation (`click`,
+    /// `press_key`, `goto`) to wait until the new page content is ready.
     pub async fn wait_for_navigation_response(&self) -> Result<ArcHttpRequest> {
         self.inner.wait_for_navigation().await
     }
@@ -520,10 +515,7 @@ impl Page {
         Ok(self)
     }
 
-    /// Wait for `DOMContentLoaded` — resolves once HTML is parsed and sync
-    /// scripts have executed. Unlike `wait_for_navigation` (which waits for
-    /// `load`), this does **not** wait for subresources (images, fonts, late
-    /// XHRs), making it significantly faster through slow proxies.
+    /// Alias for `wait_for_navigation` — both resolve on `DOMContentLoaded`.
     pub async fn wait_for_dom_content_loaded(&self) -> Result<&Self> {
         self.inner.wait_for_dom_content_loaded().await?;
         Ok(self)
@@ -1010,23 +1002,6 @@ impl Page {
         }
 
         Ok(self)
-    }
-
-    /// Navigate and wait only for `DOMContentLoaded` (HTML parsed, sync
-    /// scripts executed). Unlike `goto` + `wait_for_navigation`, this does
-    /// **not** block on subresources (images, fonts, XHRs). Through slow
-    /// proxies this unblocks the page pipeline much earlier.
-    pub async fn goto_dom_content_loaded(
-        &self,
-        params: impl Into<NavigateParams>,
-    ) -> Result<&Self> {
-        let res = self.execute(params.into()).await?;
-
-        if let Some(err) = res.result.error_text {
-            return Err(CdpError::ChromeMessage(err));
-        }
-
-        self.wait_for_dom_content_loaded().await
     }
 
     /// The identifier of the `Target` this page belongs to

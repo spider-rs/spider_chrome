@@ -641,9 +641,9 @@ impl Target {
                     while let Some(tx) = self.wait_for_dom_content_loaded.pop() {
                         let _ = tx.send(frame.http_request().cloned());
                     }
-                }
-
-                if frame.is_loaded() {
+                    // Navigation resolves on DOMContentLoaded — HTML parsed
+                    // and sync scripts executed, without waiting for
+                    // subresources (images, fonts, XHRs).
                     while let Some(tx) = self.wait_for_frame_navigation.pop() {
                         let _ = tx.send(frame.http_request().cloned());
                     }
@@ -742,7 +742,7 @@ impl Target {
                         }
                         TargetMessage::WaitForNavigation(tx) => {
                             if let Some(frame) = self.frame_manager.main_frame() {
-                                if frame.is_loaded() {
+                                if frame.is_dom_content_loaded() {
                                     let _ = tx.send(frame.http_request().cloned());
                                 } else {
                                     self.wait_for_frame_navigation.push(tx);
@@ -952,7 +952,7 @@ impl Target {
             }
             TargetMessage::WaitForNavigation(tx) => {
                 if let Some(frame) = self.frame_manager.main_frame() {
-                    if frame.is_loaded() {
+                    if frame.is_dom_content_loaded() {
                         let _ = tx.send(frame.http_request().cloned());
                     } else {
                         self.wait_for_frame_navigation.push(tx);
@@ -1207,8 +1207,6 @@ impl Target {
                     while let Some(tx) = self.wait_for_dom_content_loaded.pop() {
                         let _ = tx.send(frame.http_request().cloned());
                     }
-                }
-                if frame.is_loaded() {
                     while let Some(tx) = self.wait_for_frame_navigation.pop() {
                         let _ = tx.send(frame.http_request().cloned());
                     }
