@@ -798,3 +798,116 @@ async fn wait_for_navigation_resolves_on_dom_content_loaded() {
     );
     eprintln!("wait_for_navigation (DCL): {} bytes ready", content.len());
 }
+
+// ---------------------------------------------------------------------------
+// 14. wait_for_selector — poll until CSS selector matches
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn wait_for_selector_finds_element() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("wfs")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    timeout(Duration::from_secs(30), page.goto(TARGET))
+        .await
+        .expect("goto should not time out")
+        .expect("goto should succeed");
+
+    timeout(Duration::from_secs(30), page.wait_for_navigation())
+        .await
+        .expect("wait_for_navigation should not time out")
+        .expect("wait_for_navigation should succeed");
+
+    // example.com has an <h1> — wait_for_selector should find it.
+    let el = timeout(
+        Duration::from_secs(15),
+        page.wait_for_selector("h1", Some(Duration::from_secs(10))),
+    )
+    .await
+    .expect("wait_for_selector should not time out")
+    .expect("wait_for_selector should find <h1>");
+
+    let text = timeout(Duration::from_secs(10), el.inner_text())
+        .await
+        .expect("inner_text should not time out")
+        .expect("inner_text should succeed");
+
+    assert!(
+        text.as_deref()
+            .is_some_and(|t| t.contains("Example Domain")),
+        "h1 should contain 'Example Domain', got: {text:?}"
+    );
+}
+
+/// wait_for_selector with a missing element should time out, not hang.
+#[tokio::test]
+async fn wait_for_selector_times_out_for_missing_element() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("wfs-missing")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    timeout(Duration::from_secs(30), page.goto(TARGET))
+        .await
+        .expect("goto should not time out")
+        .expect("goto should succeed");
+
+    timeout(Duration::from_secs(30), page.wait_for_navigation())
+        .await
+        .expect("wait_for_navigation should not time out")
+        .expect("wait_for_navigation should succeed");
+
+    // Nonexistent selector — should return Err(Timeout), not hang.
+    let result = page
+        .wait_for_selector("#does-not-exist", Some(Duration::from_secs(2)))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "wait_for_selector should error on missing element"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15. wait_for_delay — simple floor delay
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn wait_for_delay_sleeps() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("wfd")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    let start = std::time::Instant::now();
+    page.wait_for_delay(Duration::from_millis(200)).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(180),
+        "wait_for_delay should sleep at least ~200ms, got {elapsed:?}"
+    );
+}

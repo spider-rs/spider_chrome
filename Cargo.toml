@@ -1,6 +1,6 @@
 [package]
 name = "chromey"
-version = "2.46.25"
+version = "2.46.26"
 rust-version = "1.70"
 authors = ["j-mendez <jeff@spider.cloud>"]
 edition = "2021"
@@ -63,6 +63,7 @@ serde_stacker = { version = "0.1", optional = true }
 blake3 = { version = "1", optional = true }
 hex = { version = "0.4", optional = true }
 dashmap = { version = "6", optional = true }
+spider_remote_cache = { version = "0.2", optional = true, default-features = false }
 
 [dependencies.spider_fingerprint]
 version = "2"
@@ -93,6 +94,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 futures-util = "0.3"
 anyhow = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.27.0"
+spider_remote_cache = { version = "0.2", default-features = false }
+dashmap = "6"
 
 [features]
 default = ["bytes", "simd", "default-tls", "serde0", "auto-detect-executable"]
@@ -123,6 +127,7 @@ _cache = [
     "dep:blake3",
     "dep:hex",
     "dep:dashmap",
+    "dep:spider_remote_cache",
     "_cache_stream_disk"
     ]
 _cache_stream_disk = []
@@ -182,3 +187,8 @@ harness = false
 [[bench]]
 name = "simd_comparison"
 harness = false
+
+[[bench]]
+name = "remote_cache_bench"
+harness = false
+required-features = ["cache"]

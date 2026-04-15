@@ -539,6 +539,51 @@ impl Page {
         self.inner.wait_for_load().await
     }
 
+    /// Poll until a CSS selector matches an element in the DOM, using
+    /// exponential backoff (0 → 20 → 50 → 100 → 100 → 500 ms).
+    /// Returns the `Element` on success.
+    ///
+    /// ```rust,no_run
+    /// # async fn example(page: &chromiumoxide::Page) -> chromiumoxide::error::Result<()> {
+    /// use std::time::Duration;
+    /// let el = page.wait_for_selector("div.loaded", Some(Duration::from_secs(10))).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn wait_for_selector(
+        &self,
+        selector: impl Into<String>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Element> {
+        const BACKOFF: [u64; 6] = [0, 20, 50, 100, 100, 500];
+        let selector = selector.into();
+        let poll = async {
+            let mut i = 0;
+            loop {
+                let delay = BACKOFF[i % BACKOFF.len()];
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                if let Ok(el) = self.find_element(&selector).await {
+                    return Ok(el);
+                }
+                i += 1;
+            }
+        };
+        match timeout {
+            Some(t) => tokio::time::timeout(t, poll)
+                .await
+                .map_err(|_| CdpError::Timeout)?,
+            None => poll.await,
+        }
+    }
+
+    /// Sleep for a fixed duration. Useful as a floor in wait chains.
+    pub async fn wait_for_delay(&self, duration: std::time::Duration) -> &Self {
+        tokio::time::sleep(duration).await;
+        self
+    }
+
     /// Controls whether page will emit lifecycle events
     pub async fn set_page_lifecycles_enabled(&self, enabled: bool) -> Result<&Self> {
         self.execute(SetLifecycleEventsEnabledParams::new(enabled))

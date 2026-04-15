@@ -5,136 +5,40 @@ use http_cache_reqwest::CacheManager;
 use http_cache_semantics::CachePolicy;
 use http_global_cache::CACACHE_MANAGER;
 use lazy_static::lazy_static;
-use reqwest::header::HeaderValue;
 use reqwest::Method;
-use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use reqwest::StatusCode;
 use url::Url;
 
 use crate::cache::manager::site_key_for_target_url;
-use crate::http::{convert_headers, HttpRequestLike, HttpResponseLike, HttpVersion};
+use crate::http::{convert_headers, HttpRequestLike, HttpResponseLike};
+
+// Re-export from the shared crate so existing call sites keep working.
+pub use spider_remote_cache::{
+    build_payload, dump_batch_to_remote as dump_batch_to_remote_cache,
+    dump_to_remote as dump_to_remote_cache_parts, get_client, get_endpoint,
+    resolve_base_url as resolve_remote_base_url, set_client, set_endpoint,
+    HybridCachePayload,
+};
 
 lazy_static! {
-    /// Global HTTP client reused for all remote cache dumps.
-    pub static ref HYBRID_CACHE_CLIENT: Client = Client::builder()
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .build()
-        .expect("failed to build HYBRID_CACHE_CLIENT");
-    /// Base URL of your remote hybrid cache server.
-    ///
-    /// Example: "http://127.0.0.1:8080"
-    ///
-    /// Override via env:
-    ///   HYBRID_CACHE_ENDPOINT=http://remote-cache:8080
-    pub static ref HYBRID_CACHE_ENDPOINT: String = std::env::var("HYBRID_CACHE_ENDPOINT")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     /// The local session cache per run cleared.
     pub static ref LOCAL_SESSION_CACHE: dashmap::DashMap<String, HashMap<String, (http_cache_reqwest::HttpResponse, CachePolicy)>> = dashmap::DashMap::new();
-    /// Max concurrent remote cache dumps across the whole process.
-    pub static ref REMOTE_CACHE_DUMP_SEM: Semaphore = Semaphore::new(1000);
     /// URLs currently being streamed via `Fetch.takeResponseBodyAsStream`.
     /// Checked by the `Network.responseReceived` listener to avoid a
     /// redundant `getResponseBody` call for the same resource.
     pub(crate) static ref PENDING_STREAM_URLS: dashmap::DashSet<String> = dashmap::DashSet::new();
 }
 
-/// Payload shape for the remote hybrid cache server `/cache/index` endpoint.
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct HybridCachePayload {
-    /// Optional website-level key (defaults to URL host if None).
-    #[serde(default)]
-    website_key: Option<String>,
-    resource_key: String,
-    url: String,
-    method: String,
-    status: u16,
-    request_headers: std::collections::HashMap<String, String>,
-    response_headers: std::collections::HashMap<String, String>,
-    http_version: HttpVersion,
-    /// Base64-encoded HTTP body for JSON transport.
-    body_base64: String,
-}
-
-pub async fn dump_to_remote_cache_parts(
-    cache_key: &str,
-    cache_site: &str,
-    url_str: &str,
-    body: &[u8],
-    method: &str,
-    status: u16,
-    http_request_headers: &std::collections::HashMap<String, String>,
-    response_headers: &std::collections::HashMap<String, String>,
-    http_version: &HttpVersion,
-    dump_remote: Option<&str>,
-) {
-    let _permit = match REMOTE_CACHE_DUMP_SEM.acquire().await {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    let website_key = url::Url::parse(url_str)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_string()));
-
-    let body_base64 = general_purpose::STANDARD.encode(body);
-
-    let payload = HybridCachePayload {
-        website_key,
-        resource_key: cache_key.to_string(),
-        url: url_str.to_string(),
-        method: method.to_string(),
-        status,
-        http_version: *http_version,
-        request_headers: http_request_headers.clone(),
-        response_headers: response_headers.clone(),
-        body_base64,
-    };
-
-    let mut base_url = HYBRID_CACHE_ENDPOINT.as_str();
-
-    if let Some(remote) = dump_remote {
-        if remote != "true" {
-            base_url = remote.trim_ascii();
-        }
-    }
-
-    let endpoint = format!("{}/cache/index", &*base_url);
-
-    let result = HYBRID_CACHE_CLIENT
-        .post(&endpoint)
-        .json(&payload)
-        .header(
-            "x-cache-site",
-            HeaderValue::from_str(cache_site).unwrap_or(HeaderValue::from_static("")),
-        )
-        .send()
-        .await;
-
-    match result {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                tracing::warn!(
-                    "remote cache dump: non-success status for {}: {}",
-                    cache_key,
-                    resp.status()
-                );
-            } else {
-                tracing::info!(
-                    "remote cache dump: success status for {}: {}",
-                    cache_key,
-                    resp.status()
-                );
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                "remote cache dump: failed to POST {} to {}: {}",
-                cache_key,
-                endpoint,
-                err
-            );
-        }
+/// Convert a `spider_remote_cache::HttpVersion` to an `http_cache::HttpVersion`.
+fn remote_version_to_http_cache(
+    v: spider_remote_cache::HttpVersion,
+) -> http_cache::HttpVersion {
+    match v {
+        spider_remote_cache::HttpVersion::H2 => http_cache::HttpVersion::H2,
+        spider_remote_cache::HttpVersion::H3 => http_cache::HttpVersion::H3,
+        spider_remote_cache::HttpVersion::Http09 => http_cache::HttpVersion::Http09,
+        spider_remote_cache::HttpVersion::Http10 => http_cache::HttpVersion::Http10,
+        spider_remote_cache::HttpVersion::Http11 | _ => http_cache::HttpVersion::Http11,
     }
 }
 
@@ -147,6 +51,15 @@ pub async fn dump_to_remote_cache(
     http_request_headers: &std::collections::HashMap<String, String>,
     dump_remote: Option<&str>,
 ) {
+    // Convert chromey HttpVersion to spider_remote_cache HttpVersion.
+    let version = match http_response.version {
+        crate::http::HttpVersion::Http09 => spider_remote_cache::HttpVersion::Http09,
+        crate::http::HttpVersion::Http10 => spider_remote_cache::HttpVersion::Http10,
+        crate::http::HttpVersion::H2 => spider_remote_cache::HttpVersion::H2,
+        crate::http::HttpVersion::H3 => spider_remote_cache::HttpVersion::H3,
+        _ => spider_remote_cache::HttpVersion::Http11,
+    };
+
     dump_to_remote_cache_parts(
         cache_key,
         cache_site,
@@ -156,7 +69,7 @@ pub async fn dump_to_remote_cache(
         http_response.status,
         http_request_headers,
         &http_response.headers,
-        &http_response.version,
+        &version,
         dump_remote,
     )
     .await
@@ -164,29 +77,19 @@ pub async fn dump_to_remote_cache(
 
 /// Get the cache for a website from the remote cache server and seed
 /// our local hybrid cache (CACACHE_MANAGER) with **all** entries [experimental].
-///
-/// `cache_key` here is the `website_key` used by the remote server,
-/// e.g. "example.com".
 pub async fn get_cache_site(
     target_url: &str,
     auth: Option<&str>,
     remote: Option<&str>,
     namespace: Option<&str>,
 ) {
-    let mut base_url = HYBRID_CACHE_ENDPOINT.as_str();
-
-    if let Some(remote) = remote {
-        if remote != "true" {
-            base_url = remote.trim_ascii();
-        }
-    }
+    let base_url = spider_remote_cache::resolve_base_url(remote);
 
     let cache_key = site_key_for_target_url(target_url, auth, namespace);
 
-    let endpoint = format!("{}/cache/site/{}", &*base_url, cache_key);
+    let endpoint = format!("{}/cache/site/{}", base_url, cache_key);
 
-    // Fetch all entries for this website from the remote cache server.
-    let result = HYBRID_CACHE_CLIENT.get(&endpoint).send().await;
+    let result = get_client().get(&endpoint).send().await;
 
     let resp = match result {
         Ok(resp) => resp,
@@ -210,7 +113,6 @@ pub async fn get_cache_site(
         return;
     }
 
-    // Parse JSON payloads: Vec<HybridCachePayload>
     let payloads: Vec<Box<HybridCachePayload>> = match resp.json().await {
         Ok(p) => p,
         Err(err) => {
@@ -231,7 +133,7 @@ pub async fn get_cache_site(
     );
 
     for payload in payloads {
-        if let Err(err) = seed_payload_into_local_cache(&cache_key, &payload, &target_url).await {
+        if let Err(err) = seed_payload_into_local_cache(&cache_key, &payload, target_url).await {
             tracing::warn!(
                 "remote cache get: failed to seed resource {} for website {}: {}",
                 payload.resource_key,
@@ -244,29 +146,19 @@ pub async fn get_cache_site(
 
 /// Get the cache for a resource from the remote cache server and seed
 /// our local hybrid cache (CACACHE_MANAGER) with **all** entries [experimental].
-///
-/// `cache_key` here is the `website_key` used by the remote server,
-/// e.g. "example.com".
 pub async fn get_cache_resource(
     target_url: &str,
     auth: Option<&str>,
     remote: Option<&str>,
     namespace: Option<&str>,
 ) {
-    let mut base_url = HYBRID_CACHE_ENDPOINT.as_str();
-
-    if let Some(remote) = remote {
-        if remote != "true" {
-            base_url = remote.trim_ascii();
-        }
-    }
+    let base_url = spider_remote_cache::resolve_base_url(remote);
 
     let cache_key = site_key_for_target_url(target_url, auth, namespace);
 
-    let endpoint = format!("{}/cache/resource/{}", &*base_url, cache_key);
+    let endpoint = format!("{}/cache/resource/{}", base_url, cache_key);
 
-    // Fetch all entries for this website from the remote cache server.
-    let result = HYBRID_CACHE_CLIENT.get(&endpoint).send().await;
+    let result = get_client().get(&endpoint).send().await;
 
     let resp = match result {
         Ok(resp) => resp,
@@ -308,7 +200,7 @@ pub async fn get_cache_resource(
         cache_key
     );
 
-    if let Err(err) = seed_payload_into_local_cache(&cache_key, &payload, &target_url).await {
+    if let Err(err) = seed_payload_into_local_cache(&cache_key, &payload, target_url).await {
         tracing::warn!(
             "remote cache get: failed to seed resource {} for website {}: {}",
             payload.resource_key,
@@ -324,9 +216,6 @@ pub async fn clear_local_session_cache(cache_key: &str) {
 }
 
 /// Maximum number of top-level site keys in the local session cache.
-/// Each site key maps to a sub-map of resource entries. This cap prevents
-/// unbounded memory growth when crawling many distinct sites in a single
-/// process lifetime. The oldest entries are dropped in bulk when exceeded.
 const SESSION_CACHE_MAX_SITES: usize = 2_000;
 
 /// Maximum number of resource entries per site key.
@@ -344,14 +233,11 @@ pub fn session_cache_insert(
     match LOCAL_SESSION_CACHE.entry(cache_key.to_string()) {
         Entry::Occupied(mut occ) => {
             let inner = occ.get_mut();
-            // Cap per-site entries to avoid a single site exhausting memory.
             if inner.len() < SESSION_CACHE_MAX_PER_SITE {
                 inner.insert(entry_key.into(), (http_res, cache_policy));
             }
         }
         Entry::Vacant(vac) => {
-            // If we've hit the global cap, shed ~25 % of entries (cheap bulk
-            // eviction without requiring an LRU structure).
             if LOCAL_SESSION_CACHE.len() >= SESSION_CACHE_MAX_SITES {
                 let to_remove: Vec<String> = LOCAL_SESSION_CACHE
                     .iter()
@@ -415,7 +301,7 @@ async fn seed_payload_into_local_cache(
         headers: http_cache::HttpHeaders::Modern(crate::http::headers_to_multi(
             &payload.response_headers,
         )),
-        version: payload.http_version.into(),
+        version: remote_version_to_http_cache(payload.http_version),
         status: payload.status,
         body,
         metadata: None,

@@ -379,7 +379,7 @@ pub async fn put_hybrid_cache(
                 request_headers: http_request_headers,
                 response_headers: http_response.headers,
                 body,
-                http_version: version,
+                http_version: version.into(),
                 dump_remote: dump_remote.map(|s| s.to_string()),
             };
 
@@ -693,7 +693,7 @@ async fn handle_single_response(
             request_headers: req_headers,
             response_headers: resp_headers,
             body: body_bytes,
-            http_version: version,
+            http_version: version.into(),
             dump_remote: dump_remote.map(|s| s.to_string()),
         };
 

@@ -83,6 +83,32 @@ impl From<HttpVersion> for http_cache::HttpVersion {
     }
 }
 
+#[cfg(feature = "_cache")]
+impl From<HttpVersion> for spider_remote_cache::HttpVersion {
+    fn from(v: HttpVersion) -> Self {
+        match v {
+            HttpVersion::H2 => spider_remote_cache::HttpVersion::H2,
+            HttpVersion::H3 => spider_remote_cache::HttpVersion::H3,
+            HttpVersion::Http09 => spider_remote_cache::HttpVersion::Http09,
+            HttpVersion::Http10 => spider_remote_cache::HttpVersion::Http10,
+            HttpVersion::Http11 => spider_remote_cache::HttpVersion::Http11,
+        }
+    }
+}
+
+#[cfg(feature = "_cache")]
+impl From<spider_remote_cache::HttpVersion> for HttpVersion {
+    fn from(v: spider_remote_cache::HttpVersion) -> Self {
+        match v {
+            spider_remote_cache::HttpVersion::H2 => HttpVersion::H2,
+            spider_remote_cache::HttpVersion::H3 => HttpVersion::H3,
+            spider_remote_cache::HttpVersion::Http09 => HttpVersion::Http09,
+            spider_remote_cache::HttpVersion::Http10 => HttpVersion::Http10,
+            spider_remote_cache::HttpVersion::Http11 | _ => HttpVersion::Http11,
+        }
+    }
+}
+
 /// A basic generic type that represents an HTTP response.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {

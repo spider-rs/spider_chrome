@@ -61,6 +61,12 @@ lazy_static::lazy_static! {
         .expect("client to build");
 }
 
+/// Returns chromey's global `reqwest::Client` for reuse by other subsystems
+/// (e.g. remote cache uploads via `spider_remote_cache`).
+pub fn request_client() -> &'static reqwest::Client {
+    &REQUEST_CLIENT
+}
+
 /// A [`Browser`] is created when chromiumoxide connects to a Chromium instance.
 #[derive(Debug)]
 pub struct Browser {
