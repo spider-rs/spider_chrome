@@ -73,6 +73,21 @@ impl<T> TargetMessageFuture<T> {
         )
     }
 
+    /// Wait for `DOMContentLoaded` — fires once the HTML is fully parsed and
+    /// synchronous scripts have executed, but before subresources (images,
+    /// fonts, late XHRs) finish loading.  Much faster than `wait_for_navigation`
+    /// through slow proxies.
+    pub fn wait_for_dom_content_loaded(
+        target_sender: PageSender,
+        request_timeout: std::time::Duration,
+    ) -> TargetMessageFuture<ArcHttpRequest> {
+        Self::wait(
+            target_sender,
+            request_timeout,
+            TargetMessage::WaitForDomContentLoaded,
+        )
+    }
+
     /// Wait until the main frame reaches `networkIdle`.
     ///
     /// This triggers a `TargetMessage::WaitForNetworkIdle` and resolves with

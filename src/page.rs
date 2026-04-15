@@ -513,6 +513,20 @@ impl Page {
         Ok(self)
     }
 
+    /// Wait for `DOMContentLoaded` — resolves once HTML is parsed and sync
+    /// scripts have executed. Unlike `wait_for_navigation` (which waits for
+    /// `load`), this does **not** wait for subresources (images, fonts, late
+    /// XHRs), making it significantly faster through slow proxies.
+    pub async fn wait_for_dom_content_loaded(&self) -> Result<&Self> {
+        self.inner.wait_for_dom_content_loaded().await?;
+        Ok(self)
+    }
+
+    /// Same as `wait_for_dom_content_loaded` but returns the HTTP response.
+    pub async fn wait_for_dom_content_loaded_response(&self) -> Result<ArcHttpRequest> {
+        self.inner.wait_for_dom_content_loaded().await
+    }
+
     /// Controls whether page will emit lifecycle events
     pub async fn set_page_lifecycles_enabled(&self, enabled: bool) -> Result<&Self> {
         self.execute(SetLifecycleEventsEnabledParams::new(enabled))

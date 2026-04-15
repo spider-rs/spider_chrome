@@ -189,6 +189,13 @@ impl Frame {
         self.lifecycle_events.contains("load")
     }
 
+    /// The `DOMContentLoaded` lifecycle event has fired (HTML parsed, sync
+    /// scripts executed). This fires *before* `load` — subresources like
+    /// images and fonts may still be in-flight.
+    pub fn is_dom_content_loaded(&self) -> bool {
+        self.lifecycle_events.contains("DOMContentLoaded")
+    }
+
     /// Main frame + child frames have fired the `networkIdle` lifecycle event.
     pub fn is_network_idle(&self) -> bool {
         self.lifecycle_events.contains("networkIdle")

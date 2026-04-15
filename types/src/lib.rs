@@ -139,10 +139,7 @@ pub trait Method {
                 let mut iter = id.split('.');
                 let domain = iter.next().unwrap_or_default();
                 let method = iter.next().unwrap_or_default();
-                (
-                    Cow::Owned(domain.into()),
-                    Cow::Owned(method.into()),
-                )
+                (Cow::Owned(domain.into()), Cow::Owned(method.into()))
             }
         }
     }
