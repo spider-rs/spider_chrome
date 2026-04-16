@@ -14,11 +14,12 @@ mod inner {
     use std::ffi::CString;
     use std::io;
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{mpsc, oneshot};
 
-    static URING_ENABLED: AtomicBool = AtomicBool::new(false);
-    static URING_POOL: std::sync::OnceLock<mpsc::UnboundedSender<IoTask>> =
+    /// Lazily initialized io_uring worker. `None` means probe ran and
+    /// io_uring is unavailable — callers fall back to tokio without
+    /// re-probing on every call.
+    static URING_POOL: std::sync::OnceLock<Option<mpsc::UnboundedSender<IoTask>>> =
         std::sync::OnceLock::new();
 
     enum IoTask {
@@ -137,9 +138,35 @@ mod inner {
         Ok(())
     }
 
+    fn uring_statx_size(ring: &mut io_uring::IoUring, path: &str) -> io::Result<u64> {
+        let c_path =
+            CString::new(path).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        let mut statx_buf: libc::statx = unsafe { std::mem::zeroed() };
+
+        let statx_e = io_uring::opcode::Statx::new(
+            io_uring::types::Fd(libc::AT_FDCWD),
+            c_path.as_ptr(),
+            &mut statx_buf as *mut libc::statx as *mut _,
+        )
+        .flags(0)
+        .mask(libc::STATX_SIZE)
+        .build()
+        .user_data(0x574A7);
+        unsafe {
+            ring.submission()
+                .push(&statx_e)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring: SQ full on statx"))?;
+        }
+        let res = submit_and_reap(ring)?;
+        if res < 0 {
+            return Err(io::Error::from_raw_os_error(-res));
+        }
+        Ok(statx_buf.stx_size)
+    }
+
     fn uring_read_file(ring: &mut io_uring::IoUring, path: &str) -> io::Result<Vec<u8>> {
-        let meta = std::fs::metadata(path)?;
-        let len = meta.len() as usize;
+        let len = uring_statx_size(ring, path)? as usize;
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -230,9 +257,14 @@ mod inner {
             return Err(io::Error::from_raw_os_error(-fd));
         }
 
+        // Declare storage in the outer scope so the pointer stays valid
+        // through the io_uring connect submission below.
+        let sa_v4;
+        let sa_v6;
+
         let (sa_ptr, sa_len) = match addr {
             SocketAddr::V4(v4) => {
-                let sa = libc::sockaddr_in {
+                sa_v4 = libc::sockaddr_in {
                     sin_family: libc::AF_INET as libc::sa_family_t,
                     sin_port: v4.port().to_be(),
                     sin_addr: libc::in_addr {
@@ -240,11 +272,13 @@ mod inner {
                     },
                     sin_zero: [0; 8],
                 };
-                let ptr = &sa as *const libc::sockaddr_in as *const libc::sockaddr;
-                (ptr, std::mem::size_of::<libc::sockaddr_in>() as u32)
+                (
+                    &sa_v4 as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as u32,
+                )
             }
             SocketAddr::V6(v6) => {
-                let sa = libc::sockaddr_in6 {
+                sa_v6 = libc::sockaddr_in6 {
                     sin6_family: libc::AF_INET6 as libc::sa_family_t,
                     sin6_port: v6.port().to_be(),
                     sin6_flowinfo: v6.flowinfo(),
@@ -253,8 +287,10 @@ mod inner {
                     },
                     sin6_scope_id: v6.scope_id(),
                 };
-                let ptr = &sa as *const libc::sockaddr_in6 as *const libc::sockaddr;
-                (ptr, std::mem::size_of::<libc::sockaddr_in6>() as u32)
+                (
+                    &sa_v6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as u32,
+                )
             }
         };
 
@@ -263,12 +299,18 @@ mod inner {
             .user_data(0xC044);
         unsafe {
             ring.submission().push(&connect_e).map_err(|_| {
-                libc::close(fd);
+                let _ = uring_close(ring, fd);
                 io::Error::new(io::ErrorKind::Other, "io_uring: SQ full on connect")
             })?;
         }
 
-        let res = submit_and_reap(ring)?;
+        let res = match submit_and_reap(ring) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = uring_close(ring, fd);
+                return Err(e);
+            }
+        };
         if res < 0 && res != -libc::EINPROGRESS {
             let _ = uring_close(ring, fd);
             return Err(io::Error::from_raw_os_error(-res));
@@ -297,33 +339,32 @@ mod inner {
 
     // ── Public API ──────────────────────────────────────────────────────────
 
-    pub fn init() -> bool {
-        if URING_ENABLED.load(Ordering::Acquire) {
-            return true;
-        }
-        let ring = match probe_io_uring() {
-            Some(r) => r,
-            None => return false,
-        };
-        let (tx, rx) = mpsc::unbounded_channel();
-        let builder = std::thread::Builder::new().name("chromey-uring-worker".into());
-        match builder.spawn(move || worker_loop(rx, ring)) {
-            Ok(_) => {
-                if URING_POOL.set(tx).is_ok() {
-                    URING_ENABLED.store(true, Ordering::Release);
+    /// Probe io_uring once and spawn the worker if available.
+    /// Returns `Some(sender)` on success, `None` if unavailable.
+    /// Subsequent calls return the cached result instantly.
+    fn get_pool() -> Option<&'static mpsc::UnboundedSender<IoTask>> {
+        URING_POOL
+            .get_or_init(|| {
+                let ring = probe_io_uring()?;
+                let (tx, rx) = mpsc::unbounded_channel();
+                let builder =
+                    std::thread::Builder::new().name("chromey-uring-worker".into());
+                match builder.spawn(move || worker_loop(rx, ring)) {
+                    Ok(_) => Some(tx),
+                    Err(e) => {
+                        tracing::warn!("Failed to spawn chromey io_uring worker: {}", e);
+                        None
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to spawn chromey io_uring worker: {}", e);
-                return false;
-            }
-        }
-        URING_ENABLED.load(Ordering::Acquire)
+            })
+            .as_ref()
+    }
+
+    pub fn init() -> bool {
+        get_pool().is_some()
     }
 
     /// Send a pre-built `IoTask` to the worker and await its result.
-    /// Caller must only call this after checking `URING_ENABLED` and
-    /// `URING_POOL.get()`.
     async fn await_worker<T>(
         sender: &mpsc::UnboundedSender<IoTask>,
         task: IoTask,
@@ -344,39 +385,32 @@ mod inner {
     }
 
     pub async fn write_file(path: String, data: Vec<u8>) -> io::Result<()> {
-        if URING_ENABLED.load(Ordering::Acquire) {
-            if let Some(sender) = URING_POOL.get() {
-                let (tx, rx) = oneshot::channel();
-                return await_worker(sender, IoTask::WriteFile { path, data, tx }, rx).await;
-            }
+        if let Some(sender) = get_pool() {
+            let (tx, rx) = oneshot::channel();
+            return await_worker(sender, IoTask::WriteFile { path, data, tx }, rx).await;
         }
         tokio::fs::write(path, data).await
     }
 
     pub async fn read_file(path: String) -> io::Result<Vec<u8>> {
-        if URING_ENABLED.load(Ordering::Acquire) {
-            if let Some(sender) = URING_POOL.get() {
-                let (tx, rx) = oneshot::channel();
-                return await_worker(sender, IoTask::ReadFile { path, tx }, rx).await;
-            }
+        if let Some(sender) = get_pool() {
+            let (tx, rx) = oneshot::channel();
+            return await_worker(sender, IoTask::ReadFile { path, tx }, rx).await;
         }
         tokio::fs::read(path).await
     }
 
     pub async fn tcp_connect(addr: SocketAddr) -> io::Result<std::net::TcpStream> {
-        if URING_ENABLED.load(Ordering::Acquire) {
-            if let Some(sender) = URING_POOL.get() {
-                let (tx, rx) = oneshot::channel();
-                return await_worker(sender, IoTask::TcpConnect { addr, tx }, rx).await;
-            }
+        if let Some(sender) = get_pool() {
+            let (tx, rx) = oneshot::channel();
+            return await_worker(sender, IoTask::TcpConnect { addr, tx }, rx).await;
         }
-        tokio::task::spawn_blocking(move || std::net::TcpStream::connect(addr))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.into_std()
     }
 
     pub fn is_enabled() -> bool {
-        URING_ENABLED.load(Ordering::Acquire)
+        get_pool().is_some()
     }
 }
 
@@ -400,9 +434,8 @@ mod inner {
     }
 
     pub async fn tcp_connect(addr: SocketAddr) -> io::Result<std::net::TcpStream> {
-        tokio::task::spawn_blocking(move || std::net::TcpStream::connect(addr))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.into_std()
     }
 
     pub fn is_enabled() -> bool {
