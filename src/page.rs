@@ -7,7 +7,8 @@ use chromiumoxide_cdp::cdp::browser_protocol::accessibility::{
 use chromiumoxide_cdp::cdp::browser_protocol::emulation::{
     MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
     SetGeolocationOverrideParams, SetHardwareConcurrencyOverrideParams, SetLocaleOverrideParams,
-    SetTimezoneOverrideParams, UserAgentBrandVersion, UserAgentMetadata,
+    SetScriptExecutionDisabledParams, SetTimezoneOverrideParams, UserAgentBrandVersion,
+    UserAgentMetadata,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::input::{
     DispatchDragEventType, DispatchMouseEventParams, DispatchMouseEventType, DragData, MouseButton,
@@ -2339,6 +2340,13 @@ impl Page {
         geolocation: impl Into<SetGeolocationOverrideParams>,
     ) -> Result<&Self> {
         self.send_command(geolocation.into()).await?;
+        Ok(self)
+    }
+
+    /// Sets whether script execution is disabled in the page.
+    pub async fn set_javascript_enabled(&self, enabled: bool) -> Result<&Self> {
+        self.send_command(SetScriptExecutionDisabledParams::new(!enabled))
+            .await?;
         Ok(self)
     }
 
