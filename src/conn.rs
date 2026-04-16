@@ -54,6 +54,9 @@ pub const DEFAULT_CONNECTION_RETRIES: u32 = 4;
 /// Initial backoff delay between connection retries (in milliseconds).
 const INITIAL_BACKOFF_MS: u64 = 50;
 
+/// Maximum backoff delay between connection retries (in milliseconds).
+const MAX_BACKOFF_MS: u64 = 2_000;
+
 impl<T: EventMessage + Unpin> Connection<T> {
     pub async fn connect(debug_ws_url: impl AsRef<str>) -> Result<Self> {
         Self::connect_with_retries(debug_ws_url, DEFAULT_CONNECTION_RETRIES).await
@@ -93,9 +96,36 @@ impl<T: EventMessage + Unpin> Connection<T> {
                     });
                 }
                 Err(e) => {
+                    // Detect non-retriable errors early to avoid wasting time
+                    // on connections that will never succeed.
+                    let should_retry = match &e {
+                        // Connection refused — nothing is listening on this port.
+                        CdpError::Io(io_err)
+                            if io_err.kind() == std::io::ErrorKind::ConnectionRefused =>
+                        {
+                            false
+                        }
+                        // HTTP response to a WebSocket upgrade (e.g. wrong path
+                        // returns 404 / redirect) — retrying the same URL won't help.
+                        CdpError::Ws(tungstenite_err) => {
+                            !matches!(
+                                tungstenite_err,
+                                tokio_tungstenite::tungstenite::Error::Http(_)
+                                    | tokio_tungstenite::tungstenite::Error::HttpFormat(_)
+                            )
+                        }
+                        _ => true,
+                    };
+
                     last_err = Some(e);
+
+                    if !should_retry {
+                        break;
+                    }
+
                     if attempt < retries {
-                        let backoff_ms = INITIAL_BACKOFF_MS * 3u64.saturating_pow(attempt);
+                        let backoff_ms = (INITIAL_BACKOFF_MS * 3u64.saturating_pow(attempt))
+                            .min(MAX_BACKOFF_MS);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
                 }
