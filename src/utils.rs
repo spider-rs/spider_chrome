@@ -45,7 +45,7 @@ pub(crate) async fn canonicalize_except_snap(path: PathBuf) -> std::io::Result<P
     Ok(
         if executable_cleaned
             .to_str()
-            .map_or(false, |s| s.ends_with("/snap"))
+            .is_some_and(|s| s.ends_with("/snap"))
         {
             absolute(path)?
         } else {

@@ -2350,6 +2350,11 @@ impl Page {
         Ok(self)
     }
 
+    /// Disables JavaScript execution on the page.
+    pub async fn disable_javascript(&self) -> Result<&Self> {
+        self.set_javascript_enabled(false).await
+    }
+
     /// Reloads given page
     ///
     /// To reload ignoring cache run:

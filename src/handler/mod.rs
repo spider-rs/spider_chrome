@@ -734,7 +734,7 @@ impl Handler {
                             TargetEvent::Request(req) => {
                                 if let Ok(call_id) = ws_submit!(
                                     req.method.clone(),
-                                    req.session_id.map(Into::into),
+                                    req.session_id,
                                     req.params
                                 ) {
                                     self.pending_commands.insert(
@@ -760,7 +760,7 @@ impl Handler {
                                     ));
                                     if let Ok(call_id) = ws_submit!(
                                         req.method.clone(),
-                                        req.session_id.map(Into::into),
+                                        req.session_id,
                                         req.params
                                     ) {
                                         self.pending_commands.insert(
@@ -772,27 +772,25 @@ impl Handler {
                                         nav_id,
                                         NavigationRequest::Navigate(NavigationInProgress::new(tx)),
                                     );
-                                } else {
-                                    if let Ok(call_id) = ws_submit!(
-                                        msg.method.clone(),
-                                        msg.session_id.map(Into::into),
-                                        msg.params
-                                    ) {
-                                        self.pending_commands.insert(
-                                            call_id,
-                                            (
-                                                PendingRequest::ExternalCommand(msg.sender),
-                                                msg.method,
-                                                now,
-                                            ),
-                                        );
-                                    }
+                                } else if let Ok(call_id) = ws_submit!(
+                                    msg.method.clone(),
+                                    msg.session_id.map(Into::into),
+                                    msg.params
+                                ) {
+                                    self.pending_commands.insert(
+                                        call_id,
+                                        (
+                                            PendingRequest::ExternalCommand(msg.sender),
+                                            msg.method,
+                                            now,
+                                        ),
+                                    );
                                 }
                             }
                             TargetEvent::NavigationRequest(nav_id, req) => {
                                 if let Ok(call_id) = ws_submit!(
                                     req.method.clone(),
-                                    req.session_id.map(Into::into),
+                                    req.session_id,
                                     req.params
                                 ) {
                                     self.pending_commands.insert(
