@@ -347,8 +347,7 @@ mod inner {
             .get_or_init(|| {
                 let ring = probe_io_uring()?;
                 let (tx, rx) = mpsc::unbounded_channel();
-                let builder =
-                    std::thread::Builder::new().name("chromey-uring-worker".into());
+                let builder = std::thread::Builder::new().name("chromey-uring-worker".into());
                 match builder.spawn(move || worker_loop(rx, ring)) {
                     Ok(_) => Some(tx),
                     Err(e) => {

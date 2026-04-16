@@ -8,9 +8,9 @@
 //! pool and TLS stack.
 
 pub use spider_remote_cache::worker::{
-    default_max_concurrent, default_queue_cap, default_qps, default_timeout_ms,
-    enqueue, enqueue_best_effort, init_remote_dump_worker, try_enqueue,
-    worker_inited as worke_inited, DumpJob,
+    default_max_concurrent, default_qps, default_queue_cap, default_timeout_ms, enqueue,
+    enqueue_best_effort, init_remote_dump_worker, try_enqueue, worker_inited as worke_inited,
+    DumpJob,
 };
 
 /// Init the cache worker, injecting chromey's `REQUEST_CLIENT` so the

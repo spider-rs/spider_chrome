@@ -251,7 +251,10 @@ async fn fast_path_insert_is_retrievable() {
     let item2 = get_session_cache_item(cache_key, entry_key2);
 
     assert!(item1.is_some(), "first entry should be retrievable");
-    assert!(item2.is_some(), "second entry (fast path) should be retrievable");
+    assert!(
+        item2.is_some(),
+        "second entry (fast path) should be retrievable"
+    );
 
     // Verify the URLs are correct.
     let (resp1, _) = item1.unwrap();
@@ -281,7 +284,12 @@ async fn per_site_entry_limit_respected() {
 
     // All 100 should be present.
     let inner = LOCAL_SESSION_CACHE.get(cache_key).unwrap();
-    assert_eq!(inner.len(), 100, "expected 100 entries, got {}", inner.len());
+    assert_eq!(
+        inner.len(),
+        100,
+        "expected 100 entries, got {}",
+        inner.len()
+    );
     drop(inner);
 
     LOCAL_SESSION_CACHE.remove(cache_key);

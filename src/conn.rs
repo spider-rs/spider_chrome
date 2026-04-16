@@ -107,13 +107,11 @@ impl<T: EventMessage + Unpin> Connection<T> {
                         }
                         // HTTP response to a WebSocket upgrade (e.g. wrong path
                         // returns 404 / redirect) — retrying the same URL won't help.
-                        CdpError::Ws(tungstenite_err) => {
-                            !matches!(
-                                tungstenite_err,
-                                tokio_tungstenite::tungstenite::Error::Http(_)
-                                    | tokio_tungstenite::tungstenite::Error::HttpFormat(_)
-                            )
-                        }
+                        CdpError::Ws(tungstenite_err) => !matches!(
+                            tungstenite_err,
+                            tokio_tungstenite::tungstenite::Error::Http(_)
+                                | tokio_tungstenite::tungstenite::Error::HttpFormat(_)
+                        ),
                         _ => true,
                     };
 
@@ -124,8 +122,8 @@ impl<T: EventMessage + Unpin> Connection<T> {
                     }
 
                     if attempt < retries {
-                        let backoff_ms = (INITIAL_BACKOFF_MS * 3u64.saturating_pow(attempt))
-                            .min(MAX_BACKOFF_MS);
+                        let backoff_ms =
+                            (INITIAL_BACKOFF_MS * 3u64.saturating_pow(attempt)).min(MAX_BACKOFF_MS);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
                 }

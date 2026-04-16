@@ -55,8 +55,7 @@ fn bench_batch_drain_throughput(c: &mut Criterion) {
 
                         // Enqueue all jobs.
                         for i in 0..num_jobs {
-                            let _ = tx
-                                .try_send(make_job(&format!("key-{i}")));
+                            let _ = tx.try_send(make_job(&format!("key-{i}")));
                         }
 
                         // Drain.

@@ -391,10 +391,7 @@ pub async fn put_hybrid_cache(
                 // Worker should already be inited by spawn_cache_listener,
                 // but enqueue() auto-inits as a fallback.
                 if let Err(err) = super::dump_remote::enqueue(job).await {
-                    tracing::debug!(
-                        "remote dump skipped (queue full) - {:?}",
-                        err
-                    );
+                    tracing::debug!("remote dump skipped (queue full) - {:?}", err);
                 }
             }
         }
@@ -705,10 +702,7 @@ async fn handle_single_response(
             }
         } else {
             if let Err(err) = super::dump_remote::enqueue(job).await {
-                tracing::debug!(
-                    "remote dump skipped (queue full) - {:?}",
-                    err
-                );
+                tracing::debug!("remote dump skipped (queue full) - {:?}", err);
             }
         }
     }

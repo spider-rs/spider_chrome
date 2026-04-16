@@ -16,8 +16,7 @@ use crate::http::{convert_headers, HttpRequestLike, HttpResponseLike};
 pub use spider_remote_cache::{
     build_payload, dump_batch_to_remote as dump_batch_to_remote_cache,
     dump_to_remote as dump_to_remote_cache_parts, get_client, get_endpoint,
-    resolve_base_url as resolve_remote_base_url, set_client, set_endpoint,
-    HybridCachePayload,
+    resolve_base_url as resolve_remote_base_url, set_client, set_endpoint, HybridCachePayload,
 };
 
 lazy_static! {
@@ -30,9 +29,7 @@ lazy_static! {
 }
 
 /// Convert a `spider_remote_cache::HttpVersion` to an `http_cache::HttpVersion`.
-fn remote_version_to_http_cache(
-    v: spider_remote_cache::HttpVersion,
-) -> http_cache::HttpVersion {
+fn remote_version_to_http_cache(v: spider_remote_cache::HttpVersion) -> http_cache::HttpVersion {
     match v {
         spider_remote_cache::HttpVersion::H2 => http_cache::HttpVersion::H2,
         spider_remote_cache::HttpVersion::H3 => http_cache::HttpVersion::H3,

@@ -16,8 +16,8 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use spider_remote_cache::{DumpJob, HybridCachePayload, HttpVersion};
 use spider_remote_cache::{build_payload, dump_batch_to_remote, dump_to_remote};
+use spider_remote_cache::{DumpJob, HttpVersion, HybridCachePayload};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -33,8 +33,7 @@ fn free_port() -> u16 {
 /// Returns `None` when the binary is not available (e.g. in CI),
 /// allowing tests to skip gracefully instead of panicking.
 fn server_binary() -> Option<PathBuf> {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let base = PathBuf::from(manifest_dir);
     let candidates = [
         base.join("../index_cache_server/target/release/hybrid_cache_server"),

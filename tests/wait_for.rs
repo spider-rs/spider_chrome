@@ -961,13 +961,10 @@ async fn wait_for_selector_none_timeout_finds_existing_element() {
         .expect("wait_for_navigation should succeed");
 
     // h1 exists on example.com — None timeout should still find it quickly.
-    let el = timeout(
-        Duration::from_secs(15),
-        page.wait_for_selector("h1", None),
-    )
-    .await
-    .expect("should not time out")
-    .expect("should find h1 with None timeout");
+    let el = timeout(Duration::from_secs(15), page.wait_for_selector("h1", None))
+        .await
+        .expect("should not time out")
+        .expect("should find h1 with None timeout");
 
     let text = timeout(Duration::from_secs(10), el.inner_text())
         .await
@@ -1075,11 +1072,7 @@ async fn handler_drain_budget_does_not_starve_other_pages() {
         async move {
             // Send many rapid evaluate calls to flood the handler channel.
             for i in 0..200 {
-                let _ = timeout(
-                    Duration::from_secs(5),
-                    page.evaluate(format!("1 + {i}")),
-                )
-                .await;
+                let _ = timeout(Duration::from_secs(5), page.evaluate(format!("1 + {i}"))).await;
             }
         }
     });
