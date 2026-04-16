@@ -1538,9 +1538,10 @@ impl NetworkManager {
             redirect_chain,
         );
 
-        self.requests.insert(event.request_id.clone(), request);
+        let rid = event.request_id.clone();
         self.queued_events
-            .push_back(NetworkEvent::Request(event.request_id.clone()));
+            .push_back(NetworkEvent::Request(rid.clone()));
+        self.requests.insert(rid, request);
     }
 
     /// Handle request redirect.

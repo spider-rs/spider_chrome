@@ -522,8 +522,9 @@ impl Handler {
             browser_ctx,
         );
 
-        self.target_ids.push(target.target_id().clone());
-        self.targets.insert(target.target_id().clone(), target);
+        let tid = target.target_id().clone();
+        self.target_ids.push(tid.clone());
+        self.targets.insert(tid, target);
     }
 
     /// A new session is attached to a target
