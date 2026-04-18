@@ -448,9 +448,10 @@ pub async fn spawn_response_cache_listener(
 fn headers_to_string_map(
     headers: &crate::cdp::browser_protocol::network::Headers,
 ) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+    let obj = headers.inner().as_object();
+    let mut out = HashMap::with_capacity(obj.map(|o| o.len()).unwrap_or(0));
 
-    if let Some(obj) = headers.inner().as_object() {
+    if let Some(obj) = obj {
         for (k, v) in obj {
             // CDP normally uses strings, but be safe:
             let val = if let Some(s) = v.as_str() {
@@ -1076,8 +1077,9 @@ async fn fetch_response_body_oneshot(
 
 /// Extract response headers from a `requestPaused` event into a HashMap.
 fn response_headers_from_event(ev: &EventRequestPaused) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    if let Some(ref headers) = ev.response_headers {
+    let headers = ev.response_headers.as_ref();
+    let mut map = HashMap::with_capacity(headers.map(|h| h.len()).unwrap_or(0));
+    if let Some(headers) = headers {
         for entry in headers {
             map.insert(entry.name.clone(), entry.value.clone());
         }
@@ -1087,8 +1089,9 @@ fn response_headers_from_event(ev: &EventRequestPaused) -> HashMap<String, Strin
 
 /// Extract request headers from a `requestPaused` event into a HashMap.
 fn request_headers_from_event(ev: &EventRequestPaused) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    if let Some(obj) = ev.request.headers.inner().as_object() {
+    let obj = ev.request.headers.inner().as_object();
+    let mut map = HashMap::with_capacity(obj.map(|o| o.len()).unwrap_or(0));
+    if let Some(obj) = obj {
         for (k, v) in obj {
             let val = if let Some(s) = v.as_str() {
                 s.to_string()

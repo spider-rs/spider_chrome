@@ -732,11 +732,9 @@ impl Handler {
                     while let Some(event) = target.advance(now) {
                         match event {
                             TargetEvent::Request(req) => {
-                                if let Ok(call_id) = ws_submit!(
-                                    req.method.clone(),
-                                    req.session_id,
-                                    req.params
-                                ) {
+                                if let Ok(call_id) =
+                                    ws_submit!(req.method.clone(), req.session_id, req.params)
+                                {
                                     self.pending_commands.insert(
                                         call_id,
                                         (
@@ -758,11 +756,9 @@ impl Handler {
                                         req.clone(),
                                         self.config.request_timeout,
                                     ));
-                                    if let Ok(call_id) = ws_submit!(
-                                        req.method.clone(),
-                                        req.session_id,
-                                        req.params
-                                    ) {
+                                    if let Ok(call_id) =
+                                        ws_submit!(req.method.clone(), req.session_id, req.params)
+                                    {
                                         self.pending_commands.insert(
                                             call_id,
                                             (PendingRequest::Navigate(nav_id), req.method, now),
@@ -788,11 +784,9 @@ impl Handler {
                                 }
                             }
                             TargetEvent::NavigationRequest(nav_id, req) => {
-                                if let Ok(call_id) = ws_submit!(
-                                    req.method.clone(),
-                                    req.session_id,
-                                    req.params
-                                ) {
+                                if let Ok(call_id) =
+                                    ws_submit!(req.method.clone(), req.session_id, req.params)
+                                {
                                     self.pending_commands.insert(
                                         call_id,
                                         (PendingRequest::Navigate(nav_id), req.method, now),

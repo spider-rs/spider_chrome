@@ -1,6 +1,6 @@
 [package]
 name = "chromey"
-version = "2.46.37"
+version = "2.46.38"
 rust-version = "1.70"
 authors = ["j-mendez <jeff@spider.cloud>"]
 edition = "2021"
@@ -192,3 +192,7 @@ harness = false
 name = "remote_cache_bench"
 harness = false
 required-features = ["cache"]
+
+[[bench]]
+name = "alloc_audit_bench"
+harness = false

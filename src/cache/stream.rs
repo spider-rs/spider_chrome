@@ -37,6 +37,15 @@ fn max_body_bytes() -> Option<usize> {
         .and_then(|v| v.parse().ok())
 }
 
+/// Hard cap for pre-allocation based on a remote-supplied `Content-Length`
+/// hint.  The hint comes from an HTTP response header and is therefore
+/// attacker-controlled; clamping it here prevents a malicious server from
+/// coercing a multi-GiB `Vec::with_capacity` before any bytes are read.
+/// The actual body can still grow past this via `push`, subject to
+/// `max_body_bytes()` enforcement in the read loop.
+#[cfg(not(feature = "_cache_stream_disk"))]
+const MAX_PREALLOC_BODY_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
 /// Base threshold (bytes) below which we skip streaming and let the
 /// `Network.getResponseBody` path handle the response.  This value is
 /// *lowered* dynamically as active page count rises — but only modestly,
@@ -281,10 +290,16 @@ async fn read_all_chunks(
     #[cfg(feature = "_cache_stream_disk")]
     let mut sink = ChunkSink::open_disk().await;
 
-    #[cfg(not(feature = "_cache_stream_disk"))]
-    let mut body = Vec::with_capacity(content_length_hint.unwrap_or(0));
-
     let cap = max_body_bytes();
+
+    #[cfg(not(feature = "_cache_stream_disk"))]
+    let mut body = {
+        // Clamp attacker-supplied Content-Length to the effective cap so a
+        // malicious `Content-Length: <huge>` cannot force a giant pre-alloc.
+        let prealloc_ceiling = cap.unwrap_or(MAX_PREALLOC_BODY_BYTES);
+        let capacity = content_length_hint.unwrap_or(0).min(prealloc_ceiling);
+        Vec::with_capacity(capacity)
+    };
     let mut total_bytes: usize = 0;
 
     // Reusable buffer for base64 decoding — avoids allocating a new Vec per chunk.
