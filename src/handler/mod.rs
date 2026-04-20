@@ -289,7 +289,7 @@ impl Handler {
                         self.config.created_first_target = true;
                     }
                 }
-                PendingRequest::ExternalCommand(tx) => {
+                PendingRequest::ExternalCommand { tx, .. } => {
                     let _ = tx.send(Ok(resp)).ok();
                 }
                 PendingRequest::InternalCommand(target_id) => {
@@ -312,12 +312,28 @@ impl Handler {
         msg: CommandMessage,
         now: Instant,
     ) -> Result<()> {
+        // Resolve session_id → target_id before `submit_command`
+        // consumes `msg.session_id`. `None` when the session hasn't
+        // landed in `self.sessions` yet; that command then relies on
+        // the normal request_timeout path if the target later crashes.
+        let target_id = msg
+            .session_id
+            .as_ref()
+            .and_then(|sid| self.sessions.get(sid.as_ref()))
+            .map(|s| s.target_id().clone());
         let call_id =
             self.conn()?
                 .submit_command(msg.method.clone(), msg.session_id, msg.params)?;
         self.pending_commands.insert(
             call_id,
-            (PendingRequest::ExternalCommand(msg.sender), msg.method, now),
+            (
+                PendingRequest::ExternalCommand {
+                    tx: msg.sender,
+                    target_id,
+                },
+                msg.method,
+                now,
+            ),
         );
         Ok(())
     }
@@ -465,6 +481,7 @@ impl Handler {
             CdpEvent::TargetTargetCreated(ref ev) => self.on_target_created((**ev).clone()),
             CdpEvent::TargetAttachedToTarget(ref ev) => self.on_attached_to_target(ev.clone()),
             CdpEvent::TargetTargetDestroyed(ref ev) => self.on_target_destroyed(ev.clone()),
+            CdpEvent::TargetTargetCrashed(ref ev) => self.on_target_crashed(ev.clone()),
             CdpEvent::TargetDetachedFromTarget(ref ev) => self.on_detached_from_target(ev.clone()),
             _ => {}
         }
@@ -560,6 +577,78 @@ impl Handler {
         }
     }
 
+    /// Fired when a target has crashed (`Target.targetCrashed`).
+    ///
+    /// Unlike `targetDestroyed` (clean teardown), a crash means any
+    /// in-flight commands on that target will never receive a
+    /// response. Without explicit cancellation those commands sit in
+    /// `pending_commands` until the `request_timeout` evicts them,
+    /// which surfaces to callers as long latency tails on what is
+    /// really an immediate failure.
+    ///
+    /// Cancellation policy:
+    /// * `ExternalCommand { target_id: Some(crashed), .. }` — the
+    ///   caller's oneshot resolves with an error carrying the
+    ///   termination `status` + `errorCode` from the crash event.
+    /// * `InternalCommand(crashed)` — dropped silently; these are
+    ///   target-init commands whose caller is the target itself,
+    ///   which we're about to remove.
+    /// * `ExternalCommand { target_id: None, .. }` — left alone;
+    ///   browser-level or pre-attach-race commands aren't bound to
+    ///   this target.
+    /// * `Navigate(_)` and entries in `self.navigations` — left to
+    ///   the normal timeout path; `on_navigation_response` drops
+    ///   late responses once the target is removed below.
+    fn on_target_crashed(&mut self, event: EventTargetCrashed) {
+        let crashed_id = event.target_id.clone();
+        let status = event.status.clone();
+        let error_code = event.error_code;
+
+        // Two-pass cancellation: collect matching call-ids, then
+        // remove + signal. Can't signal inside `iter()` because
+        // `OneshotSender::send` consumes the sender, and the
+        // borrow checker disallows taking ownership from inside
+        // the iterator.
+        let to_cancel: Vec<CallId> = self
+            .pending_commands
+            .iter()
+            .filter_map(|(&call_id, (req, _, _))| match req {
+                PendingRequest::ExternalCommand {
+                    target_id: Some(tid),
+                    ..
+                } if *tid == crashed_id => Some(call_id),
+                PendingRequest::InternalCommand(tid) if *tid == crashed_id => Some(call_id),
+                _ => None,
+            })
+            .collect();
+
+        for call_id in to_cancel {
+            if let Some((req, _, _)) = self.pending_commands.remove(&call_id) {
+                match req {
+                    PendingRequest::ExternalCommand { tx, .. } => {
+                        let _ = tx.send(Err(CdpError::msg(format!(
+                            "target {:?} crashed: {} (errorCode={})",
+                            crashed_id, status, error_code
+                        ))));
+                    }
+                    PendingRequest::InternalCommand(_) => {
+                        // Target-init command — the target is gone,
+                        // nobody is waiting on a user-facing reply.
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Same map cleanup as `on_target_destroyed`.
+        self.attached_targets.remove(&crashed_id);
+        if let Some(target) = self.targets.remove(&crashed_id) {
+            if let Some(session) = target.session_id() {
+                self.sessions.remove(session);
+            }
+        }
+    }
+
     /// House keeping of commands
     ///
     /// Remove all commands where `now` > `timestamp of command starting point +
@@ -595,7 +684,7 @@ impl Handler {
                             }
                         }
                     }
-                    PendingRequest::ExternalCommand(tx) => {
+                    PendingRequest::ExternalCommand { tx, .. } => {
                         let _ = tx.send(Err(CdpError::Timeout));
                     }
                     PendingRequest::InternalCommand(_) => {}
@@ -773,10 +862,17 @@ impl Handler {
                                     msg.session_id.map(Into::into),
                                     msg.params
                                 ) {
+                                    // `target` is in scope here, so bind
+                                    // the pending command to its target_id
+                                    // directly.
+                                    let target_id = Some(target.target_id().clone());
                                     self.pending_commands.insert(
                                         call_id,
                                         (
-                                            PendingRequest::ExternalCommand(msg.sender),
+                                            PendingRequest::ExternalCommand {
+                                                tx: msg.sender,
+                                                target_id,
+                                            },
                                             msg.method,
                                             now,
                                         ),
@@ -835,6 +931,13 @@ impl Handler {
                         Some(msg) => {
                             match msg {
                                 HandlerMessage::Command(cmd) => {
+                                    // See `submit_external_command` for
+                                    // the session_id → target_id resolve.
+                                    let target_id = cmd
+                                        .session_id
+                                        .as_ref()
+                                        .and_then(|sid| self.sessions.get(sid.as_ref()))
+                                        .map(|s| s.target_id().clone());
                                     if let Ok(call_id) = ws_submit!(
                                         cmd.method.clone(),
                                         cmd.session_id.map(Into::into),
@@ -842,7 +945,14 @@ impl Handler {
                                     ) {
                                         self.pending_commands.insert(
                                             call_id,
-                                            (PendingRequest::ExternalCommand(cmd.sender), cmd.method, now),
+                                            (
+                                                PendingRequest::ExternalCommand {
+                                                    tx: cmd.sender,
+                                                    target_id,
+                                                },
+                                                cmd.method,
+                                                now,
+                                            ),
                                         );
                                     }
                                 }
@@ -1360,7 +1470,17 @@ enum PendingRequest {
     /// loading, which comes after the response.
     Navigate(NavigationId),
     /// A common request received via a channel (`Page`).
-    ExternalCommand(OneshotSender<Result<Response>>),
+    ///
+    /// `target_id` is resolved at submit time from the caller's
+    /// `session_id` against `self.sessions`, so `on_target_crashed`
+    /// can cancel in-flight user commands immediately. `None` when
+    /// the command has no session (browser-level) or was sent
+    /// before the attach event arrived — those fall back to the
+    /// normal `request_timeout` eviction.
+    ExternalCommand {
+        tx: OneshotSender<Result<Response>>,
+        target_id: Option<TargetId>,
+    },
     /// Requests that are initiated directly from a `Target` (all the
     /// initialization commands).
     InternalCommand(TargetId),
