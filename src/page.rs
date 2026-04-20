@@ -42,7 +42,9 @@ use crate::handler::commandfuture::CommandFuture;
 use crate::handler::httpfuture::HttpFuture;
 use crate::handler::target::{GetName, GetParent, GetUrl, TargetMessage};
 use crate::handler::PageInner;
-use crate::javascript::extract::{generate_marker_js, FULL_XML_SERIALIZER_JS, OUTER_HTML};
+use crate::javascript::extract::{
+    generate_marker_js, FULL_XML_SERIALIZER_JS, OUTER_HTML, OUTER_HTML_BYTE_LEN, OUTER_HTML_LEN,
+};
 use crate::js::{Evaluation, EvaluationResult};
 use crate::layout::{Delta, Point, ScrollBehavior};
 use crate::listeners::{EventListenerRequest, EventStream};
@@ -3274,6 +3276,28 @@ impl Page {
     /// Returns the HTML content of the page
     pub async fn content_bytes(&self) -> Result<Vec<u8>> {
         Ok(self.evaluate(OUTER_HTML).await?.into_bytes()?)
+    }
+
+    /// Returns the UTF-16 code-unit length of the serialized page HTML —
+    /// the same measure tracked by
+    /// [`content_stream::MAX_DOCUMENT_UNITS`].  Cheap: one
+    /// `Runtime.evaluate` that yields a primitive `Number`, so no
+    /// `RemoteObjectId` is retained and no content bytes are shipped
+    /// back to Rust.
+    ///
+    /// Use this to preflight whether a page is safe to buffer before
+    /// calling [`Page::content`] or [`Page::content_bytes`].
+    ///
+    /// [`content_stream::MAX_DOCUMENT_UNITS`]: crate::content_stream::MAX_DOCUMENT_UNITS
+    pub async fn content_length(&self) -> Result<u64> {
+        Ok(self.evaluate(OUTER_HTML_LEN).await?.into_value()?)
+    }
+
+    /// Returns the UTF-8 byte length of the serialized page HTML —
+    /// HTTP `Content-Length` semantics.  Computed inside V8 via `Blob`
+    /// so the encoded bytes never leave the page.
+    pub async fn content_byte_length(&self) -> Result<u64> {
+        Ok(self.evaluate(OUTER_HTML_BYTE_LEN).await?.into_value()?)
     }
 
     /// Streams the HTML content of the page in fixed-size chunks.
