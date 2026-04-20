@@ -3276,6 +3276,73 @@ impl Page {
         Ok(self.evaluate(OUTER_HTML).await?.into_bytes()?)
     }
 
+    /// Streams the HTML content of the page in fixed-size chunks.
+    ///
+    /// When the document is below the adaptive streaming threshold (scales
+    /// with active page count), this falls back to the single-shot
+    /// [`Page::content`] path.  Above the threshold the HTML is UTF-8 encoded
+    /// inside the page and pulled over multiple `Runtime.evaluate` calls so
+    /// that peak Rust-side memory stays at ~64 KiB per chunk.  With the
+    /// `_cache_stream_disk` feature enabled, chunks spill to a temp file and
+    /// fall back to memory on any I/O error.
+    pub async fn content_streaming(&self) -> Result<String> {
+        crate::content_stream::content_streaming(self).await
+    }
+
+    /// Streaming variant of [`Page::content_bytes`].  See
+    /// [`Page::content_streaming`] for behavior.
+    ///
+    /// Guardrails: documents exceeding
+    /// [`content_stream::MAX_DOCUMENT_UNITS`] are rejected before
+    /// streaming; accumulated bytes are capped at
+    /// [`content_stream::DEFAULT_MAX_ACCUMULATED_BYTES`] (override with the
+    /// `CHROMEY_CONTENT_STREAM_MAX_BYTES` env var).
+    ///
+    /// [`content_stream::MAX_DOCUMENT_UNITS`]: crate::content_stream::MAX_DOCUMENT_UNITS
+    /// [`content_stream::DEFAULT_MAX_ACCUMULATED_BYTES`]: crate::content_stream::DEFAULT_MAX_ACCUMULATED_BYTES
+    pub async fn content_bytes_streaming(&self) -> Result<Vec<u8>> {
+        crate::content_stream::content_bytes_streaming(self).await
+    }
+
+    /// Pump-style async [`Stream`] of the page HTML — yields each chunk of
+    /// UTF-8 bytes as Chrome returns it, without accumulating into a `Vec`.
+    ///
+    /// `chunk_units` optionally caps how many UTF-16 code units the page
+    /// slices per round-trip.  `None` uses
+    /// [`content_stream::DEFAULT_CHUNK_UNITS`] (`65_536` = 64 Ki);
+    /// `Some(n)` pins every slice call to at most `n` units, clamped into
+    /// `[`[`content_stream::MIN_CHUNK_UNITS`]` (1024),
+    /// `[`content_stream::MAX_CHUNK_UNITS`]` (4_194_304)]`.
+    ///
+    /// Drop the stream early (cancellation, `StreamExt::take`, `break`) to
+    /// stop pulling chunks; the V8 wrapper's `RemoteObjectId` is enqueued
+    /// for release via the batched worker on the stream's `Drop`.
+    ///
+    /// Guardrail: a document exceeding
+    /// [`content_stream::MAX_DOCUMENT_UNITS`] UTF-16 code units yields an
+    /// error on first poll rather than beginning the stream.
+    ///
+    /// [`Stream`]: futures_util::Stream
+    /// [`content_stream::DEFAULT_CHUNK_UNITS`]: crate::content_stream::DEFAULT_CHUNK_UNITS
+    /// [`content_stream::MIN_CHUNK_UNITS`]: crate::content_stream::MIN_CHUNK_UNITS
+    /// [`content_stream::MAX_CHUNK_UNITS`]: crate::content_stream::MAX_CHUNK_UNITS
+    /// [`content_stream::MAX_DOCUMENT_UNITS`]: crate::content_stream::MAX_DOCUMENT_UNITS
+    pub fn content_bytes_stream(
+        &self,
+        chunk_units: Option<u32>,
+    ) -> impl futures_util::Stream<Item = Result<Vec<u8>>> + Send + 'static {
+        crate::content_stream::content_bytes_stream(self, chunk_units)
+    }
+
+    /// [`Page::content_bytes_stream`] but each yielded chunk is validated
+    /// and returned as a `String`.
+    pub fn content_stream(
+        &self,
+        chunk_units: Option<u32>,
+    ) -> impl futures_util::Stream<Item = Result<String>> + Send + 'static {
+        crate::content_stream::content_stream(self, chunk_units)
+    }
+
     /// Returns the full serialized content of the page (HTML or XML)
     pub async fn content_bytes_xml(&self) -> Result<Vec<u8>> {
         Ok(self.evaluate(FULL_XML_SERIALIZER_JS).await?.into_bytes()?)

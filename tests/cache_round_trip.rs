@@ -165,7 +165,7 @@ async fn test_dump_and_seed_round_trip() {
         "text/html; charset=utf-8".to_string(),
     );
 
-    let http_version = HttpVersion::Http11;
+    let http_version = spider_remote_cache::HttpVersion::Http11;
 
     // --- Step 1: Dump to the mock server ---
     dump_to_remote_cache_parts(
@@ -270,7 +270,7 @@ async fn test_dump_multiple_resources_same_site() {
         200,
         &HashMap::new(),
         &html_resp_headers,
-        &HttpVersion::Http11,
+        &spider_remote_cache::HttpVersion::Http11,
         Some(&base_url),
     )
     .await;
@@ -290,7 +290,7 @@ async fn test_dump_multiple_resources_same_site() {
         200,
         &HashMap::new(),
         &css_resp_headers,
-        &HttpVersion::Http11,
+        &spider_remote_cache::HttpVersion::Http11,
         Some(&base_url),
     )
     .await;
@@ -313,7 +313,7 @@ async fn test_dump_multiple_resources_same_site() {
         200,
         &HashMap::new(),
         &js_resp_headers,
-        &HttpVersion::Http11,
+        &spider_remote_cache::HttpVersion::Http11,
         Some(&base_url),
     )
     .await;
@@ -373,7 +373,7 @@ async fn test_dump_with_auth() {
         200,
         &HashMap::new(),
         &response_headers,
-        &HttpVersion::H2,
+        &spider_remote_cache::HttpVersion::H2,
         Some(&base_url),
     )
     .await;
@@ -427,7 +427,7 @@ async fn test_dump_empty_body_skipped() {
         200,
         &HashMap::new(),
         &HashMap::new(),
-        &HttpVersion::Http11,
+        &spider_remote_cache::HttpVersion::Http11,
         Some(&base_url),
     )
     .await;
@@ -503,7 +503,7 @@ async fn test_binary_body_round_trip() {
         200,
         &HashMap::new(),
         &response_headers,
-        &HttpVersion::Http11,
+        &spider_remote_cache::HttpVersion::Http11,
         Some(&base_url),
     )
     .await;
@@ -551,7 +551,7 @@ async fn test_dump_worker_queue_end_to_end() {
         request_headers: HashMap::new(),
         response_headers,
         body: body.clone(),
-        http_version: HttpVersion::Http11,
+        http_version: spider_remote_cache::HttpVersion::Http11,
         dump_remote: Some(base_url.clone()),
     };
 
@@ -670,7 +670,7 @@ async fn test_cache_policy_uses_correct_headers() {
         200,
         &request_headers,
         &response_headers,
-        &HttpVersion::Http11,
+        &spider_remote_cache::HttpVersion::Http11,
         Some(&base_url),
     )
     .await;

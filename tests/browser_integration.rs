@@ -754,3 +754,393 @@ async fn goto_cross_origin_redirect_url_loads() {
         }
     }
 }
+
+/// Streaming `content` on a small page should match the one-shot result.
+/// This exercises the fast path (below the streaming threshold).
+#[tokio::test]
+async fn content_streaming_matches_content_small() {
+    let Some(_) = try_browser_config() else {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    };
+
+    let browser = launch_with_handler(browser_like_config("content-stream-small")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page timeout")
+        .expect("new_page failed");
+
+    let html = "<html><head><title>s</title></head><body><p>hello</p><p>world</p></body></html>";
+    page.set_content(html).await.expect("set_content");
+
+    let one_shot = page.content().await.expect("content");
+    let streamed = page.content_streaming().await.expect("content_streaming");
+
+    assert_eq!(
+        one_shot, streamed,
+        "streaming content must match single-shot content"
+    );
+    assert!(streamed.contains("<p>hello</p>"));
+}
+
+/// Streaming `content` on a page large enough to exceed the streaming
+/// threshold (2 MiB under low page count).  Exercises the actual chunked
+/// read loop end-to-end and verifies round-trip byte equality against the
+/// single-shot `content()` call.
+#[tokio::test]
+async fn content_streaming_matches_content_large() {
+    let Some(_) = try_browser_config() else {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    };
+
+    let browser = launch_with_handler(browser_like_config("content-stream-large")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page timeout")
+        .expect("new_page failed");
+
+    // Build ~2.5 MiB of HTML body to exceed the 2 MiB streaming threshold.
+    // 64 chars per <p> × ~40_000 paragraphs ≈ 2.56 MiB.
+    let mut body = String::with_capacity(3 * 1024 * 1024);
+    body.push_str("<html><head><title>large</title></head><body>");
+    for i in 0..40_000_u32 {
+        // Roughly 64 bytes per iteration.
+        body.push_str("<p>line-");
+        body.push_str(&format!("{i:08}"));
+        body.push_str(" lorem ipsum dolor sit amet consectetur adipis</p>");
+    }
+    body.push_str("</body></html>");
+
+    assert!(
+        body.len() > 2 * 1024 * 1024,
+        "test payload should exceed streaming threshold (got {} bytes)",
+        body.len()
+    );
+
+    timeout(Duration::from_secs(30), page.set_content(&body))
+        .await
+        .expect("set_content timeout")
+        .expect("set_content failed");
+
+    let one_shot = timeout(Duration::from_secs(60), page.content())
+        .await
+        .expect("content timeout")
+        .expect("content failed");
+
+    let streamed = timeout(Duration::from_secs(120), page.content_streaming())
+        .await
+        .expect("content_streaming timeout")
+        .expect("content_streaming failed");
+
+    assert_eq!(
+        one_shot.len(),
+        streamed.len(),
+        "streaming and one-shot content lengths must match"
+    );
+    assert_eq!(
+        one_shot, streamed,
+        "streaming content must match single-shot content byte-for-byte"
+    );
+
+    // Sanity check: we really crossed the threshold and got the expected tail.
+    assert!(
+        streamed.len() > 2 * 1024 * 1024,
+        "streamed HTML should be larger than threshold"
+    );
+    assert!(streamed.contains("line-00039999"));
+}
+
+/// Kicks off many `content_streaming` calls concurrently on the same page
+/// so the release batcher sees multiple `RemoteObjectId`s queued nearly
+/// simultaneously.  Verifies every stream returns the same bytes as a
+/// single-shot `content()` and that no deadlock occurs.
+#[tokio::test]
+async fn content_streaming_concurrent_releases() {
+    let Some(_) = try_browser_config() else {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    };
+
+    let browser = launch_with_handler(browser_like_config("content-stream-concurrent")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page timeout")
+        .expect("new_page failed");
+
+    let html = "<html><head><title>c</title></head><body><p>hello world</p></body></html>";
+    page.set_content(html).await.expect("set_content");
+
+    let expected = page.content().await.expect("content");
+
+    // 16 concurrent streams ≥ any reasonable batch fill.
+    let mut handles = Vec::new();
+    for _ in 0..16_u32 {
+        let p = page.clone();
+        handles.push(tokio::spawn(async move { p.content_streaming().await }));
+    }
+
+    for h in handles {
+        let got = timeout(Duration::from_secs(30), h)
+            .await
+            .expect("stream timeout")
+            .expect("stream join")
+            .expect("stream call");
+        assert_eq!(got, expected);
+    }
+
+    // Give the batcher a moment to drain so leak-detection style checks
+    // would pass; functional correctness is already asserted above.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// Pump-style `content_bytes_stream`: concatenating all yielded chunks
+/// must equal `content()` byte-for-byte, and the stream must yield at
+/// least two chunks for a >2 MiB document (i.e. the pump actually pumps).
+#[tokio::test]
+async fn content_bytes_stream_matches_content_large() {
+    let Some(_) = try_browser_config() else {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    };
+
+    let browser = launch_with_handler(browser_like_config("content-pump-large")).await;
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page timeout")
+        .expect("new_page failed");
+
+    // Build ~2.5 MiB of HTML body to exceed the streaming threshold.
+    let mut body = String::with_capacity(3 * 1024 * 1024);
+    body.push_str("<html><head><title>pump</title></head><body>");
+    for i in 0..40_000_u32 {
+        body.push_str("<p>line-");
+        body.push_str(&format!("{i:08}"));
+        body.push_str(" lorem ipsum dolor sit amet consectetur adipis</p>");
+    }
+    body.push_str("</body></html>");
+    assert!(body.len() > 2 * 1024 * 1024);
+
+    timeout(Duration::from_secs(30), page.set_content(&body))
+        .await
+        .expect("set_content timeout")
+        .expect("set_content failed");
+
+    let expected = timeout(Duration::from_secs(60), page.content())
+        .await
+        .expect("content timeout")
+        .expect("content failed");
+
+    let mut stream = Box::pin(page.content_bytes_stream(None));
+    let mut buf: Vec<u8> = Vec::with_capacity(expected.len());
+    let mut chunks: u32 = 0;
+    while let Some(item) = timeout(Duration::from_secs(60), stream.next())
+        .await
+        .expect("pump next timeout")
+    {
+        let chunk = item.expect("chunk error");
+        assert!(!chunk.is_empty(), "pump yielded empty chunk");
+        buf.extend_from_slice(&chunk);
+        chunks += 1;
+    }
+
+    assert!(
+        chunks >= 2,
+        "pump should yield more than one chunk for >2 MiB document, got {chunks}"
+    );
+    assert_eq!(buf.len(), expected.len(), "pump length mismatch");
+    assert_eq!(buf, expected.as_bytes(), "pump bytes differ from content()");
+}
+
+/// A small caller-supplied `chunk_units` override must yield many small
+/// chunks and still reassemble to the full document byte-for-byte.
+#[tokio::test]
+async fn content_bytes_stream_custom_chunk_size() {
+    let Some(_) = try_browser_config() else {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    };
+
+    let browser = launch_with_handler(browser_like_config("content-pump-chunk")).await;
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page timeout")
+        .expect("new_page failed");
+
+    // ~200 KiB document — easily fits in one default chunk, but a tiny
+    // override forces many chunks.
+    let mut body = String::with_capacity(256 * 1024);
+    body.push_str("<html><body>");
+    for i in 0..4_000_u32 {
+        body.push_str("<p>line-");
+        body.push_str(&format!("{i:08}"));
+        body.push_str("</p>");
+    }
+    body.push_str("</body></html>");
+
+    timeout(Duration::from_secs(15), page.set_content(&body))
+        .await
+        .expect("set_content timeout")
+        .expect("set_content failed");
+
+    let expected = page.content().await.expect("content");
+    let expected_bytes = expected.as_bytes();
+
+    // 2 KiB UTF-16 units per chunk = at least 100 round-trips for 200 KiB.
+    let chunk_units = 2_048_u32;
+    let mut stream = Box::pin(page.content_bytes_stream(Some(chunk_units)));
+    let mut buf: Vec<u8> = Vec::with_capacity(expected_bytes.len());
+    let mut chunks: u32 = 0;
+    let mut max_chunk_bytes: usize = 0;
+    while let Some(item) = timeout(Duration::from_secs(30), stream.next())
+        .await
+        .expect("pump next timeout")
+    {
+        let chunk = item.expect("chunk error");
+        max_chunk_bytes = max_chunk_bytes.max(chunk.len());
+        buf.extend_from_slice(&chunk);
+        chunks += 1;
+    }
+
+    assert_eq!(buf, expected_bytes, "custom-chunk pump bytes differ");
+    assert!(
+        chunks >= 10,
+        "small chunk_units should produce many chunks, got {chunks}"
+    );
+    // Each chunk is at most `chunk_units` UTF-16 code units → at most
+    // 3×chunk_units bytes in UTF-8 (worst case for BMP).
+    assert!(
+        max_chunk_bytes <= (chunk_units as usize) * 3,
+        "chunk exceeded expected byte ceiling: {max_chunk_bytes}"
+    );
+}
+
+/// DoS guardrail: when the accumulated-bytes env override is set below the
+/// actual document size, `content_bytes_streaming` returns an error
+/// instead of allocating the full document.  The pump API (which does not
+/// enforce the cap) should still succeed on the same page.
+#[tokio::test]
+async fn content_streaming_accumulated_bytes_cap() {
+    let Some(_) = try_browser_config() else {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    };
+
+    let browser = launch_with_handler(browser_like_config("content-stream-cap")).await;
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page timeout")
+        .expect("new_page failed");
+
+    // >2 MiB document so streaming path triggers for the accumulating API.
+    let mut body = String::with_capacity(3 * 1024 * 1024);
+    body.push_str("<html><body>");
+    for i in 0..40_000_u32 {
+        body.push_str("<p>line-");
+        body.push_str(&format!("{i:08}"));
+        body.push_str(" lorem ipsum dolor sit amet consectetur adipis</p>");
+    }
+    body.push_str("</body></html>");
+
+    timeout(Duration::from_secs(30), page.set_content(&body))
+        .await
+        .expect("set_content timeout")
+        .expect("set_content failed");
+
+    // SAFETY: env vars are process-wide; this test sets a small cap then
+    // restores it.  Serialising via a dedicated test process would be
+    // cleaner, but for now this is the lowest-friction path.
+    let prev = std::env::var("CHROMEY_CONTENT_STREAM_MAX_BYTES").ok();
+    // SAFETY: setting env vars is safe in single-threaded test tokio contexts.
+    unsafe {
+        std::env::set_var("CHROMEY_CONTENT_STREAM_MAX_BYTES", "1048576");
+    }
+
+    let result = timeout(Duration::from_secs(60), page.content_bytes_streaming()).await;
+
+    // Restore env var before asserting so a failure doesn't leak.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("CHROMEY_CONTENT_STREAM_MAX_BYTES", v),
+            None => std::env::remove_var("CHROMEY_CONTENT_STREAM_MAX_BYTES"),
+        }
+    }
+
+    let err = result
+        .expect("content_bytes_streaming should not hang")
+        .expect_err("should error out at the accumulated-bytes cap");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("accumulated bytes exceeded cap"),
+        "unexpected error message: {msg}"
+    );
+
+    // Pump API is not capped — it must still complete.
+    let mut stream = Box::pin(page.content_bytes_stream(None));
+    let mut total: usize = 0;
+    while let Some(item) = timeout(Duration::from_secs(30), stream.next())
+        .await
+        .expect("pump next timeout")
+    {
+        total += item.expect("chunk error").len();
+    }
+    assert!(
+        total > 2 * 1024 * 1024,
+        "pump should have completed despite cap being set (total={total})"
+    );
+}
+
+/// Dropping the pump stream early must not leak, hang, or double-release.
+/// We take just the first two chunks and drop — the release guard should
+/// enqueue cleanup via the batching worker.
+#[tokio::test]
+async fn content_bytes_stream_early_drop() {
+    let Some(_) = try_browser_config() else {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    };
+
+    let browser = launch_with_handler(browser_like_config("content-pump-drop")).await;
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page timeout")
+        .expect("new_page failed");
+
+    // Large enough to require multiple chunks.
+    let mut body = String::with_capacity(3 * 1024 * 1024);
+    body.push_str("<html><body>");
+    for i in 0..40_000_u32 {
+        body.push_str("<p>line-");
+        body.push_str(&format!("{i:08}"));
+        body.push_str(" lorem ipsum dolor sit amet</p>");
+    }
+    body.push_str("</body></html>");
+
+    timeout(Duration::from_secs(30), page.set_content(&body))
+        .await
+        .expect("set_content timeout")
+        .expect("set_content failed");
+
+    {
+        let mut stream = Box::pin(page.content_bytes_stream(None));
+        for _ in 0..2_u32 {
+            let _ = timeout(Duration::from_secs(30), stream.next())
+                .await
+                .expect("pump next timeout");
+        }
+        // stream drops here — releases the V8 remote ref via the batcher.
+    }
+
+    // Follow-up: the page should still be usable after early drop.
+    let html = timeout(Duration::from_secs(15), page.content())
+        .await
+        .expect("content timeout")
+        .expect("content failed");
+    assert!(
+        html.len() > 1024,
+        "page should still be readable after early stream drop"
+    );
+}
