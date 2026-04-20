@@ -626,29 +626,145 @@ fn max_accumulated_bytes() -> usize {
 /// - 3-byte sequence (U+0800..U+FFFF) → 1 code unit
 /// - 4-byte sequence (U+10000..U+10FFFF) → 2 code units (surrogate pair)
 ///
-/// We walk only the *lead* bytes of each UTF-8 sequence, which is branch-
-/// prediction friendly and roughly memory-bandwidth bound.
+/// Identity: `units = total_bytes − continuation_bytes + four_byte_leads`.
+/// Each continuation byte (`0b10xx_xxxx`) contributes 0, every other byte
+/// contributes 1, and 4-byte leads (`0b1111_0xxx`, i.e. `>= 0xF0`) contribute
+/// one extra for the low surrogate.
+///
+/// The hot loop uses SWAR — 8 bytes per iteration via `u64` words and
+/// Mycroft's zero-byte-detection trick — then a scalar tail for the remainder.
+/// No `unsafe`, no panics: saturating arithmetic on the outer accumulator and
+/// a final `min(u32::MAX)` clamp.
 #[inline]
 fn utf16_len_of_utf8(bytes: &[u8]) -> u32 {
-    let mut units: u32 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let (adv, u) = if b < 0x80 {
-            (1, 1)
-        } else if b < 0xC0 {
-            // Continuation byte encountered out of sequence — input is not
-            // valid UTF-8.  Skip one byte defensively.
-            (1, 0)
-        } else if b < 0xE0 {
-            (2, 1)
-        } else if b < 0xF0 {
-            (3, 1)
-        } else {
-            (4, 2)
-        };
-        i += adv;
-        units = units.saturating_add(u);
+    let total = bytes.len();
+
+    // Word-parallel counts.  Using `u64` accumulators so we can't overflow a
+    // single chunk's count (max 8 per word) regardless of input length.
+    let mut cont: u64 = 0;
+    let mut four: u64 = 0;
+
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        // chunks_exact guarantees the slice is exactly 8 bytes long, so the
+        // array conversion is infallible — no panic path.
+        let arr: [u8; 8] = [
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ];
+        let w = u64::from_ne_bytes(arr);
+
+        // Continuation: `(b & 0xC0) == 0x80` — high two bits are `10`.
+        // Zero-lane iff the byte is a continuation.
+        let cont_mask = (w & 0xC0C0_C0C0_C0C0_C0C0) ^ 0x8080_8080_8080_8080;
+        cont = cont.wrapping_add(count_zero_bytes_u64(cont_mask) as u64);
+
+        // 4-byte lead: `b >= 0xF0` — high four bits are `1111`.
+        // Zero-lane iff the byte has all four high bits set.
+        let four_mask = (w & 0xF0F0_F0F0_F0F0_F0F0) ^ 0xF0F0_F0F0_F0F0_F0F0;
+        four = four.wrapping_add(count_zero_bytes_u64(four_mask) as u64);
     }
-    units
+
+    // Scalar tail (<8 bytes).
+    for &b in chunks.remainder() {
+        if (b & 0xC0) == 0x80 {
+            cont += 1;
+        }
+        if b >= 0xF0 {
+            four += 1;
+        }
+    }
+
+    // units = total − cont + four.  Compute in u64 then clamp to u32.
+    let units = (total as u64).saturating_sub(cont).saturating_add(four);
+    units.min(u32::MAX as u64) as u32
+}
+
+/// Count bytes whose lane value is zero inside a `u64` word.
+///
+/// Classic Mycroft / Alan Mycroft's "zero byte" bit trick:
+/// - `v.wrapping_sub(0x01)` underflows only in zero lanes,
+/// - `!v` isolates the zero lanes,
+/// - the final `0x80…` mask keeps only the high bit of each flagged lane.
+///
+/// `count_ones` then gives the number of zero bytes.  Branchless, no
+/// panics, portable across architectures — and LLVM lowers it to `popcnt`
+/// on x86-64 / AArch64 where available.
+#[inline(always)]
+fn count_zero_bytes_u64(v: u64) -> u32 {
+    let mask = v.wrapping_sub(0x0101_0101_0101_0101) & !v & 0x8080_8080_8080_8080;
+    mask.count_ones()
+}
+
+#[cfg(test)]
+mod utf16_len_tests {
+    use super::utf16_len_of_utf8;
+
+    #[test]
+    fn empty() {
+        assert_eq!(utf16_len_of_utf8(b""), 0);
+    }
+
+    #[test]
+    fn pure_ascii_short() {
+        assert_eq!(utf16_len_of_utf8(b"hello"), 5);
+    }
+
+    #[test]
+    fn pure_ascii_multi_word() {
+        // 24 ASCII bytes → exactly 3 u64 words, zero tail.
+        let s = b"abcdefghijklmnopqrstuvwx";
+        assert_eq!(utf16_len_of_utf8(s), 24);
+    }
+
+    #[test]
+    fn ascii_with_tail() {
+        // 11 bytes → 1 word + 3-byte tail.
+        let s = b"hello world";
+        assert_eq!(utf16_len_of_utf8(s), 11);
+    }
+
+    #[test]
+    fn two_byte_sequences() {
+        // U+00E9 "é" = 2 UTF-8 bytes, 1 UTF-16 unit.
+        let s = "éééééééé".as_bytes(); // 8 chars * 2 bytes = 16 bytes (2 words)
+        assert_eq!(s.len(), 16);
+        assert_eq!(utf16_len_of_utf8(s), 8);
+    }
+
+    #[test]
+    fn three_byte_sequences() {
+        // U+20AC "€" = 3 UTF-8 bytes, 1 UTF-16 unit.
+        let s = "€€€€€".as_bytes(); // 5 chars * 3 bytes = 15 bytes (1 word + tail)
+        assert_eq!(s.len(), 15);
+        assert_eq!(utf16_len_of_utf8(s), 5);
+    }
+
+    #[test]
+    fn four_byte_sequences() {
+        // U+1F600 "😀" = 4 UTF-8 bytes, 2 UTF-16 units (surrogate pair).
+        let s = "😀😀😀".as_bytes(); // 3 chars * 4 bytes = 12 bytes (1 word + 4-byte tail)
+        assert_eq!(s.len(), 12);
+        assert_eq!(utf16_len_of_utf8(s), 6);
+    }
+
+    #[test]
+    fn mixed_matches_std() {
+        let s = "<p>héllo 世界 🌍</p>";
+        let expected: u32 = s.encode_utf16().count() as u32;
+        assert_eq!(utf16_len_of_utf8(s.as_bytes()), expected);
+    }
+
+    #[test]
+    fn large_ascii_matches_std() {
+        let s: String = "abcdefghij".repeat(1024);
+        let expected: u32 = s.encode_utf16().count() as u32;
+        assert_eq!(utf16_len_of_utf8(s.as_bytes()), expected);
+    }
+
+    #[test]
+    fn large_mixed_matches_std() {
+        let s: String = "a€b😀c".repeat(512);
+        let expected: u32 = s.encode_utf16().count() as u32;
+        assert_eq!(utf16_len_of_utf8(s.as_bytes()), expected);
+    }
 }
