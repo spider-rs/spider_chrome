@@ -1,6 +1,6 @@
 [package]
 name = "chromey"
-version = "2.46.40"
+version = "2.46.41"
 rust-version = "1.70"
 authors = ["j-mendez <jeff@spider.cloud>"]
 edition = "2021"
@@ -195,4 +195,12 @@ required-features = ["cache"]
 
 [[bench]]
 name = "alloc_audit_bench"
+harness = false
+
+[[bench]]
+name = "content_stream_simd"
+harness = false
+
+[[bench]]
+name = "runtime_release_bench"
 harness = false

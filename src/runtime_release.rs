@@ -52,19 +52,12 @@ fn spawn_worker() -> mpsc::UnboundedSender<(Page, RemoteObjectId)> {
     tokio::spawn(async move {
         let mut batch: Vec<(Page, RemoteObjectId)> = Vec::with_capacity(MAX_BATCH);
         loop {
-            // Block until at least one release shows up.
-            let first = match rx.recv().await {
-                Some(v) => v,
-                None => break, // channel closed — no more producers
-            };
-            batch.push(first);
-
-            // Drain up to MAX_BATCH-1 more without waiting.
-            while batch.len() < MAX_BATCH {
-                match rx.try_recv() {
-                    Ok(v) => batch.push(v),
-                    Err(_) => break,
-                }
+            // `recv_many` awaits at least one item and then drains up to
+            // `limit` without additional awaits — single atomic drain
+            // rather than the `recv + N×try_recv` CAS loop.
+            let n = rx.recv_many(&mut batch, MAX_BATCH).await;
+            if n == 0 {
+                break; // channel closed — no more producers
             }
 
             // Fire all release commands concurrently.  Each `page.execute`
