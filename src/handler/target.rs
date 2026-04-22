@@ -164,6 +164,7 @@ impl Target {
 
         network_manager.set_request_interception(config.request_intercept);
         network_manager.max_bytes_allowed = config.max_bytes_allowed;
+        network_manager.max_redirects = config.max_redirects;
 
         if let Some(headers) = &config.extra_headers {
             network_manager.set_extra_headers(headers.clone());
@@ -1372,6 +1373,9 @@ pub struct TargetConfig {
     /// The maximum number of response bytes allowed for this target.
     /// When set, responses larger than this limit may be truncated or aborted.
     pub max_bytes_allowed: Option<u64>,
+    /// Cap on Document-type redirect hops before the navigation is aborted.
+    /// `None` disables enforcement; `Some(n)` mirrors `reqwest::redirect::Policy::limited(n)`.
+    pub max_redirects: Option<usize>,
     /// Whitelist patterns to allow through the network.
     pub whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to black through the network.
@@ -1402,6 +1406,7 @@ impl Default for TargetConfig {
             extra_headers: Default::default(),
             intercept_manager: NetworkInterceptManager::Unknown,
             max_bytes_allowed: None,
+            max_redirects: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
             #[cfg(feature = "adblock")]

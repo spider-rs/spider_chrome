@@ -530,6 +530,7 @@ impl Handler {
                 only_html: self.config.only_html && self.config.created_first_target,
                 intercept_manager: self.config.intercept_manager,
                 max_bytes_allowed: self.config.max_bytes_allowed,
+                max_redirects: self.config.max_redirects,
                 whitelist_patterns: self.config.whitelist_patterns.clone(),
                 blacklist_patterns: self.config.blacklist_patterns.clone(),
                 #[cfg(feature = "adblock")]
@@ -1368,6 +1369,13 @@ pub struct HandlerConfig {
     pub intercept_manager: NetworkInterceptManager,
     /// The max bytes to receive.
     pub max_bytes_allowed: Option<u64>,
+    /// Cap on main-frame Document redirect hops (per navigation).
+    ///
+    /// `None` disables enforcement (default); `Some(n)` aborts once the chain length
+    /// exceeds `n` by emitting `net::ERR_TOO_MANY_REDIRECTS` and calling
+    /// `Page.stopLoading`. Preserves the accumulated `redirect_chain` on the failed
+    /// request so consumers can inspect it.
+    pub max_redirects: Option<usize>,
     /// Optional per-run/per-site whitelist of URL substrings (scripts/resources).
     pub whitelist_patterns: Option<Vec<String>>,
     /// Optional per-run/per-site blacklist of URL substrings (scripts/resources).
@@ -1404,6 +1412,7 @@ impl Default for HandlerConfig {
             created_first_target: false,
             intercept_manager: NetworkInterceptManager::Unknown,
             max_bytes_allowed: None,
+            max_redirects: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
             #[cfg(feature = "adblock")]

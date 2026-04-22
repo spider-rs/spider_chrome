@@ -201,6 +201,7 @@ impl Browser {
             service_worker_enabled: config.service_worker_enabled,
             intercept_manager: config.intercept_manager,
             max_bytes_allowed: config.max_bytes_allowed,
+            max_redirects: config.max_redirects,
             whitelist_patterns: config.whitelist_patterns.clone(),
             blacklist_patterns: config.blacklist_patterns.clone(),
             ..Default::default()
@@ -295,6 +296,7 @@ impl Browser {
             created_first_target: false,
             intercept_manager: config.intercept_manager,
             max_bytes_allowed: config.max_bytes_allowed,
+            max_redirects: config.max_redirects,
             whitelist_patterns: config.whitelist_patterns.clone(),
             blacklist_patterns: config.blacklist_patterns.clone(),
             #[cfg(feature = "adblock")]
@@ -890,6 +892,9 @@ pub struct BrowserConfig {
     pub intercept_manager: NetworkInterceptManager,
     /// The max bytes to receive.
     pub max_bytes_allowed: Option<u64>,
+    /// Cap on Document-type redirect hops before the navigation is aborted.
+    /// `None` disables enforcement; `Some(n)` mirrors `reqwest::redirect::Policy::limited(n)`.
+    pub max_redirects: Option<usize>,
     /// Whitelist patterns to allow through the network.
     pub whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to block through the network.
@@ -968,6 +973,8 @@ pub struct BrowserConfigBuilder {
     intercept_manager: NetworkInterceptManager,
     /// Optional upper bound on bytes that may be received (per session/run).
     max_bytes_allowed: Option<u64>,
+    /// Optional cap on Document redirect hops per navigation (`None` = disabled).
+    max_redirects: Option<usize>,
     /// Whitelist patterns to allow through the network.
     whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to block through the network.
@@ -1027,6 +1034,7 @@ impl Default for BrowserConfigBuilder {
             service_worker_enabled: true,
             intercept_manager: NetworkInterceptManager::Unknown,
             max_bytes_allowed: None,
+            max_redirects: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
             #[cfg(feature = "adblock")]
@@ -1081,6 +1089,16 @@ impl BrowserConfigBuilder {
 
     pub fn with_max_bytes_allowed(mut self, max_bytes_allowed: Option<u64>) -> Self {
         self.max_bytes_allowed = max_bytes_allowed;
+        self
+    }
+
+    /// Cap the number of Document-type redirect hops per navigation.
+    ///
+    /// `None` disables enforcement (default, preserves Chromium's own ~20-hop cap).
+    /// `Some(n)` aborts once a navigation chain exceeds `n` by emitting
+    /// `net::ERR_TOO_MANY_REDIRECTS` and calling `Page.stopLoading`.
+    pub fn with_max_redirects(mut self, max_redirects: Option<usize>) -> Self {
+        self.max_redirects = max_redirects;
         self
     }
 
@@ -1281,6 +1299,7 @@ impl BrowserConfigBuilder {
             intercept_manager: self.intercept_manager,
             service_worker_enabled: self.service_worker_enabled,
             max_bytes_allowed: self.max_bytes_allowed,
+            max_redirects: self.max_redirects,
             whitelist_patterns: self.whitelist_patterns,
             blacklist_patterns: self.blacklist_patterns,
             #[cfg(feature = "adblock")]

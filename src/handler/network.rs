@@ -372,6 +372,14 @@ pub struct NetworkManager {
     pub document_target_domain: String,
     /// The max bytes to receive.
     pub max_bytes_allowed: Option<u64>,
+    /// Cap on main-frame Document redirect hops before the navigation is aborted.
+    ///
+    /// `None` disables enforcement (default, preserves prior behavior). When `Some(n)`,
+    /// the (n+1)th Document redirect short-circuits: a synthetic `RequestFailed` event
+    /// is emitted with `failure_text = "net::ERR_TOO_MANY_REDIRECTS"` and
+    /// `Page.stopLoading` is dispatched to abort in-flight navigation. The accumulated
+    /// `redirect_chain` is preserved on the failed request so consumers can inspect it.
+    pub max_redirects: Option<usize>,
     #[cfg(feature = "_cache")]
     /// The cache site_key to use.
     pub cache_site_key: Option<String>,
@@ -429,6 +437,7 @@ impl NetworkManager {
             blacklist_matcher: None,
             blacklist_strict: true,
             max_bytes_allowed: None,
+            max_redirects: None,
             #[cfg(feature = "_cache")]
             cache_site_key: None,
             #[cfg(feature = "_cache")]
@@ -1530,6 +1539,30 @@ impl NetworkManager {
             }
         }
 
+        // Redirect cap: applies only to Document-type hops and only when
+        // `max_redirects` is set. Sub-resource chains are untouched.
+        if let Some(cap) = self.max_redirects {
+            let is_document = matches!(event.r#type, Some(ResourceType::Document));
+            if is_document && redirect_chain.len() > cap {
+                let mut failed = HttpRequest::new(
+                    event.request_id.clone(),
+                    event.frame_id.clone(),
+                    interception_id,
+                    self.user_request_interception_enabled,
+                    redirect_chain,
+                );
+                failed.url = Some(event.request.url.clone());
+                failed.method = Some(event.request.method.clone());
+                failed.failure_text = Some("net::ERR_TOO_MANY_REDIRECTS".into());
+                self.push_cdp_request(
+                    chromiumoxide_cdp::cdp::browser_protocol::page::StopLoadingParams::default(),
+                );
+                self.queued_events
+                    .push_back(NetworkEvent::RequestFailed(failed));
+                return;
+            }
+        }
+
         let request = HttpRequest::new(
             event.request_id.clone(),
             event.frame_id.clone(),
@@ -2072,5 +2105,190 @@ mod tests {
         assert!(nm.is_blacklisted(u));
         assert!(nm.is_whitelisted(u));
         assert!(!nm.blacklist_strict);
+    }
+
+    // ── max_redirects enforcement ───────────────────────────────────────
+    //
+    // The redirect cap short-circuits in NetworkManager::on_request when a
+    // Document-type chain exceeds the configured limit. We drive it via the
+    // public on_request_will_be_sent entry point by deserializing synthetic
+    // events — builder APIs exist but require every non-optional field, and
+    // JSON is less fragile to cdp schema additions.
+
+    fn make_request_will_be_sent(
+        request_id: &str,
+        url: &str,
+        resource_type: &str,
+        redirect_from_url: Option<&str>,
+    ) -> chromiumoxide_cdp::cdp::browser_protocol::network::EventRequestWillBeSent {
+        let mut v = serde_json::json!({
+            "requestId": request_id,
+            "loaderId": "test-loader",
+            "documentURL": url,
+            "request": {
+                "url": url,
+                "method": "GET",
+                "headers": {},
+                "initialPriority": "Medium",
+                "referrerPolicy": "no-referrer"
+            },
+            "timestamp": 0.0,
+            "wallTime": 0.0,
+            "initiator": { "type": "other" },
+            "redirectHasExtraInfo": false,
+            "type": resource_type,
+            "frameId": "frame1"
+        });
+        if let Some(from) = redirect_from_url {
+            v["redirectResponse"] = serde_json::json!({
+                "url": from,
+                "status": 302,
+                "statusText": "Found",
+                "headers": { "Location": url },
+                "mimeType": "text/html",
+                "charset": "",
+                "connectionReused": false,
+                "connectionId": 0.0,
+                "encodedDataLength": 0.0,
+                "securityState": "unknown"
+            });
+        }
+        serde_json::from_value(v).expect("EventRequestWillBeSent should deserialize")
+    }
+
+    fn drain_too_many_redirects(nm: &mut NetworkManager) -> Option<super::HttpRequest> {
+        while let Some(ev) = nm.poll() {
+            if let super::NetworkEvent::RequestFailed(req) = ev {
+                if req.failure_text.as_deref() == Some("net::ERR_TOO_MANY_REDIRECTS") {
+                    return Some(req);
+                }
+            }
+        }
+        None
+    }
+
+    fn drain_stop_loading(nm: &mut NetworkManager) -> bool {
+        while let Some(ev) = nm.poll() {
+            if let super::NetworkEvent::SendCdpRequest((method, _)) = ev {
+                let m: &str = method.as_ref();
+                if m == "Page.stopLoading" {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn test_max_redirects_none_allows_unlimited_chain() {
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        // max_redirects left at its default (None).
+
+        // 10 sequential Document hops sharing the same request_id.
+        nm.on_request_will_be_sent(&make_request_will_be_sent(
+            "r1",
+            "https://example.com/0",
+            "Document",
+            None,
+        ));
+        for i in 1..10 {
+            nm.on_request_will_be_sent(&make_request_will_be_sent(
+                "r1",
+                &format!("https://example.com/{i}"),
+                "Document",
+                Some(&format!("https://example.com/{}", i - 1)),
+            ));
+        }
+
+        assert!(
+            drain_too_many_redirects(&mut nm).is_none(),
+            "no cap set: chain of 10 hops must not emit ERR_TOO_MANY_REDIRECTS"
+        );
+    }
+
+    #[test]
+    fn test_max_redirects_caps_document_chain() {
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.max_redirects = Some(3);
+
+        // Initial request + 4 redirect hops. The 4th redirect (chain length 4 > 3)
+        // must trip the cap.
+        nm.on_request_will_be_sent(&make_request_will_be_sent(
+            "r1",
+            "https://example.com/0",
+            "Document",
+            None,
+        ));
+        for i in 1..=4 {
+            nm.on_request_will_be_sent(&make_request_will_be_sent(
+                "r1",
+                &format!("https://example.com/{i}"),
+                "Document",
+                Some(&format!("https://example.com/{}", i - 1)),
+            ));
+        }
+
+        let failed = drain_too_many_redirects(&mut nm)
+            .expect("cap of 3 on a 4-hop chain must emit ERR_TOO_MANY_REDIRECTS");
+        assert_eq!(
+            failed.redirect_chain.len(),
+            4,
+            "failed request should preserve the full accumulated chain"
+        );
+        assert_eq!(
+            failed.url.as_deref(),
+            Some("https://example.com/4"),
+            "failed request url should be the hop that tripped the cap"
+        );
+
+        // Second navigation after the cap is tripped must also schedule
+        // Page.stopLoading to actually abort the tab.
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.max_redirects = Some(3);
+        nm.on_request_will_be_sent(&make_request_will_be_sent(
+            "r2",
+            "https://example.com/0",
+            "Document",
+            None,
+        ));
+        for i in 1..=4 {
+            nm.on_request_will_be_sent(&make_request_will_be_sent(
+                "r2",
+                &format!("https://example.com/{i}"),
+                "Document",
+                Some(&format!("https://example.com/{}", i - 1)),
+            ));
+        }
+        assert!(
+            drain_stop_loading(&mut nm),
+            "cap hit must dispatch Page.stopLoading to abort navigation"
+        );
+    }
+
+    #[test]
+    fn test_max_redirects_ignores_subresources() {
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.max_redirects = Some(2);
+
+        // A 5-hop script redirect chain — sub-resources are exempt by design.
+        nm.on_request_will_be_sent(&make_request_will_be_sent(
+            "s1",
+            "https://cdn.example.com/0.js",
+            "Script",
+            None,
+        ));
+        for i in 1..=5 {
+            nm.on_request_will_be_sent(&make_request_will_be_sent(
+                "s1",
+                &format!("https://cdn.example.com/{i}.js"),
+                "Script",
+                Some(&format!("https://cdn.example.com/{}.js", i - 1)),
+            ));
+        }
+
+        assert!(
+            drain_too_many_redirects(&mut nm).is_none(),
+            "sub-resource redirect chains must never be capped"
+        );
     }
 }
