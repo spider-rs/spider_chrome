@@ -43,6 +43,8 @@ pub enum CdpError {
     LaunchIo(#[source] io::Error, BrowserStderr),
     #[error("Request timed out.")]
     Timeout,
+    #[error("net::ERR_TOO_MANY_NAVIGATIONS: main-frame navigated {0} times within a single goto")]
+    TooManyNavigations(u32),
     #[error("FrameId {0:?} not found.")]
     FrameNotFound(FrameId),
     /// Error message related to a cdp response that is not a
@@ -106,6 +108,9 @@ impl From<NavigationError> for CdpError {
         match err {
             NavigationError::Timeout { .. } => CdpError::Timeout,
             NavigationError::FrameNotFound { frame, .. } => CdpError::FrameNotFound(frame),
+            NavigationError::TooManyNavigations { count, .. } => {
+                CdpError::TooManyNavigations(count)
+            }
         }
     }
 }

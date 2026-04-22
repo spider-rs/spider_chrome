@@ -531,6 +531,7 @@ impl Handler {
                 intercept_manager: self.config.intercept_manager,
                 max_bytes_allowed: self.config.max_bytes_allowed,
                 max_redirects: self.config.max_redirects,
+                max_main_frame_navigations: self.config.max_main_frame_navigations,
                 whitelist_patterns: self.config.whitelist_patterns.clone(),
                 blacklist_patterns: self.config.blacklist_patterns.clone(),
                 #[cfg(feature = "adblock")]
@@ -1376,6 +1377,10 @@ pub struct HandlerConfig {
     /// `Page.stopLoading`. Preserves the accumulated `redirect_chain` on the failed
     /// request so consumers can inspect it.
     pub max_redirects: Option<usize>,
+    /// Cap on main-frame cross-document navigations per `goto`. Defends against
+    /// JS / meta-refresh loops that bypass the HTTP redirect guard. `None`
+    /// disables the guard.
+    pub max_main_frame_navigations: Option<u32>,
     /// Optional per-run/per-site whitelist of URL substrings (scripts/resources).
     pub whitelist_patterns: Option<Vec<String>>,
     /// Optional per-run/per-site blacklist of URL substrings (scripts/resources).
@@ -1413,6 +1418,7 @@ impl Default for HandlerConfig {
             intercept_manager: NetworkInterceptManager::Unknown,
             max_bytes_allowed: None,
             max_redirects: None,
+            max_main_frame_navigations: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
             #[cfg(feature = "adblock")]

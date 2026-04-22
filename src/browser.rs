@@ -202,6 +202,7 @@ impl Browser {
             intercept_manager: config.intercept_manager,
             max_bytes_allowed: config.max_bytes_allowed,
             max_redirects: config.max_redirects,
+            max_main_frame_navigations: config.max_main_frame_navigations,
             whitelist_patterns: config.whitelist_patterns.clone(),
             blacklist_patterns: config.blacklist_patterns.clone(),
             ..Default::default()
@@ -297,6 +298,7 @@ impl Browser {
             intercept_manager: config.intercept_manager,
             max_bytes_allowed: config.max_bytes_allowed,
             max_redirects: config.max_redirects,
+            max_main_frame_navigations: config.max_main_frame_navigations,
             whitelist_patterns: config.whitelist_patterns.clone(),
             blacklist_patterns: config.blacklist_patterns.clone(),
             #[cfg(feature = "adblock")]
@@ -895,6 +897,10 @@ pub struct BrowserConfig {
     /// Cap on Document-type redirect hops before the navigation is aborted.
     /// `None` disables enforcement; `Some(n)` mirrors `reqwest::redirect::Policy::limited(n)`.
     pub max_redirects: Option<usize>,
+    /// Cap on main-frame cross-document navigations per `goto`. Defends against
+    /// JS / meta-refresh loops that bypass the HTTP redirect guard. `None`
+    /// disables the guard.
+    pub max_main_frame_navigations: Option<u32>,
     /// Whitelist patterns to allow through the network.
     pub whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to block through the network.
@@ -975,6 +981,8 @@ pub struct BrowserConfigBuilder {
     max_bytes_allowed: Option<u64>,
     /// Optional cap on Document redirect hops per navigation (`None` = disabled).
     max_redirects: Option<usize>,
+    /// Optional cap on main-frame cross-document navigations per goto.
+    max_main_frame_navigations: Option<u32>,
     /// Whitelist patterns to allow through the network.
     whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to block through the network.
@@ -1035,6 +1043,7 @@ impl Default for BrowserConfigBuilder {
             intercept_manager: NetworkInterceptManager::Unknown,
             max_bytes_allowed: None,
             max_redirects: None,
+            max_main_frame_navigations: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
             #[cfg(feature = "adblock")]
@@ -1099,6 +1108,18 @@ impl BrowserConfigBuilder {
     /// `net::ERR_TOO_MANY_REDIRECTS` and calling `Page.stopLoading`.
     pub fn with_max_redirects(mut self, max_redirects: Option<usize>) -> Self {
         self.max_redirects = max_redirects;
+        self
+    }
+
+    /// Cap the number of main-frame cross-document navigations allowed per
+    /// `goto` call.
+    ///
+    /// Defends against JS `location.href` / meta-refresh loops that bypass
+    /// HTTP-level redirect detection — each hop looks like a fresh document
+    /// to Chromium, so `with_max_redirects` alone cannot catch them. `None`
+    /// disables the guard (default).
+    pub fn with_max_main_frame_navigations(mut self, cap: Option<u32>) -> Self {
+        self.max_main_frame_navigations = cap;
         self
     }
 
@@ -1300,6 +1321,7 @@ impl BrowserConfigBuilder {
             service_worker_enabled: self.service_worker_enabled,
             max_bytes_allowed: self.max_bytes_allowed,
             max_redirects: self.max_redirects,
+            max_main_frame_navigations: self.max_main_frame_navigations,
             whitelist_patterns: self.whitelist_patterns,
             blacklist_patterns: self.blacklist_patterns,
             #[cfg(feature = "adblock")]

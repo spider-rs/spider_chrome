@@ -245,6 +245,16 @@ pub struct FrameManager {
     pending_navigations: VecDeque<(FrameRequestedNavigation, NavigationWatcher)>,
     /// The currently ongoing navigation
     navigation: Option<(NavigationWatcher, Instant)>,
+    /// Optional cap on main-frame cross-document navigations per `goto`.
+    ///
+    /// Defends against JS/meta-refresh loops that keep issuing fresh top-level
+    /// navigations (which look like new documents, not HTTP redirects). `None`
+    /// disables the guard — preserves prior behavior. `Some(n)` aborts the
+    /// in-flight navigation with `NavigationError::TooManyNavigations` once the
+    /// main frame has navigated more than `n` times since the latest `goto`.
+    max_main_frame_navigations: Option<u32>,
+    /// Count of main-frame cross-document navigations since the last `goto`.
+    main_frame_nav_count: u32,
 }
 
 impl FrameManager {
@@ -257,7 +267,15 @@ impl FrameManager {
             request_timeout,
             pending_navigations: Default::default(),
             navigation: None,
+            max_main_frame_navigations: None,
+            main_frame_nav_count: 0,
         }
+    }
+
+    /// Set the cap on main-frame cross-document navigations per `goto`.
+    /// `None` disables the guard.
+    pub fn set_max_main_frame_navigations(&mut self, cap: Option<u32>) {
+        self.max_main_frame_navigations = cap;
     }
 
     /// The commands to execute in order to initialize this frame manager
@@ -365,6 +383,22 @@ impl FrameManager {
     pub fn poll(&mut self, now: Instant) -> Option<FrameEvent> {
         // check if the navigation completed
         if let Some((watcher, deadline)) = self.navigation.take() {
+            // Navigation-loop guard: abort if the main frame has navigated
+            // more than the configured cap since this `goto` started.
+            if let Some(cap) = self.max_main_frame_navigations {
+                if self.main_frame_nav_count > cap {
+                    let count = self.main_frame_nav_count;
+                    // Keep the counter positive so the next goto can still
+                    // reset it cleanly; we just clear the active navigation.
+                    return Some(FrameEvent::NavigationResult(Err(
+                        NavigationError::TooManyNavigations {
+                            id: watcher.id,
+                            count,
+                        },
+                    )));
+                }
+            }
+
             if now > deadline {
                 // navigation request timed out
                 return Some(FrameEvent::NavigationResult(Err(
@@ -416,6 +450,9 @@ impl FrameManager {
         // insert the frame_id in the request if not present
         req.set_frame_id(frame_id);
 
+        // Fresh goto — reset the per-navigation loop counter.
+        self.main_frame_nav_count = 0;
+
         self.pending_navigations.push_back((req, watcher))
     }
 
@@ -463,6 +500,11 @@ impl FrameManager {
                 self.frames.insert(id, f);
             }
         } else {
+            // Track main-frame cross-document navigations since the last
+            // `goto`. Same-document (hash change) events land in
+            // `on_frame_navigated_within_document` and are not counted.
+            self.main_frame_nav_count = self.main_frame_nav_count.saturating_add(1);
+
             let old_main = self.main_frame.take();
             let mut f = if let Some(main) = old_main.as_ref() {
                 // update main frame
@@ -687,6 +729,15 @@ pub enum NavigationError {
         id: NavigationId,
         frame: FrameId,
     },
+    /// The main frame performed more cross-document navigations during a
+    /// single `goto` than the configured `max_main_frame_navigations` cap.
+    /// Typically triggered by meta-refresh / `location.href` loops, which
+    /// are invisible to the HTTP-layer `max_redirects` guard.
+    TooManyNavigations {
+        id: NavigationId,
+        /// Observed main-frame navigation count (always `> cap`).
+        count: u32,
+    },
 }
 
 impl NavigationError {
@@ -694,6 +745,7 @@ impl NavigationError {
         match self {
             NavigationError::Timeout { id, .. } => id,
             NavigationError::FrameNotFound { id, .. } => id,
+            NavigationError::TooManyNavigations { id, .. } => id,
         }
     }
 }
@@ -1000,6 +1052,140 @@ mod tests {
         assert!(
             matches!(event, Some(FrameEvent::NavigationResult(Ok(_)))),
             "navigation should complete on the new frame"
+        );
+    }
+
+    // ── Main-frame navigation-loop guard ─────────────────────────────
+
+    fn seed_main_frame(fm: &mut FrameManager, loader: &str) -> FrameId {
+        let id = FrameId::new("main");
+        let mut frame = Frame::new(id.clone());
+        frame.loader_id = Some(LoaderId::from(loader.to_string()));
+        fm.frames.insert(id.clone(), frame);
+        fm.main_frame = Some(id.clone());
+        id
+    }
+
+    fn active_watcher(fm: &mut FrameManager, frame_id: FrameId) {
+        let watcher = NavigationWatcher::until_load(
+            NavigationId(0),
+            frame_id.clone(),
+            fm.frames.get(&frame_id).and_then(|f| f.loader_id.clone()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        fm.navigation = Some((watcher, deadline));
+    }
+
+    #[test]
+    fn nav_loop_guard_none_allows_unlimited() {
+        let mut fm = FrameManager::new(Duration::from_secs(30));
+        // Default: max_main_frame_navigations = None.
+        let id = seed_main_frame(&mut fm, "loader-0");
+        active_watcher(&mut fm, id);
+
+        // Simulate 25 main-frame navigations — no cap → no error.
+        for _ in 0..25 {
+            fm.main_frame_nav_count = fm.main_frame_nav_count.saturating_add(1);
+        }
+
+        // poll should not trip on count; only deadline/lifecycle drive it.
+        // (Lifecycle is incomplete so poll returns None here, but critically
+        // no NavigationError is emitted.)
+        let event = fm.poll(Instant::now());
+        assert!(
+            !matches!(
+                event,
+                Some(FrameEvent::NavigationResult(Err(
+                    NavigationError::TooManyNavigations { .. }
+                )))
+            ),
+            "None cap must never emit TooManyNavigations"
+        );
+    }
+
+    #[test]
+    fn nav_loop_guard_caps_and_reports_count() {
+        let mut fm = FrameManager::new(Duration::from_secs(30));
+        fm.set_max_main_frame_navigations(Some(3));
+        let id = seed_main_frame(&mut fm, "loader-0");
+        active_watcher(&mut fm, id);
+
+        // Simulate 5 main-frame navigations — cap is 3, so 4+ trips.
+        for _ in 0..5 {
+            fm.main_frame_nav_count = fm.main_frame_nav_count.saturating_add(1);
+        }
+
+        match fm.poll(Instant::now()) {
+            Some(FrameEvent::NavigationResult(Err(NavigationError::TooManyNavigations {
+                count,
+                ..
+            }))) => {
+                assert_eq!(count, 5, "reported count must be the observed value");
+            }
+            other => panic!("expected TooManyNavigations, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nav_loop_guard_resets_on_goto() {
+        let mut fm = FrameManager::new(Duration::from_secs(30));
+        fm.set_max_main_frame_navigations(Some(3));
+        let id = seed_main_frame(&mut fm, "loader-0");
+        active_watcher(&mut fm, id.clone());
+
+        // Trip the cap on the first goto.
+        fm.main_frame_nav_count = 10;
+        assert!(matches!(
+            fm.poll(Instant::now()),
+            Some(FrameEvent::NavigationResult(Err(
+                NavigationError::TooManyNavigations { .. }
+            )))
+        ));
+
+        // Fresh goto must reset the counter.
+        fm.navigate_frame(
+            id.clone(),
+            FrameRequestedNavigation::new(
+                NavigationId(1),
+                Request::new("Page.navigate".into(), serde_json::json!({})),
+                Duration::from_secs(30),
+            ),
+        );
+        assert_eq!(
+            fm.main_frame_nav_count, 0,
+            "navigate_frame must reset the main-frame nav counter"
+        );
+    }
+
+    #[test]
+    fn nav_loop_guard_same_document_not_counted() {
+        // Same-document navigations (hash changes, History.pushState) land in
+        // `on_frame_navigated_within_document`, not `on_frame_navigated`, so
+        // they must NOT increment the cross-document counter. This test
+        // encodes that contract — if `on_frame_navigated_within_document`
+        // ever starts incrementing `main_frame_nav_count`, it fails.
+        let mut fm = FrameManager::new(Duration::from_secs(30));
+        fm.set_max_main_frame_navigations(Some(2));
+        let id = seed_main_frame(&mut fm, "loader-0");
+
+        // Seed an active navigation watcher on this frame.
+        active_watcher(&mut fm, id.clone());
+
+        // Dispatch 10 same-document navigations.
+        for _ in 0..10 {
+            fm.on_frame_navigated_within_document(
+                &chromiumoxide_cdp::cdp::browser_protocol::page::EventNavigatedWithinDocument {
+                    frame_id: id.clone(),
+                    url: "https://example.com/#a".into(),
+                    navigation_type:
+                        chromiumoxide_cdp::cdp::browser_protocol::page::NavigatedWithinDocumentNavigationType::Fragment,
+                },
+            );
+        }
+
+        assert_eq!(
+            fm.main_frame_nav_count, 0,
+            "same-document navigations must not count against the cross-document cap"
         );
     }
 }

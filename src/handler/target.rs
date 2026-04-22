@@ -207,11 +207,14 @@ impl Target {
             network_manager.set_adblock_engine(std::sync::Arc::new(engine));
         }
 
+        let mut frame_manager = FrameManager::new(request_timeout);
+        frame_manager.set_max_main_frame_navigations(config.max_main_frame_navigations);
+
         Self {
             info,
             r#type: ty,
             config,
-            frame_manager: FrameManager::new(request_timeout),
+            frame_manager,
             network_manager,
             emulation_manager: EmulationManager::new(request_timeout),
             session_id: None,
@@ -1376,6 +1379,10 @@ pub struct TargetConfig {
     /// Cap on Document-type redirect hops before the navigation is aborted.
     /// `None` disables enforcement; `Some(n)` mirrors `reqwest::redirect::Policy::limited(n)`.
     pub max_redirects: Option<usize>,
+    /// Cap on main-frame cross-document navigations per `goto`. Defends against
+    /// JS / meta-refresh loops that bypass the HTTP redirect guard. `None`
+    /// disables the guard.
+    pub max_main_frame_navigations: Option<u32>,
     /// Whitelist patterns to allow through the network.
     pub whitelist_patterns: Option<Vec<String>>,
     /// Blacklist patterns to black through the network.
@@ -1407,6 +1414,7 @@ impl Default for TargetConfig {
             intercept_manager: NetworkInterceptManager::Unknown,
             max_bytes_allowed: None,
             max_redirects: None,
+            max_main_frame_navigations: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
             #[cfg(feature = "adblock")]
