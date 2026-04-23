@@ -446,14 +446,14 @@ pub async fn read_response_body_as_stream(
         Ok(body) => {
             // Explicitly close the CDP stream (guard becomes a no-op).
             if let Some(h) = guard.take() {
-                let _ = page.execute(CloseParams { handle: h }).await;
+                let _ = page.send_command(CloseParams { handle: h }).await;
             }
             StreamResult::Ok(body)
         }
         Err(err) => {
             // Close the stream best-effort.
             if let Some(h) = guard.take() {
-                let _ = page.execute(CloseParams { handle: h }).await;
+                let _ = page.send_command(CloseParams { handle: h }).await;
             }
 
             // Recover whatever was accumulated so far.
