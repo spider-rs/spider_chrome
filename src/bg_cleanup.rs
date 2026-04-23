@@ -189,12 +189,21 @@ fn spawn_worker() -> mpsc::UnboundedSender<CleanupTask> {
                 break; // channel closed — no more producers
             }
             // Move the batch into a spawned worker. `mem::replace`
-            // swaps in a fresh pre-allocated `Vec` of the right
-            // capacity so the dispatcher's next `recv_many` doesn't
-            // need to grow the buffer incrementally. One allocation
-            // per batch, zero per-element move (just a pointer swap).
+            // swaps in a fresh pre-allocated `Vec` so the
+            // dispatcher's next `recv_many` doesn't need to grow the
+            // buffer incrementally.
+            //
+            // Size the replacement to `n` (the count we just
+            // drained), capped at `DISPATCH_BATCH`. This adapts the
+            // allocation to the workload: a steady trickle of one
+            // task per wake stops over-allocating 63 unused slots,
+            // while a sustained burst keeps the full capacity around
+            // for the next batch. A spike that exceeds the last
+            // batch's size causes `recv_many` to grow the Vec on the
+            // next call — amortised O(1), no correctness impact.
+            let next_cap = n.min(DISPATCH_BATCH);
             let tasks: Vec<CleanupTask> =
-                std::mem::replace(&mut batch, Vec::with_capacity(DISPATCH_BATCH));
+                std::mem::replace(&mut batch, Vec::with_capacity(next_cap));
             tokio::spawn(async move {
                 let mut in_flight: FuturesUnordered<_> =
                     tasks.into_iter().map(run_task).collect();
