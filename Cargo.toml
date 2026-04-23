@@ -1,6 +1,6 @@
 [package]
 name = "chromey"
-version = "2.46.46"
+version = "2.46.47"
 rust-version = "1.70"
 authors = ["j-mendez <jeff@spider.cloud>"]
 edition = "2021"
@@ -203,4 +203,8 @@ harness = false
 
 [[bench]]
 name = "runtime_release_bench"
+harness = false
+
+[[bench]]
+name = "waiter_drain_bench"
 harness = false

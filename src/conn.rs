@@ -403,6 +403,13 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
         // Read from the websocket, skipping non-data frames (pings,
         // pongs, malformed messages) without yielding back to the
         // executor.  This avoids a full round-trip per skipped frame.
+        //
+        // Cap consecutive skips so a flood of non-data frames (many
+        // pings, malformed/unexpected types) cannot starve the
+        // runtime — yield Pending after `MAX_SKIPS_PER_POLL` and
+        // self-wake so we resume on the next tick.
+        const MAX_SKIPS_PER_POLL: u32 = 16;
+        let mut skips: u32 = 0;
         loop {
             match ready!(pin.ws.poll_next_unpin(cx)) {
                 Some(Ok(WsMessage::Text(text))) => {
@@ -413,7 +420,7 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
                                 target: "chromiumoxide::conn::raw_ws::parse_errors",
                                 "Dropping malformed text WS frame: {err}",
                             );
-                            continue;
+                            skips += 1;
                         }
                     }
                 }
@@ -424,22 +431,28 @@ impl<T: EventMessage + Unpin> Stream for Connection<T> {
                             target: "chromiumoxide::conn::raw_ws::parse_errors",
                             "Dropping malformed binary WS frame: {err}",
                         );
-                        continue;
+                        skips += 1;
                     }
                 },
                 Some(Ok(WsMessage::Close(_))) => return Poll::Ready(None),
-                // skip ping, pong, and unexpected types without yielding
-                Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+                Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => {
+                    skips += 1;
+                }
                 Some(Ok(msg)) => {
                     tracing::debug!(
                         target: "chromiumoxide::conn::raw_ws::parse_errors",
                         "Unexpected WS message type: {:?}",
                         msg
                     );
-                    continue;
+                    skips += 1;
                 }
                 Some(Err(err)) => return Poll::Ready(Some(Err(CdpError::Ws(err)))),
                 None => return Poll::Ready(None),
+            }
+
+            if skips >= MAX_SKIPS_PER_POLL {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
         }
     }

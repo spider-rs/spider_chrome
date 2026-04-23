@@ -106,6 +106,42 @@ lazy_static::lazy_static! {
     };
 }
 
+/// Per-queue cap on waiter sends per `Target::poll` call.
+///
+/// Each `wait_for_*` queue can hold an unbounded number of `oneshot::Sender`s
+/// registered by concurrent callers. Firing them all in one tight `pop()`
+/// loop previously produced multi-hundred-microsecond synchronous bursts
+/// inside the handler's event loop under fan-out (e.g. 1000 tasks awaiting
+/// `wait_for_load` on one page). Capping at 64 per queue per poll keeps
+/// worst-case burst at ~5 × 64 oneshot sends (~6μs) before yielding. Any
+/// remainder is drained on subsequent polls, re-armed via `Waker::wake_by_ref`.
+const WAITER_DRAIN_BUDGET: usize = 64;
+
+/// Pop up to `budget` senders from `queue` and deliver `value` to each.
+///
+/// Returns `true` when the queue still contains senders after draining.
+/// Dropped receivers (closed senders) are silently ignored — they consume
+/// a budget slot but contribute no cost beyond the cheap `send` no-op.
+///
+/// The queue is pruned of closed senders elsewhere once per `Target::poll`
+/// (before this helper runs), so in steady state `budget` slots approximate
+/// `budget` live fan-out sends.
+#[inline]
+fn drain_waiters_bounded(
+    queue: &mut Vec<Sender<ArcHttpRequest>>,
+    http_request: Option<&Arc<crate::handler::http::HttpRequest>>,
+    budget: usize,
+) -> bool {
+    let to_fire = queue.len().min(budget);
+    for _ in 0..to_fire {
+        // `pop` cannot be `None` here: `to_fire <= queue.len()`.
+        if let Some(tx) = queue.pop() {
+            let _ = tx.send(http_request.cloned());
+        }
+    }
+    !queue.is_empty()
+}
+
 #[derive(Debug)]
 pub struct Target {
     /// Info about this target as returned from the chromium instance
@@ -647,31 +683,51 @@ impl Target {
             }
 
             if let Some(frame) = self.frame_manager.main_frame() {
+                let req = frame.http_request();
+                let mut waiters_remaining = false;
+
                 if frame.is_dom_content_loaded() {
-                    while let Some(tx) = self.wait_for_dom_content_loaded.pop() {
-                        let _ = tx.send(frame.http_request().cloned());
-                    }
-                    while let Some(tx) = self.wait_for_frame_navigation.pop() {
-                        let _ = tx.send(frame.http_request().cloned());
-                    }
+                    waiters_remaining |= drain_waiters_bounded(
+                        &mut self.wait_for_dom_content_loaded,
+                        req,
+                        WAITER_DRAIN_BUDGET,
+                    );
+                    waiters_remaining |= drain_waiters_bounded(
+                        &mut self.wait_for_frame_navigation,
+                        req,
+                        WAITER_DRAIN_BUDGET,
+                    );
                 }
 
                 if frame.is_loaded() {
-                    while let Some(tx) = self.wait_for_load.pop() {
-                        let _ = tx.send(frame.http_request().cloned());
-                    }
+                    waiters_remaining |= drain_waiters_bounded(
+                        &mut self.wait_for_load,
+                        req,
+                        WAITER_DRAIN_BUDGET,
+                    );
                 }
 
                 if frame.is_network_idle() {
-                    while let Some(tx) = self.wait_for_network_idle.pop() {
-                        let _ = tx.send(frame.http_request().cloned());
-                    }
+                    waiters_remaining |= drain_waiters_bounded(
+                        &mut self.wait_for_network_idle,
+                        req,
+                        WAITER_DRAIN_BUDGET,
+                    );
                 }
 
                 if frame.is_network_almost_idle() {
-                    while let Some(tx) = self.wait_for_network_almost_idle.pop() {
-                        let _ = tx.send(frame.http_request().cloned());
-                    }
+                    waiters_remaining |= drain_waiters_bounded(
+                        &mut self.wait_for_network_almost_idle,
+                        req,
+                        WAITER_DRAIN_BUDGET,
+                    );
+                }
+
+                if waiters_remaining {
+                    // More waiters queued than the per-poll budget.
+                    // Self-wake so the handler re-enters and drains the
+                    // remainder on the next tick instead of stalling.
+                    cx.waker().wake_by_ref();
                 }
             }
 
@@ -1608,4 +1664,122 @@ pub enum TargetMessage {
     BlockNetwork(bool),
     /// Enable/Disable internal request paused interception
     EnableInterception(bool),
+}
+
+#[cfg(test)]
+mod waiter_drain_tests {
+    //! Unit tests for `drain_waiters_bounded`.
+    //!
+    //! These cover the isolated drain helper — they do not spin up a real
+    //! `Target` or browser, so they run in microseconds and exhaustively
+    //! exercise the budget / re-arm contract:
+    //!
+    //! - drain with no waiters is a no-op and reports `remaining = false`
+    //! - drain with fewer waiters than budget fires all and reports `false`
+    //! - drain with exactly `budget` waiters fires all and reports `false`
+    //! - drain with more waiters than `budget` fires `budget` and reports `true`
+    //! - senders whose receivers were dropped don't panic or consume extra work
+    //! - repeated draining eventually empties any queue (no deadlock)
+    //!
+    //! The last test is the key "no deadlock" property: if re-arm were broken
+    //! (say, we forgot to wake), the handler could stall with waiters pending
+    //! forever. Here we prove the helper itself always makes forward progress.
+    use super::{drain_waiters_bounded, WAITER_DRAIN_BUDGET};
+    use crate::ArcHttpRequest;
+    use tokio::sync::oneshot::{self, Sender};
+
+    fn make_waiters(n: usize) -> (Vec<Sender<ArcHttpRequest>>, Vec<oneshot::Receiver<ArcHttpRequest>>) {
+        let mut txs = Vec::with_capacity(n);
+        let mut rxs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (tx, rx) = oneshot::channel();
+            txs.push(tx);
+            rxs.push(rx);
+        }
+        (txs, rxs)
+    }
+
+    #[test]
+    fn empty_queue_is_noop() {
+        let mut queue: Vec<Sender<ArcHttpRequest>> = Vec::new();
+        let remaining = drain_waiters_bounded(&mut queue, None, WAITER_DRAIN_BUDGET);
+        assert!(!remaining, "empty queue should not mark 'remaining'");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn drains_fewer_than_budget() {
+        let (mut queue, mut rxs) = make_waiters(10);
+        let remaining = drain_waiters_bounded(&mut queue, None, WAITER_DRAIN_BUDGET);
+        assert!(!remaining);
+        assert!(queue.is_empty());
+        // All receivers got a value.
+        for rx in rxs.iter_mut() {
+            assert!(rx.try_recv().is_ok(), "every waiter must receive a value");
+        }
+    }
+
+    #[test]
+    fn drains_exactly_budget() {
+        let (mut queue, mut rxs) = make_waiters(WAITER_DRAIN_BUDGET);
+        let remaining = drain_waiters_bounded(&mut queue, None, WAITER_DRAIN_BUDGET);
+        assert!(!remaining, "exactly-budget drain should empty the queue");
+        assert!(queue.is_empty());
+        for rx in rxs.iter_mut() {
+            assert!(rx.try_recv().is_ok());
+        }
+    }
+
+    #[test]
+    fn drains_budget_when_over_capacity() {
+        let n = WAITER_DRAIN_BUDGET * 3 + 7; // 199 waiters at the default 64
+        let (mut queue, _rxs) = make_waiters(n);
+        let remaining = drain_waiters_bounded(&mut queue, None, WAITER_DRAIN_BUDGET);
+        assert!(remaining, "over-budget drain must mark 'remaining = true'");
+        assert_eq!(
+            queue.len(),
+            n - WAITER_DRAIN_BUDGET,
+            "exactly `budget` waiters should be popped per call"
+        );
+    }
+
+    #[test]
+    fn dropped_receiver_does_not_panic() {
+        let (mut queue, mut rxs) = make_waiters(4);
+        // Drop half the receivers — their senders become closed.
+        rxs.truncate(2);
+        let remaining = drain_waiters_bounded(&mut queue, None, WAITER_DRAIN_BUDGET);
+        assert!(!remaining);
+        assert!(queue.is_empty());
+        // The remaining receivers either got a value or were the popped ones;
+        // at minimum, no panic occurred.
+    }
+
+    #[test]
+    fn repeated_draining_empties_any_queue() {
+        // "No deadlock" property: repeatedly calling the helper always makes
+        // forward progress and eventually empties the queue. If this loop
+        // ever ran forever, the re-arm contract would be unreachable.
+        let n = 10_000;
+        let (mut queue, _rxs) = make_waiters(n);
+        let mut rounds = 0;
+        loop {
+            let remaining = drain_waiters_bounded(&mut queue, None, WAITER_DRAIN_BUDGET);
+            rounds += 1;
+            if !remaining {
+                break;
+            }
+            assert!(
+                rounds < n,
+                "drain must make forward progress on every call"
+            );
+        }
+        assert!(queue.is_empty());
+        // 10_000 / 64 = 156.25 → 157 full rounds + final clean-up = 157
+        assert_eq!(
+            rounds,
+            n.div_ceil(WAITER_DRAIN_BUDGET),
+            "each round should pop exactly `budget` waiters until the tail"
+        );
+    }
 }

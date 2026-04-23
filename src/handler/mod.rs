@@ -1128,9 +1128,19 @@ impl Stream for Handler {
     type Item = Result<()>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Budgets prevent a single chatty target or WS flood from
+        // starving other futures on the runtime. Mirror the caps
+        // used in `Handler::run()`; on exhaustion, self-wake and
+        // return Pending so the executor gets a chance to schedule
+        // other work before we resume.
+        const BROWSER_MSG_BUDGET: usize = 128;
+        const PER_TARGET_DRAIN_BUDGET: usize = 128;
+        const WS_MSG_BUDGET: usize = 512;
+
         let pin = self.get_mut();
 
         let mut dispose = false;
+        let mut budget_hit = false;
 
         let now = Instant::now();
 
@@ -1138,6 +1148,7 @@ impl Stream for Handler {
             // temporary pinning of the browser receiver should be safe as we are pinning
             // through the already pinned self. with the receivers we can also
             // safely ignore exhaustion as those are fused.
+            let mut browser_msgs = 0usize;
             while let Poll::Ready(Some(msg)) = pin.from_browser.poll_recv(cx) {
                 match msg {
                     HandlerMessage::Command(cmd) => {
@@ -1196,12 +1207,18 @@ impl Stream for Handler {
                         pin.event_listeners.add_listener(req);
                     }
                 }
+                browser_msgs += 1;
+                if browser_msgs >= BROWSER_MSG_BUDGET {
+                    budget_hit = true;
+                    break;
+                }
             }
 
             for n in (0..pin.target_ids.len()).rev() {
                 let target_id = pin.target_ids.swap_remove(n);
 
                 if let Some((id, mut target)) = pin.targets.remove_entry(&target_id) {
+                    let mut drained = 0usize;
                     while let Some(event) = target.poll(cx, now) {
                         match event {
                             TargetEvent::Request(req) => {
@@ -1228,6 +1245,11 @@ impl Stream for Handler {
                                     }
                                 }
                             }
+                        }
+                        drained += 1;
+                        if drained >= PER_TARGET_DRAIN_BUDGET {
+                            budget_hit = true;
+                            break;
                         }
                     }
 
@@ -1262,6 +1284,10 @@ impl Stream for Handler {
                             ws_err = Some(err);
                             break;
                         }
+                    }
+                    if ws_msgs.len() >= WS_MSG_BUDGET {
+                        budget_hit = true;
+                        break;
                     }
                 }
             }
@@ -1321,6 +1347,14 @@ impl Stream for Handler {
 
             if dispose {
                 return Poll::Ready(None);
+            }
+
+            if budget_hit {
+                // yield to the scheduler; self-wake so the remaining
+                // work resumes on the next tick without waiting for
+                // a WS event.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
 
             if done {

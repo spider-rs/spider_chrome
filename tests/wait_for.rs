@@ -1137,3 +1137,77 @@ async fn wait_for_delay_sleeps() {
         "wait_for_delay should sleep at least ~200ms, got {elapsed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fan-out stress: 1024 concurrent waiters exercise the drain budget
+// ---------------------------------------------------------------------------
+//
+// Background: the target's waiter queues (`wait_for_*`) used to be drained
+// with unbounded `while let Some(tx) = pop()` loops inside `Target::poll`.
+// Each queue now drains at most `WAITER_DRAIN_BUDGET = 64` senders per poll
+// and self-wakes if more remain, which spreads fan-out across multiple polls.
+//
+// This test stresses that path with 1024 waiters across both queues (`load`
+// and `dom_content_loaded`). If the re-arm is broken (missing `wake_by_ref`
+// after a partial drain), these waiters will stall mid-queue and the test
+// will time out — which is what the per-task timeout catches.
+//
+// Scale chosen so the budget has to cycle at least 16 times per queue,
+// proving re-arm works across many polls without deadlock.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_concurrent_waiters_drain_without_deadlock() {
+    if try_browser_config().is_none() {
+        eprintln!("skipping: no Chrome/Chromium executable found");
+        return;
+    }
+
+    let browser = launch(headless_config("fan-out-drain")).await;
+
+    let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
+        .await
+        .expect("new_page should not time out")
+        .expect("new_page should resolve");
+
+    // Kick a real navigation (about:blank may already be `loaded` at this
+    // point, which would make every waiter fire inline and bypass the
+    // queue). A real goto forces the target to reset lifecycle state and
+    // re-enqueue fresh waiters.
+    timeout(Duration::from_secs(30), page.goto(TARGET))
+        .await
+        .expect("goto should not time out")
+        .expect("goto should succeed");
+
+    const WAITERS_PER_QUEUE: usize = 512;
+    let mut futs = Vec::with_capacity(WAITERS_PER_QUEUE * 2);
+
+    for i in 0..WAITERS_PER_QUEUE {
+        let p = page.clone();
+        futs.push(tokio::spawn(async move {
+            timeout(Duration::from_secs(30), p.wait_for_load())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("wait_for_load({i}) timed out — drain-budget deadlock?")
+                })
+                .unwrap_or_else(|err| panic!("wait_for_load({i}) failed: {err}"));
+        }));
+    }
+    for i in 0..WAITERS_PER_QUEUE {
+        let p = page.clone();
+        futs.push(tokio::spawn(async move {
+            timeout(Duration::from_secs(30), p.wait_for_dom_content_loaded())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("wait_for_dom_content_loaded({i}) timed out — drain-budget deadlock?")
+                })
+                .unwrap_or_else(|err| {
+                    panic!("wait_for_dom_content_loaded({i}) failed: {err}")
+                });
+        }));
+    }
+
+    for (i, fut) in futs.into_iter().enumerate() {
+        fut.await
+            .unwrap_or_else(|err| panic!("task {i} panicked: {err}"));
+    }
+}
