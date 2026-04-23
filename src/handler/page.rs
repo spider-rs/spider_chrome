@@ -63,7 +63,20 @@ pub struct PageHandle {
     page: Arc<PageInner>,
 }
 
+/// Default capacity of the per-page `TargetMessage` channel.
+///
+/// Historical hard-coded value preserved for backwards compatibility —
+/// `PageHandle::new` delegates to `PageHandle::with_capacity` with this
+/// value. Override via `HandlerConfig::page_channel_capacity` (plumbed
+/// through `BrowserConfigBuilder::page_channel_capacity`) to tune under
+/// bursty per-page command load, which otherwise forces every extra
+/// command into the `CommandFuture` async-send fallback path.
+pub(crate) const DEFAULT_PAGE_CHANNEL_CAPACITY: usize = 2048;
+
 impl PageHandle {
+    /// Create a `PageHandle` with the default per-page channel capacity
+    /// (`DEFAULT_PAGE_CHANNEL_CAPACITY`). Preserved unchanged for
+    /// backwards compatibility — call `with_capacity` to override.
     pub fn new(
         target_id: TargetId,
         session_id: SessionId,
@@ -71,7 +84,36 @@ impl PageHandle {
         request_timeout: std::time::Duration,
         page_wake: Option<Arc<Notify>>,
     ) -> Self {
-        let (commands, rx) = channel(2048);
+        Self::with_capacity(
+            target_id,
+            session_id,
+            opener_id,
+            request_timeout,
+            page_wake,
+            DEFAULT_PAGE_CHANNEL_CAPACITY,
+        )
+    }
+
+    /// Create a `PageHandle` with a caller-chosen channel capacity.
+    ///
+    /// `capacity` is the tokio mpsc buffer size for `TargetMessage`s flowing
+    /// from this page to the handler. Capacity is clamped to at least `1`
+    /// because `tokio::sync::mpsc::channel(0)` panics; callers passing `0`
+    /// get a 1-slot channel instead of an abort.
+    ///
+    /// Under bursty per-page load, larger capacities reduce the rate at
+    /// which `CommandFuture` / `TargetMessageFuture` fall back to the
+    /// boxed async-send slow path on `TrySendError::Full`; smaller
+    /// capacities apply back-pressure sooner at the cost of that fallback.
+    pub fn with_capacity(
+        target_id: TargetId,
+        session_id: SessionId,
+        opener_id: Option<TargetId>,
+        request_timeout: std::time::Duration,
+        page_wake: Option<Arc<Notify>>,
+        capacity: usize,
+    ) -> Self {
+        let (commands, rx) = channel(capacity.max(1));
         let page = PageInner {
             target_id,
             session_id,
@@ -1069,4 +1111,113 @@ pub(crate) async fn send_command<T: Command>(
         }
     }
     Ok(rx)
+}
+
+#[cfg(test)]
+mod page_channel_capacity_tests {
+    //! Unit tests for `PageHandle::with_capacity` and the capacity plumbing.
+    //!
+    //! These verify the three guarantees that keep the change
+    //! backwards-compatible and panic-free:
+    //!
+    //! 1. `PageHandle::new` (legacy signature) still allocates the historic
+    //!    2048-slot channel — proven by filling the channel to exactly
+    //!    `DEFAULT_PAGE_CHANNEL_CAPACITY` via `try_send` and then expecting
+    //!    the next `try_send` to return `Full`. This pins the default.
+    //!
+    //! 2. `PageHandle::with_capacity(N)` allocates an N-slot channel for
+    //!    any N, verified the same way at a small N so the test runs fast.
+    //!
+    //! 3. `PageHandle::with_capacity(0)` does NOT panic — we clamp to 1
+    //!    internally because `tokio::sync::mpsc::channel(0)` aborts. The
+    //!    resulting channel has exactly one slot.
+    //!
+    //! No browser / runtime is spun up — these tests are purely in-process
+    //! on the mpsc primitives.
+    use super::{PageHandle, DEFAULT_PAGE_CHANNEL_CAPACITY};
+    use crate::handler::target::TargetMessage;
+    use chromiumoxide_cdp::cdp::browser_protocol::target::{SessionId, TargetId};
+    use std::time::Duration;
+    use tokio::sync::mpsc::error::TrySendError;
+
+    /// Trivial zero-cost `TargetMessage` for filling the channel.
+    /// We're only exercising the bounded-mpsc slot count — the payload
+    /// shape is irrelevant, so use the smallest variant.
+    fn make_msg() -> TargetMessage {
+        TargetMessage::BlockNetwork(false)
+    }
+
+    fn make_handle(capacity: usize) -> PageHandle {
+        PageHandle::with_capacity(
+            TargetId::from("t".to_string()),
+            SessionId::from("s".to_string()),
+            None,
+            Duration::from_secs(30),
+            None,
+            capacity,
+        )
+    }
+
+    /// Fill a page's channel to capacity via `try_send` and return the
+    /// observed slot count — the number of sends that succeeded before
+    /// the first `Full` error.
+    fn observed_capacity(handle: &PageHandle, upper_bound: usize) -> usize {
+        // `PageSender` is the page's send half; `try_send` surfaces the
+        // underlying mpsc `TrySendError::Full` once the bounded buffer
+        // is saturated without consuming a slot, which is what we count.
+        let sender = &handle.page.sender;
+        let mut sent = 0;
+        for _ in 0..upper_bound {
+            match sender.try_send(make_msg()) {
+                Ok(()) => sent += 1,
+                Err(TrySendError::Full(_)) => return sent,
+                Err(TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed at {sent} sends")
+                }
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn new_delegates_to_default_capacity() {
+        let handle = PageHandle::new(
+            TargetId::from("t".to_string()),
+            SessionId::from("s".to_string()),
+            None,
+            Duration::from_secs(30),
+            None,
+        );
+        let n = observed_capacity(&handle, DEFAULT_PAGE_CHANNEL_CAPACITY + 16);
+        assert_eq!(
+            n, DEFAULT_PAGE_CHANNEL_CAPACITY,
+            "legacy PageHandle::new must preserve the 2048-slot default"
+        );
+    }
+
+    #[test]
+    fn with_capacity_respects_arbitrary_value() {
+        // Small N keeps the test fast; 4 is enough to distinguish from
+        // the 2048 default.
+        for n in [1_usize, 4, 16, 64] {
+            let handle = make_handle(n);
+            assert_eq!(
+                observed_capacity(&handle, n + 16),
+                n,
+                "with_capacity({n}) should produce exactly {n} slots",
+            );
+        }
+    }
+
+    #[test]
+    fn zero_capacity_is_clamped_to_one_and_does_not_panic() {
+        // `tokio::sync::mpsc::channel(0)` panics — our `.max(1)` clamp
+        // must turn that into a single-slot channel rather than an abort.
+        let handle = make_handle(0);
+        assert_eq!(
+            observed_capacity(&handle, 4),
+            1,
+            "zero capacity must clamp to 1 and not panic"
+        );
+    }
 }

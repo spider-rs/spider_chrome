@@ -304,6 +304,7 @@ impl Browser {
             #[cfg(feature = "adblock")]
             adblock_filter_rules: config.adblock_filter_rules.clone(),
             channel_capacity: config.channel_capacity,
+            page_channel_capacity: config.page_channel_capacity,
             connection_retries: config.connection_retries,
         };
 
@@ -913,6 +914,11 @@ pub struct BrowserConfig {
     /// Capacity of the channel between browser handle and handler.
     /// Defaults to 1000.
     pub channel_capacity: usize,
+    /// Capacity of the per-page mpsc channel carrying `TargetMessage`s
+    /// from each `Page` to the handler. Defaults to 2048; override via
+    /// `page_channel_capacity(N)` on the builder. Values of `0` are
+    /// clamped to `1` at channel creation.
+    pub page_channel_capacity: usize,
     /// Number of WebSocket connection retry attempts with exponential backoff.
     /// Defaults to 4.
     pub connection_retries: u32,
@@ -992,6 +998,8 @@ pub struct BrowserConfigBuilder {
     adblock_filter_rules: Option<Vec<String>>,
     /// Capacity of the channel between browser handle and handler.
     channel_capacity: usize,
+    /// Capacity of the per-page mpsc `TargetMessage` channel.
+    page_channel_capacity: usize,
     /// Number of WebSocket connection retry attempts.
     connection_retries: u32,
 }
@@ -1049,6 +1057,7 @@ impl Default for BrowserConfigBuilder {
             #[cfg(feature = "adblock")]
             adblock_filter_rules: None,
             channel_capacity: 4096,
+            page_channel_capacity: crate::handler::page::DEFAULT_PAGE_CHANNEL_CAPACITY,
             connection_retries: crate::conn::DEFAULT_CONNECTION_RETRIES,
         }
     }
@@ -1276,6 +1285,19 @@ impl BrowserConfigBuilder {
         self
     }
 
+    /// Set the capacity of the per-page mpsc channel carrying
+    /// `TargetMessage`s from each `Page` to the handler.
+    ///
+    /// Defaults to 2048 (the previous hard-coded value). Tune upward to
+    /// absorb bursts of commands without pushing them onto the
+    /// `CommandFuture` async-send fallback path; tune downward to apply
+    /// back-pressure sooner. Values of `0` are clamped to `1` at channel
+    /// creation time (tokio panics on a zero-capacity mpsc).
+    pub fn page_channel_capacity(mut self, capacity: usize) -> Self {
+        self.page_channel_capacity = capacity;
+        self
+    }
+
     /// Set the number of WebSocket connection retry attempts with exponential backoff.
     /// Defaults to 4. Set to 0 for a single attempt with no retries.
     pub fn connection_retries(mut self, retries: u32) -> Self {
@@ -1327,6 +1349,7 @@ impl BrowserConfigBuilder {
             #[cfg(feature = "adblock")]
             adblock_filter_rules: self.adblock_filter_rules,
             channel_capacity: self.channel_capacity,
+            page_channel_capacity: self.page_channel_capacity,
             connection_retries: self.connection_retries,
         })
     }

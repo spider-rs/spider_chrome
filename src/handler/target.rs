@@ -325,12 +325,13 @@ impl Target {
     fn create_page(&mut self) {
         if self.page.is_none() {
             if let Some(session) = self.session_id.clone() {
-                let handle = PageHandle::new(
+                let handle = PageHandle::with_capacity(
                     self.target_id().clone(),
                     session,
                     self.opener_id().cloned(),
                     self.config.request_timeout,
                     self.config.page_wake.clone(),
+                    self.config.page_channel_capacity,
                 );
                 self.page = Some(handle);
             }
@@ -1449,6 +1450,12 @@ pub struct TargetConfig {
     /// Optional notify handle for waking `Handler::run()`'s select loop.
     /// `None` when using the `impl Stream for Handler` path (no overhead).
     pub page_wake: Option<Arc<Notify>>,
+    /// Capacity of the per-page mpsc channel carrying `TargetMessage`s
+    /// from the page handle to the handler. Defaults to
+    /// `crate::handler::page::DEFAULT_PAGE_CHANNEL_CAPACITY` (2048);
+    /// override via `HandlerConfig::page_channel_capacity`. Clamped to
+    /// a minimum of 1 at channel creation time.
+    pub page_channel_capacity: usize,
 }
 
 impl Default for TargetConfig {
@@ -1476,6 +1483,7 @@ impl Default for TargetConfig {
             #[cfg(feature = "adblock")]
             adblock_filter_rules: None,
             page_wake: None,
+            page_channel_capacity: crate::handler::page::DEFAULT_PAGE_CHANNEL_CAPACITY,
         }
     }
 }

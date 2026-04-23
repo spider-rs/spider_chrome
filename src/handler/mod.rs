@@ -537,6 +537,7 @@ impl Handler {
                 #[cfg(feature = "adblock")]
                 adblock_filter_rules: self.config.adblock_filter_rules.clone(),
                 page_wake: self.page_wake.clone(),
+                page_channel_capacity: self.config.page_channel_capacity,
             },
             browser_ctx,
         );
@@ -1425,6 +1426,17 @@ pub struct HandlerConfig {
     /// Capacity of the channel between browser handle and handler.
     /// Defaults to 1000.
     pub channel_capacity: usize,
+    /// Capacity of the per-page mpsc channel carrying `TargetMessage`s
+    /// from each `Page` to the handler.
+    ///
+    /// Defaults to `DEFAULT_PAGE_CHANNEL_CAPACITY` (2048) — the previous
+    /// hard-coded value. Tune upward for pages that burst many commands
+    /// (heavy `evaluate`/selector use, high-concurrency tasks sharing
+    /// one page) to avoid pushing each extra command onto the
+    /// `CommandFuture` async-send fallback path on `TrySendError::Full`.
+    /// Tune downward to apply back-pressure sooner. Values of `0` are
+    /// clamped to `1` at channel creation.
+    pub page_channel_capacity: usize,
     /// Number of WebSocket connection retry attempts with exponential backoff.
     /// Defaults to 4.
     pub connection_retries: u32,
@@ -1458,6 +1470,7 @@ impl Default for HandlerConfig {
             #[cfg(feature = "adblock")]
             adblock_filter_rules: None,
             channel_capacity: 4096,
+            page_channel_capacity: crate::handler::page::DEFAULT_PAGE_CHANNEL_CAPACITY,
             connection_retries: crate::conn::DEFAULT_CONNECTION_RETRIES,
         }
     }
@@ -1585,6 +1598,37 @@ mod tests {
             target.session_id().map(AsRef::as_ref),
             Some("session-1"),
             "attach response should seed the flat session id even before Target.attachedToTarget"
+        );
+    }
+
+    /// Regression guard: `page_channel_capacity` must default to 2048
+    /// everywhere, so existing callers see identical behavior to the
+    /// previous hard-coded value. If this test ever fails, every caller
+    /// that relied on the implicit 2048-slot channel silently changed.
+    #[test]
+    fn page_channel_capacity_defaults_to_2048_across_configs() {
+        use crate::browser::BrowserConfigBuilder;
+        use crate::handler::page::DEFAULT_PAGE_CHANNEL_CAPACITY;
+        use crate::handler::target::TargetConfig;
+
+        assert_eq!(DEFAULT_PAGE_CHANNEL_CAPACITY, 2048);
+        assert_eq!(
+            HandlerConfig::default().page_channel_capacity,
+            DEFAULT_PAGE_CHANNEL_CAPACITY,
+            "HandlerConfig default must match the historical 2048 slot count"
+        );
+        assert_eq!(
+            TargetConfig::default().page_channel_capacity,
+            DEFAULT_PAGE_CHANNEL_CAPACITY,
+            "TargetConfig default must match the historical 2048 slot count"
+        );
+        // BrowserConfigBuilder default → build a builder (no executable
+        // check needed: we only inspect the numeric field, not `build()`).
+        let builder = BrowserConfigBuilder::default();
+        let bc = format!("{:?}", builder);
+        assert!(
+            bc.contains("page_channel_capacity: 2048"),
+            "BrowserConfigBuilder must default page_channel_capacity to 2048, got: {bc}",
         );
     }
 }
