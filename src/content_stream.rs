@@ -221,10 +221,15 @@ impl Sink {
 impl Drop for Sink {
     fn drop(&mut self) {
         if let Sink::Disk { path, .. } = self {
-            let p = path.clone();
-            tokio::spawn(async move {
-                let _ = tokio::fs::remove_file(&p).await;
-            });
+            // Enqueue the file removal onto the shared background
+            // cleanup worker (see `crate::bg_cleanup`). This is a
+            // wait-free atomic-load + mpsc-push — no tokio runtime
+            // context required on the Drop thread, and no panic surface
+            // even during a panic unwind. If the worker hasn't been
+            // initialised yet (e.g. Sink dropped before any CDP stream
+            // was opened), the task is silently discarded — strictly
+            // better than a Drop-time panic-abort.
+            crate::bg_cleanup::submit(crate::bg_cleanup::CleanupTask::RemoveFile(path.clone()));
         }
     }
 }
@@ -422,9 +427,13 @@ async fn pump_next(
 /// Init the page-side wrapper and measure length.  Returns `None` if the
 /// document has zero UTF-16 code units (empty page).
 async fn init_state(page: &Page) -> Result<Option<(RemoteRefGuard, u32, u32)>> {
-    // Ensure the batched release worker is running in this runtime.
-    // Single `OnceLock` load on the hot path after first init — no await.
+    // Ensure both background workers are running in this runtime:
+    // - `runtime_release` for async JS-object releases
+    // - `bg_cleanup` for async temp-file cleanup and CDP IO.close
+    // Both are a single `OnceLock` load on the hot path after first
+    // init — no await, no sync primitive after the first call.
     crate::runtime_release::init_worker();
+    crate::bg_cleanup::init_worker();
 
     let ctx = page.execution_context().await?;
 
@@ -766,5 +775,91 @@ mod utf16_len_tests {
         let s: String = "a€b😀c".repeat(512);
         let expected: u32 = s.encode_utf16().count() as u32;
         assert_eq!(utf16_len_of_utf8(s.as_bytes()), expected);
+    }
+}
+
+#[cfg(test)]
+mod drop_guard_primitive_tests {
+    //! Canary for the `Handle::try_current()` primitive every Drop
+    //! guard in this crate relies on (Sink, ChunkSink, StreamGuard).
+    //!
+    //! `StreamGuard::Drop` holds a `Page` that needs a live browser to
+    //! construct and `Sink`/`ChunkSink` variants are feature-gated —
+    //! if the primitive ever stops returning `Err` on a plain
+    //! `std::thread`, the whole guard pattern falls over silently and
+    //! we'd lose the panic-abort protection without noticing. This
+    //! test runs in every configuration (no feature flags required).
+
+    #[test]
+    fn try_current_is_err_on_plain_thread() {
+        let ok_outside = std::thread::spawn(|| {
+            tokio::runtime::Handle::try_current().is_ok()
+        })
+        .join()
+        .expect("thread panicked");
+        assert!(
+            !ok_outside,
+            "Handle::try_current() must return Err on a std::thread that \
+             is not executing inside a tokio runtime. Every `if let Ok(rt) = \
+             Handle::try_current()` guard in this crate depends on it."
+        );
+    }
+
+    #[test]
+    fn try_current_is_ok_inside_runtime() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let ok_inside = rt.block_on(async {
+            tokio::runtime::Handle::try_current().is_ok()
+        });
+        assert!(
+            ok_inside,
+            "Handle::try_current() must return Ok inside a tokio runtime \
+             so the production Drop path still schedules its cleanup."
+        );
+    }
+}
+
+#[cfg(all(test, feature = "_cache_stream_disk"))]
+mod sink_drop_tests {
+    //! `Drop for Sink` enqueues a `CleanupTask::RemoveFile` onto the
+    //! shared `bg_cleanup` worker — a wait-free `OnceLock::get()` +
+    //! `UnboundedSender::send`. There is no `tokio::spawn` on the
+    //! Drop thread, so dropping on a plain `std::thread` (no runtime
+    //! context) cannot panic, even during a panic unwind.
+    //!
+    //! We construct `Sink::Disk` via `tokio::fs::File::from_std` over
+    //! a sync-created temp file (which does not require a runtime),
+    //! move the sink across a thread boundary, drop it there, and
+    //! assert no panic.
+    use super::Sink;
+
+    #[test]
+    fn drop_outside_runtime_is_best_effort_not_panic() {
+        let path = std::env::temp_dir().join(format!(
+            "chromey-sink-drop-test-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        let std_file = std::fs::File::create(&path).expect("create temp file");
+        let tokio_file = tokio::fs::File::from_std(std_file);
+        let sink = Sink::Disk {
+            file: tokio_file,
+            path: path.clone(),
+        };
+
+        std::thread::spawn(move || {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "test thread must not be inside a tokio runtime"
+            );
+            drop(sink);
+        })
+        .join()
+        .expect("Drop must not panic on a non-tokio thread");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

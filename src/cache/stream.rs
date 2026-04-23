@@ -128,10 +128,15 @@ impl<'a> StreamGuard<'a> {
 impl Drop for StreamGuard<'_> {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            let page = self.page.clone();
-            // Fire-and-forget on a background task so Drop is non-blocking.
-            tokio::spawn(async move {
-                let _ = page.execute(CloseParams { handle }).await;
+            // Enqueue the CDP `IO.close` onto the shared background
+            // cleanup worker (see `crate::bg_cleanup`) — wait-free
+            // atomic-load + mpsc-push, safe from Drop on any thread.
+            // If the worker hasn't been initialised yet, the close is
+            // silently discarded; Chrome GCs the stream handle when
+            // the page is closed.
+            crate::bg_cleanup::submit(crate::bg_cleanup::CleanupTask::CloseCdpStream {
+                page: self.page.clone(),
+                handle,
             });
         }
     }
@@ -262,13 +267,13 @@ impl ChunkSink {
 #[cfg(feature = "_cache_stream_disk")]
 impl Drop for ChunkSink {
     fn drop(&mut self) {
-        // If the sink is dropped without calling `finish` (e.g. early error),
-        // clean up the temp file in the background.
+        // If the sink is dropped without calling `finish` (e.g. early
+        // error), enqueue the temp-file removal onto the shared
+        // background cleanup worker (see `crate::bg_cleanup`).
+        // Wait-free atomic-load + mpsc-push; safe from any thread
+        // including during a panic unwind.
         if let ChunkSink::Disk { path, .. } = self {
-            let path = path.clone();
-            tokio::spawn(async move {
-                let _ = tokio::fs::remove_file(&path).await;
-            });
+            crate::bg_cleanup::submit(crate::bg_cleanup::CleanupTask::RemoveFile(path.clone()));
         }
     }
 }
@@ -410,6 +415,12 @@ pub async fn read_response_body_as_stream(
     request_id: impl Into<chromiumoxide_cdp::cdp::browser_protocol::fetch::RequestId>,
     content_length_hint: Option<usize>,
 ) -> StreamResult {
+    // Ensure the background cleanup worker is running in this runtime
+    // so later `StreamGuard::Drop` / `ChunkSink::Drop` submissions land
+    // on a live receiver. Single atomic load on the hot path after the
+    // first call.
+    crate::bg_cleanup::init_worker();
+
     INFLIGHT_STREAMS.fetch_add(1, Ordering::Relaxed);
     let _dec = DecrementOnDrop(&INFLIGHT_STREAMS);
 
@@ -523,3 +534,49 @@ impl Drop for DecrementOnDrop<'_> {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+#[cfg(all(test, feature = "_cache_stream_disk"))]
+mod chunk_sink_drop_tests {
+    //! `Drop for ChunkSink` enqueues a `CleanupTask::RemoveFile` onto
+    //! the shared `bg_cleanup` worker via a wait-free `OnceLock::get()`
+    //! plus `UnboundedSender::send`. No `tokio::spawn` runs on the
+    //! Drop thread, so dropping on a plain `std::thread` (no runtime
+    //! context) cannot panic, even during a panic unwind.
+    //!
+    //! This test exercises that end-to-end: construct a `ChunkSink::Disk`
+    //! in the main thread, move it across a thread boundary, drop it
+    //! on a `std::thread` that has no tokio runtime, and assert no
+    //! panic.
+    use super::ChunkSink;
+
+    #[test]
+    fn drop_outside_runtime_is_best_effort_not_panic() {
+        let path = std::env::temp_dir().join(format!(
+            "chromey-chunksink-drop-test-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        let std_file = std::fs::File::create(&path).expect("create temp file");
+        let tokio_file = tokio::fs::File::from_std(std_file);
+        let sink = ChunkSink::Disk {
+            file: tokio_file,
+            path: path.clone(),
+        };
+
+        std::thread::spawn(move || {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "test thread must not be inside a tokio runtime"
+            );
+            drop(sink);
+        })
+        .join()
+        .expect("Drop must not panic on a non-tokio thread");
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+

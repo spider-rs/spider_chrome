@@ -64,6 +64,7 @@
 
 pub mod async_process;
 pub mod auth;
+pub mod bg_cleanup;
 pub mod browser;
 #[cfg(feature = "_cache")]
 pub mod cache;

@@ -231,6 +231,13 @@ impl Browser {
     /// processes stderr for more than the configured `launch_timeout`
     /// (20 seconds by default).
     pub async fn launch(mut config: BrowserConfig) -> Result<(Self, Handler)> {
+        // Eagerly initialize the background cleanup worker in this
+        // runtime so that later `Drop` calls on CDP streams / temp
+        // files (from `bg_cleanup::submit`) land on a live receiver.
+        // This is a single atomic load after the first call — safe
+        // and cheap to invoke on every `launch`.
+        crate::bg_cleanup::init_worker();
+
         // Canonalize paths to reduce issues with sandboxing
         config.executable = utils::canonicalize_except_snap(config.executable).await?;
 
