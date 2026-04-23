@@ -431,23 +431,6 @@ where
     }
 }
 
-/// Drain every in-flight decode in submit order, forwarding each
-/// result to the Handler. Used at shutdown paths (stream ended,
-/// `Close` frame, transport error) so messages that had already been
-/// pulled off the socket aren't silently lost.
-async fn drain_in_flight<T>(
-    in_flight: &mut FuturesOrdered<InFlightDecode<T>>,
-    tx: &mpsc::Sender<Result<Box<Message<T>>>>,
-) where
-    T: EventMessage + Send + 'static,
-{
-    while let Some(res) = in_flight.next().await {
-        if !emit_decoded(tx, res).await {
-            return;
-        }
-    }
-}
-
 /// Background task that reads frames from the WebSocket, decodes them to
 /// typed CDP `Message<T>`, and forwards them to the Handler over a
 /// bounded mpsc.
@@ -488,11 +471,23 @@ where
     // queue avoids `Box<dyn Future>` overhead.
     let mut in_flight: FuturesOrdered<InFlightDecode<T>> = FuturesOrdered::new();
 
+    // Shutdown state. When the stream signals `Close`, transport
+    // error, or end-of-stream, we stop reading new frames but keep
+    // running the select loop so the emit arm can flush any still
+    // in-flight decodes *interleaved with* whatever else the runtime
+    // is doing. A pending transport error is surfaced to the Handler
+    // only after the in-order flush completes.
+    let mut stream_terminated = false;
+    let mut pending_err: Option<CdpError> = None;
+
     loop {
         tokio::select! {
             // Bias: emit already-ready decodes before reading more
             // frames. Keeps the pipeline small in the steady state
-            // while still allowing concurrency under burst.
+            // while still allowing concurrency under burst, and —
+            // critically during shutdown — drains the pipeline one
+            // ready item at a time inside the select loop instead
+            // of blocking in a dedicated drain helper.
             biased;
 
             // Emit the head of the pipeline as soon as it is ready.
@@ -505,11 +500,13 @@ where
                 }
             }
 
-            // Read the next frame if the pipeline has capacity.
-            // Guard prevents unbounded memory growth when the
-            // Handler is slow and back-pressure propagates here
-            // from the head of `in_flight`.
-            maybe_frame = stream.next(), if in_flight.len() < MAX_IN_FLIGHT_DECODES => {
+            // Read the next frame if the pipeline has capacity and
+            // the stream hasn't terminated. Disabled once the stream
+            // signals end (Close / None / Err) so subsequent loop
+            // iterations only do emit work.
+            maybe_frame = stream.next(),
+                if !stream_terminated && in_flight.len() < MAX_IN_FLIGHT_DECODES =>
+            {
                 match maybe_frame {
                     Some(Ok(WsMessage::Text(text))) => {
                         // Zero-copy enqueue. The small-frame fast
@@ -547,8 +544,7 @@ where
                         }
                     }
                     Some(Ok(WsMessage::Close(_))) => {
-                        drain_in_flight(&mut in_flight, &tx).await;
-                        return;
+                        stream_terminated = true;
                     }
                     Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => {}
                     Some(Ok(msg)) => {
@@ -559,22 +555,33 @@ where
                         );
                     }
                     Some(Err(err)) => {
-                        // Preserve ordering: flush already-decoded
-                        // frames that arrived before the transport
-                        // error before surfacing the error itself.
-                        drain_in_flight(&mut in_flight, &tx).await;
-                        let _ = tx.send(Err(CdpError::Ws(err))).await;
-                        return;
+                        // Defer the error until after the already
+                        // in-flight decodes have emitted — preserves
+                        // the ordering contract that callers see
+                        // frames up to the failure point before the
+                        // error itself.
+                        stream_terminated = true;
+                        pending_err = Some(CdpError::Ws(err));
                     }
                     None => {
-                        // Stream terminated (connection closed
-                        // without a `Close` frame). Drain and exit.
-                        drain_in_flight(&mut in_flight, &tx).await;
-                        return;
+                        // Stream ended (connection closed without a
+                        // `Close` frame). No more input, but
+                        // in_flight may still hold pending decodes.
+                        stream_terminated = true;
                     }
                 }
             }
+
+            // Both arms disabled: `in_flight` is empty AND
+            // `stream_terminated`. We have nothing more to do.
+            else => {
+                break;
+            }
         }
+    }
+
+    if let Some(err) = pending_err {
+        let _ = tx.send(Err(err)).await;
     }
 }
 
