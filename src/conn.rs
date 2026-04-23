@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::ready;
 
-use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, Stream, StreamExt};
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
@@ -269,34 +269,63 @@ impl<T: EventMessage> Connection<T> {
 /// enough to apply back-pressure before memory grows without bound.
 const WS_CMD_CHANNEL_CAPACITY: usize = 2048;
 
+/// Capacity of the bounded channel from the background WS reader task to
+/// the Handler. Keeps decoded CDP messages buffered so the reader task
+/// can keep reading the socket while the Handler processes a backlog;
+/// applies TCP-level back-pressure on Chrome when the Handler is slow
+/// (the reader awaits channel capacity, stops draining the socket).
+const WS_READ_CHANNEL_CAPACITY: usize = 1024;
+
 /// Split parts returned by [`Connection::into_async`].
 #[derive(Debug)]
 pub struct AsyncConnection<T: EventMessage> {
-    /// WebSocket read stream — yields decoded CDP messages.
+    /// Receive half for decoded CDP messages. Backed by a bounded mpsc
+    /// fed by a dedicated background reader task — decode runs on that
+    /// task, never on the Handler task, so large CDP responses (multi-MB
+    /// screenshots, huge event payloads) cannot stall the Handler's
+    /// event loop.
     pub reader: WsReader<T>,
     /// Sender half for submitting outgoing CDP commands.
     pub cmd_tx: mpsc::Sender<MethodCall>,
     /// Handle to the background writer task.
     pub writer_handle: tokio::task::JoinHandle<Result<()>>,
+    /// Handle to the background reader task (reads + decodes WS frames).
+    pub reader_handle: tokio::task::JoinHandle<()>,
     /// Next command-call-id counter (continue numbering from where Connection left off).
     pub next_id: usize,
 }
 
-impl<T: EventMessage + Unpin> Connection<T> {
-    /// Consume the connection and split into an async reader + background writer.
+impl<T: EventMessage + Unpin + Send + 'static> Connection<T> {
+    /// Consume the connection and split into a background reader + writer
+    /// pair, exposing the Handler-facing ends via `AsyncConnection`.
     ///
-    /// The writer task batches outgoing commands: it `recv()`s the first
-    /// command, then drains all immediately-available commands via
-    /// `try_recv()` before flushing the batch to the WebSocket in one
-    /// write.
+    /// Two `tokio::spawn`'d tasks are created:
+    ///
+    /// * `ws_write_loop` — batches outgoing commands and flushes them in
+    ///   one write per wakeup.
+    /// * `ws_read_loop`  — reads WS frames, decodes them to typed
+    ///   `Message<T>`, and forwards them via a bounded mpsc to the
+    ///   Handler. Ping/pong/malformed frames are skipped on this task
+    ///   and never reach the Handler. Large-message decode (SerDe CPU
+    ///   work) runs here, **not** on the Handler task, so the Handler's
+    ///   poll loop never stalls for tens of milliseconds on a 10 MB
+    ///   screenshot response.
+    ///
+    /// The design uses only `tokio::spawn` (cooperative async) — no
+    /// `spawn_blocking` or blocking thread-pool — so it scales with the
+    /// tokio runtime's worker threads on multi-threaded runtimes, and
+    /// interleaves cleanly with the Handler task on single-threaded
+    /// runtimes.
     pub fn into_async(self) -> AsyncConnection<T> {
         let (ws_sink, ws_stream) = self.ws.split();
         let (cmd_tx, cmd_rx) = mpsc::channel(WS_CMD_CHANNEL_CAPACITY);
+        let (msg_tx, msg_rx) = mpsc::channel::<Result<Box<Message<T>>>>(WS_READ_CHANNEL_CAPACITY);
 
         let writer_handle = tokio::spawn(ws_write_loop(ws_sink, cmd_rx));
+        let reader_handle = tokio::spawn(ws_read_loop::<T, _>(ws_stream, msg_tx));
 
         let reader = WsReader {
-            inner: ws_stream,
+            rx: msg_rx,
             _marker: PhantomData,
         };
 
@@ -304,7 +333,90 @@ impl<T: EventMessage + Unpin> Connection<T> {
             reader,
             cmd_tx,
             writer_handle,
+            reader_handle,
             next_id: self.next_id,
+        }
+    }
+}
+
+/// Background task that reads frames from the WebSocket, decodes them to
+/// typed CDP `Message<T>`, and forwards them to the Handler over a
+/// bounded mpsc.
+///
+/// Runs on a `tokio::spawn`'d task — **not** `spawn_blocking` — so CPU
+/// time for JSON decode is charged to a regular tokio worker and not the
+/// blocking thread pool. On a multi-threaded runtime, the decode can run
+/// on a different worker than the Handler, giving true parallelism for
+/// large messages. On a single-threaded runtime, it cooperates with the
+/// Handler via `.await` points on the send channel.
+///
+/// Flow per frame:
+///
+/// * `Text` / `Binary` → `decode_message::<T>`; decoded `Ok(msg)` is
+///   sent to the Handler. Decode errors are logged and the frame is
+///   dropped (same behavior as the legacy inline decode path).
+/// * `Close` → loop exits cleanly, dropping `tx`. The Handler's
+///   `next_message().await` returns `None` on the next call.
+/// * `Ping` / `Pong` / unexpected frame types → skipped silently; they
+///   never cross the channel to the Handler.
+/// * Transport error → forwarded as `Err(CdpError::Ws(..))`, then the
+///   loop exits (the WS half is considered dead after an error).
+///
+/// Back-pressure: the outbound `tx` is bounded. If the Handler is busy
+/// and the channel fills, `tx.send(..).await` parks this task, which
+/// stops draining the WS socket. TCP flow control then applies
+/// back-pressure to Chrome instead of letting memory grow without bound.
+async fn ws_read_loop<T, S>(mut stream: S, tx: mpsc::Sender<Result<Box<Message<T>>>>)
+where
+    T: EventMessage,
+    S: Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    while let Some(frame) = stream.next().await {
+        match frame {
+            Ok(WsMessage::Text(text)) => {
+                match decode_message::<T>(text.as_bytes(), Some(&text)) {
+                    Ok(msg) => {
+                        if tx.send(Ok(msg)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            target: "chromiumoxide::conn::raw_ws::parse_errors",
+                            "Dropping malformed text WS frame: {err}",
+                        );
+                    }
+                }
+            }
+            Ok(WsMessage::Binary(buf)) => match decode_message::<T>(&buf, None) {
+                Ok(msg) => {
+                    if tx.send(Ok(msg)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        target: "chromiumoxide::conn::raw_ws::parse_errors",
+                        "Dropping malformed binary WS frame: {err}",
+                    );
+                }
+            },
+            Ok(WsMessage::Close(_)) => return,
+            Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
+            Ok(msg) => {
+                tracing::debug!(
+                    target: "chromiumoxide::conn::raw_ws::parse_errors",
+                    "Unexpected WS message type: {:?}",
+                    msg
+                );
+            }
+            Err(err) => {
+                // Forward the error once, then exit. The Handler will
+                // observe it on the next `next_message()` call.
+                let _ = tx.send(Err(CdpError::Ws(err))).await;
+                return;
+            }
         }
     }
 }
@@ -334,58 +446,30 @@ async fn ws_write_loop(
     Ok(())
 }
 
-/// Read half of a split WebSocket connection.
+/// Handler-facing read half of the split WebSocket connection.
 ///
-/// Decodes incoming WS frames into typed CDP messages, skipping pings/pongs
-/// and malformed data frames.
+/// Decoded CDP messages are produced by a dedicated background task
+/// (see [`ws_read_loop`]) and forwarded over a bounded mpsc. `WsReader`
+/// itself is a thin `Receiver` wrapper — calling `next_message()` does
+/// a single `rx.recv().await` with no per-message decoding work on the
+/// caller's task. This keeps the Handler's poll loop free of CPU-bound
+/// deserialize time, which matters for large (multi-MB) CDP responses
+/// such as screenshots and wide-header network events.
 #[derive(Debug)]
 pub struct WsReader<T: EventMessage> {
-    inner: SplitStream<WebSocketStream<ConnectStream>>,
+    rx: mpsc::Receiver<Result<Box<Message<T>>>>,
     _marker: PhantomData<T>,
 }
 
 impl<T: EventMessage + Unpin> WsReader<T> {
     /// Read the next CDP message from the WebSocket.
     ///
-    /// Returns `None` when the connection is closed.
+    /// Returns `None` when the background reader task has exited
+    /// (connection closed or sender dropped). This call does only a
+    /// channel `recv` — the actual WS read + JSON decode happens on
+    /// the background `ws_read_loop` task.
     pub async fn next_message(&mut self) -> Option<Result<Box<Message<T>>>> {
-        loop {
-            match self.inner.next().await? {
-                Ok(WsMessage::Text(text)) => {
-                    match decode_message::<T>(text.as_bytes(), Some(&text)) {
-                        Ok(msg) => return Some(Ok(msg)),
-                        Err(err) => {
-                            tracing::debug!(
-                                target: "chromiumoxide::conn::raw_ws::parse_errors",
-                                "Dropping malformed text WS frame: {err}",
-                            );
-                            continue;
-                        }
-                    }
-                }
-                Ok(WsMessage::Binary(buf)) => match decode_message::<T>(&buf, None) {
-                    Ok(msg) => return Some(Ok(msg)),
-                    Err(err) => {
-                        tracing::debug!(
-                            target: "chromiumoxide::conn::raw_ws::parse_errors",
-                            "Dropping malformed binary WS frame: {err}",
-                        );
-                        continue;
-                    }
-                },
-                Ok(WsMessage::Close(_)) => return None,
-                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => continue,
-                Ok(msg) => {
-                    tracing::debug!(
-                        target: "chromiumoxide::conn::raw_ws::parse_errors",
-                        "Unexpected WS message type: {:?}",
-                        msg
-                    );
-                    continue;
-                }
-                Err(err) => return Some(Err(CdpError::Ws(err))),
-            }
-        }
+        self.rx.recv().await
     }
 }
 
@@ -526,5 +610,225 @@ fn decode_message<T: EventMessage>(
             }
             Err(err.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod ws_read_loop_tests {
+    //! Unit tests for the `ws_read_loop` background reader task.
+    //!
+    //! These tests feed a synthetic `Stream<Item = Result<WsMessage, _>>`
+    //! into `ws_read_loop` — no real WebSocket, no Chrome — and observe
+    //! what comes out the other side of the mpsc channel.
+    //!
+    //! The properties under test are the ones that make the reader-task
+    //! decoupling safe: FIFO ordering, no-deadlock on a bounded channel
+    //! under back-pressure, silent drop of non-data frames, graceful
+    //! transport-error propagation, and clean exit on `Close`.
+    //!
+    //! The typed events are `chromiumoxide_cdp::cdp::CdpEventMessage` —
+    //! the same instantiation the real Handler uses — so these tests
+    //! exercise the actual decode path (`serde_json::from_slice`), not
+    //! a simplified fake.
+    use super::*;
+    use chromiumoxide_cdp::cdp::CdpEventMessage;
+    use chromiumoxide_types::CallId;
+    use futures_util::stream;
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// Build a CDP `Response` WS frame as text — the smallest valid CDP
+    /// message. `id` tags the frame for ordering assertions.
+    fn response_frame(id: u64) -> WsMessage {
+        WsMessage::Text(
+            format!(r#"{{"id":{id},"result":{{"ok":true}}}}"#)
+                .to_string()
+                .into(),
+        )
+    }
+
+    /// Build a frame far larger than a typical socket chunk, to exercise
+    /// the "large message" path that motivated this refactor. The blob
+    /// field pushes serde_json through a big allocation even though the
+    /// envelope is tiny.
+    fn large_response_frame(id: u64, blob_bytes: usize) -> WsMessage {
+        let blob = "x".repeat(blob_bytes);
+        WsMessage::Text(
+            format!(r#"{{"id":{id},"result":{{"blob":"{blob}"}}}}"#)
+                .to_string()
+                .into(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_messages_in_stream_order() {
+        let frames = vec![
+            Ok(response_frame(1)),
+            Ok(response_frame(2)),
+            Ok(response_frame(3)),
+        ];
+        let stream = stream::iter(frames);
+        let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(8);
+        let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));
+
+        for expected in [1u64, 2, 3] {
+            let msg = rx.recv().await.expect("msg").expect("decode ok");
+            if let Message::Response(resp) = *msg {
+                assert_eq!(resp.id, CallId::new(expected as usize));
+            } else {
+                panic!("expected Response");
+            }
+        }
+        assert!(rx.recv().await.is_none(), "channel must close on EOF");
+        task.await.expect("reader task join");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pings_and_pongs_never_reach_the_handler() {
+        let frames = vec![
+            Ok(WsMessage::Ping(vec![1, 2, 3].into())),
+            Ok(response_frame(7)),
+            Ok(WsMessage::Pong(vec![].into())),
+            Ok(response_frame(8)),
+        ];
+        let stream = stream::iter(frames);
+        let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(8);
+        let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));
+
+        for expected in [7u64, 8] {
+            let msg = rx.recv().await.expect("msg").expect("decode ok");
+            if let Message::Response(resp) = *msg {
+                assert_eq!(resp.id, CallId::new(expected as usize));
+            }
+        }
+        assert!(rx.recv().await.is_none());
+        task.await.expect("reader task join");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_frames_do_not_block_subsequent_valid_frames() {
+        let frames = vec![
+            Ok(WsMessage::Text("{not valid json".to_string().into())),
+            Ok(response_frame(42)),
+        ];
+        let stream = stream::iter(frames);
+        let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(8);
+        let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));
+
+        let msg = rx.recv().await.expect("msg").expect("decode ok");
+        if let Message::Response(resp) = *msg {
+            assert_eq!(resp.id, CallId::new(42));
+        }
+        assert!(rx.recv().await.is_none());
+        task.await.expect("reader task join");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_frame_terminates_the_reader() {
+        let frames = vec![
+            Ok(response_frame(1)),
+            Ok(WsMessage::Close(None)),
+            Ok(response_frame(2)), // unreachable after Close
+        ];
+        let stream = stream::iter(frames);
+        let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(8);
+        let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));
+
+        let msg = rx.recv().await.expect("msg").expect("decode ok");
+        if let Message::Response(resp) = *msg {
+            assert_eq!(resp.id, CallId::new(1));
+        }
+        assert!(
+            rx.recv().await.is_none(),
+            "reader must exit on Close; frames after Close must not appear"
+        );
+        task.await.expect("reader task join");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_error_is_forwarded_once_then_reader_exits() {
+        let frames = vec![
+            Ok(response_frame(1)),
+            Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed),
+            Ok(response_frame(2)),
+        ];
+        let stream = stream::iter(frames);
+        let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(8);
+        let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));
+
+        let msg = rx.recv().await.expect("msg").expect("ok");
+        assert!(matches!(*msg, Message::Response(_)));
+        match rx.recv().await {
+            Some(Err(CdpError::Ws(_))) => {}
+            other => panic!("expected forwarded Ws error, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+        task.await.expect("reader task join");
+    }
+
+    /// Back-pressure property: with the smallest possible channel and
+    /// many frames, the reader task awaits capacity after each send and
+    /// never deadlocks. This is the core "no deadlock" proof for the
+    /// new design — if the reader held anything across its `.await` that
+    /// the consumer needed, the consumer's `recv().await` would block
+    /// forever. Completion under a 5s watchdog proves it doesn't.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_channel_does_not_deadlock_under_backpressure() {
+        const N: u64 = 512;
+        let frames: Vec<_> = (1..=N).map(|id| Ok(response_frame(id))).collect();
+        let stream = stream::iter(frames);
+
+        let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(1);
+        let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));
+
+        let deadline = std::time::Duration::from_secs(5);
+        let collected = tokio::time::timeout(deadline, async {
+            let mut seen = 0u64;
+            while let Some(frame) = rx.recv().await {
+                let msg = frame.expect("decode ok");
+                if let Message::Response(resp) = *msg {
+                    seen += 1;
+                    assert_eq!(
+                        resp.id,
+                        CallId::new(seen as usize),
+                        "back-pressure must preserve FIFO order"
+                    );
+                }
+            }
+            seen
+        })
+        .await
+        .expect("reader must make forward progress despite cap-1 back-pressure");
+
+        assert_eq!(collected, N, "all frames must arrive");
+        task.await.expect("reader task join");
+    }
+
+    /// Large message (>1 MB) is decoded correctly on the background
+    /// task. This is the specific scenario the reader-task refactor
+    /// was built for — we don't measure time here (benches cover that),
+    /// we just prove the end-to-end path works without corruption or
+    /// deadlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_message_decodes_without_corruption() {
+        let big = 2 * 1024 * 1024; // 2 MB payload
+        let frames = vec![
+            Ok(large_response_frame(100, big)),
+            Ok(response_frame(101)),
+        ];
+        let stream = stream::iter(frames);
+        let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(4);
+        let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));
+
+        let first = rx.recv().await.expect("msg").expect("ok");
+        if let Message::Response(resp) = *first {
+            assert_eq!(resp.id, CallId::new(100));
+        }
+        let second = rx.recv().await.expect("msg").expect("ok");
+        if let Message::Response(resp) = *second {
+            assert_eq!(resp.id, CallId::new(101));
+        }
+        assert!(rx.recv().await.is_none());
+        task.await.expect("reader task join");
     }
 }

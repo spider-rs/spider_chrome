@@ -377,16 +377,40 @@ impl PageInner {
 
     /// Moves the mouse to `target` along a human-like bezier curve path,
     /// dispatching intermediate `mouseMoved` events with natural timing.
+    ///
+    /// Concurrency shape:
+    /// * Each step is dispatched fire-and-forget via
+    ///   [`send_command`](Self::send_command) — the CDP command lands on
+    ///   the handler channel (with `try_send` + async fallback) and the
+    ///   response oneshot is dropped. Per-step CDP round-trips (~1-2ms
+    ///   each) are eliminated.
+    /// * Pacing uses [`tokio::time::sleep_until`] against an absolute
+    ///   deadline that accumulates each step's delay. This is
+    ///   **drift-free**: if one iteration's send or scheduler wake-up
+    ///   runs long, the next deadline is unchanged so the following
+    ///   wait shrinks to compensate. Total wall-clock convergence is
+    ///   `sum(step.delay)` regardless of per-iteration variance.
+    ///
+    /// Ordering: CDP processes commands in the order they arrive on the
+    /// single-session WebSocket, and the bounded mpsc between `Page`
+    /// and handler is FIFO, so the sequence of `mouseMoved` events
+    /// reaches Chrome in issue order.
     pub async fn move_mouse_smooth(&self, target: Point) -> Result<&Self> {
         let path = self.smart_mouse.path_to(target);
+        let mut deadline = tokio::time::Instant::now();
         for step in &path {
-            self.execute(DispatchMouseEventParams::new(
+            self.send_command(DispatchMouseEventParams::new(
                 DispatchMouseEventType::MouseMoved,
                 step.point.x,
                 step.point.y,
             ))
             .await?;
-            tokio::time::sleep(step.delay).await;
+            // Absolute-deadline pacing: advancing by `step.delay`
+            // means a slow send on iteration N shortens the wait
+            // before iteration N+1 instead of pushing the whole
+            // schedule back.
+            deadline += step.delay;
+            tokio::time::sleep_until(deadline).await;
         }
         Ok(self)
     }
