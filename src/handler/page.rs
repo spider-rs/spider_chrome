@@ -397,8 +397,9 @@ impl PageInner {
     /// reaches Chrome in issue order.
     pub async fn move_mouse_smooth(&self, target: Point) -> Result<&Self> {
         let path = self.smart_mouse.path_to(target);
+        let last_idx = path.len().saturating_sub(1);
         let mut deadline = tokio::time::Instant::now();
-        for step in &path {
+        for (i, step) in path.iter().enumerate() {
             self.send_command(DispatchMouseEventParams::new(
                 DispatchMouseEventType::MouseMoved,
                 step.point.x,
@@ -409,8 +410,14 @@ impl PageInner {
             // means a slow send on iteration N shortens the wait
             // before iteration N+1 instead of pushing the whole
             // schedule back.
-            deadline += step.delay;
-            tokio::time::sleep_until(deadline).await;
+            //
+            // Skip the sleep after the final step — there's no
+            // subsequent event to pace against, so the delay would
+            // be pure wall-clock waste (~5-30ms typical).
+            if i < last_idx {
+                deadline += step.delay;
+                tokio::time::sleep_until(deadline).await;
+            }
         }
         Ok(self)
     }
@@ -644,9 +651,18 @@ impl PageInner {
             self.send_command(cmd).await?;
         }
 
-        // Smooth drag to destination (dispatching MouseMoved with button held)
+        // Smooth drag to destination (dispatching MouseMoved with button held).
+        // Absolute-deadline pacing (same shape as `move_mouse_smooth`):
+        // a slow send on step N shortens the wait before step N+1
+        // instead of shifting the whole schedule, so total time tracks
+        // `sum(step.delay)` regardless of per-iteration variance. The
+        // final step's sleep is skipped — the MouseReleased dispatch
+        // follows immediately and any trailing delay would just be
+        // wall-clock waste.
         let path = self.smart_mouse.path_to(to);
-        for step in &path {
+        let last_idx = path.len().saturating_sub(1);
+        let mut deadline = tokio::time::Instant::now();
+        for (i, step) in path.iter().enumerate() {
             if let Ok(cmd) = DispatchMouseEventParams::builder()
                 .x(step.point.x)
                 .y(step.point.y)
@@ -657,7 +673,10 @@ impl PageInner {
             {
                 self.send_command(cmd).await?;
             }
-            tokio::time::sleep(step.delay).await;
+            if i < last_idx {
+                deadline += step.delay;
+                tokio::time::sleep_until(deadline).await;
+            }
         }
 
         // Release at destination
