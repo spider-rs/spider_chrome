@@ -839,6 +839,7 @@ impl Page {
                 auth_opt.map(|f| f.into()),
                 cache_strategy.clone(),
                 remote.map(|f| f.into()),
+                false,
                 namespace,
             ),
             run_intercept,
@@ -942,6 +943,7 @@ impl Page {
                 auth_opt.map(|f| f.into()),
                 cache_strategy.clone(),
                 remote.map(|f| f.into()),
+                false,
                 namespace,
             ),
             run_intercept,
@@ -3136,12 +3138,18 @@ impl Page {
     /// You can pass an endpoint to `dump_remote` to store the cache to a url endpoint.
     /// The cache_site is used to track all the urls from the point of navigation like page.goto.
     /// Set the value to Some("true") to use the default endpoint.
+    ///
+    /// Set `dump_readonly = true` to keep local caching + per-session
+    /// cache active but suppress the outbound POST to the remote cache
+    /// server. Use when an upstream proxy is responsible for uploads
+    /// and chromey should only read from the cache.
     pub async fn spawn_cache_listener(
         &self,
         target_url: &str,
         auth: Option<String>,
         cache_strategy: Option<crate::cache::CacheStrategy>,
         dump_remote: Option<String>,
+        dump_readonly: bool,
         namespace: Option<&str>,
     ) -> Result<tokio::task::JoinHandle<()>, crate::error::CdpError> {
         // Eagerly init the remote cache worker so uploads are ready before
@@ -3150,8 +3158,9 @@ impl Page {
         //
         // Wrap in a timeout so a slow network / DNS issue cannot block page
         // creation indefinitely — the worker will auto-init as a fallback
-        // when the first dump job is enqueued.
-        if dump_remote.is_some() {
+        // when the first dump job is enqueued. Skip init in read-only mode
+        // since no dumps will be enqueued.
+        if dump_remote.is_some() && !dump_readonly {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 crate::cache::dump_remote::init_default_cache_worker(),
@@ -3168,10 +3177,32 @@ impl Page {
             auth,
             cache_strategy,
             dump_remote,
+            dump_readonly,
         )
         .await?;
 
         Ok(handle)
+    }
+
+    #[cfg(feature = "_cache")]
+    /// Convenience wrapper over [`spawn_cache_listener`] that runs in
+    /// **read-only** mode — local cache and per-session cache continue
+    /// to serve hits, but no responses are ever dumped to a remote
+    /// cache server. Equivalent to calling `spawn_cache_listener` with
+    /// `dump_remote = None` and `dump_readonly = true`.
+    ///
+    /// Intended for deployments where an upstream proxy handles remote
+    /// dumps on chromey's behalf, and chromey should only consume the
+    /// cache.
+    pub async fn spawn_cache_listener_read_only(
+        &self,
+        target_url: &str,
+        auth: Option<String>,
+        cache_strategy: Option<crate::cache::CacheStrategy>,
+        namespace: Option<&str>,
+    ) -> Result<tokio::task::JoinHandle<()>, crate::error::CdpError> {
+        self.spawn_cache_listener(target_url, auth, cache_strategy, None, true, namespace)
+            .await
     }
 
     #[cfg(feature = "_cache")]

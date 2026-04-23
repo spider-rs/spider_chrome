@@ -285,8 +285,14 @@ pub async fn get_cached_url_with_metadata(
 /// Store the page to the local HTTP cache (CACACHE_MANAGER) and,
 /// optionally, dump it to the remote hybrid cache server.
 ///
-/// `dump_remote == true` => local cache + remote cache
-/// `dump_remote == false` => local cache only
+/// Write semantics:
+/// * `dump_remote = None`             => local cache only.
+/// * `dump_remote = Some(url)` and
+///   `dump_readonly = false` (default) => local + remote (async enqueue).
+/// * `dump_remote = Some(url)` and
+///   `dump_readonly = true`            => local only; the URL is
+///   accepted for future read-through use but **no remote dump is
+///   performed**. Use when an upstream proxy handles uploads.
 pub async fn put_hybrid_cache(
     cache_key: &str,
     cache_site: &str,
@@ -294,6 +300,7 @@ pub async fn put_hybrid_cache(
     method: &str,
     http_request_headers: std::collections::HashMap<String, String>,
     dump_remote: Option<&str>,
+    dump_readonly: bool,
 ) {
     use http_cache_reqwest::CacheManager;
     use http_cache_semantics::CachePolicy;
@@ -330,9 +337,12 @@ pub async fn put_hybrid_cache(
         let version = http_response.version;
 
         // Determine whether we need a DumpJob (and thus must clone the body).
+        // Read-only mode short-circuits regardless of whether `dump_remote`
+        // is set — callers opt in to this when an external proxy handles
+        // uploads on their behalf.
         let mut need_dump = false;
 
-        if dump_remote.is_some() {
+        if dump_remote.is_some() && !dump_readonly {
             let result = tokio::time::timeout(std::time::Duration::from_millis(250), async {
                 CACACHE_MANAGER.get(&cache_key).await
             })
@@ -414,12 +424,17 @@ pub async fn put_hybrid_cache(
 
 /// Spawn a background task that listens to *all* Network.responseReceived
 /// events for this page and stores them in your cache.
+///
+/// Set `dump_readonly = true` to keep local caching active but suppress
+/// outbound writes to the remote cache server — useful when an upstream
+/// proxy is responsible for remote uploads.
 pub async fn spawn_response_cache_listener(
     page: Page,
     cache_site: String,
     auth: Option<String>,
     cache_strategy: Option<CacheStrategy>,
     dump_remote: Option<String>,
+    dump_readonly: bool,
 ) -> Result<JoinHandle<()>, crate::error::CdpError> {
     page.execute(EnableParams::default()).await?;
     let mut events = page.event_listener::<EventResponseReceived>().await?;
@@ -433,6 +448,7 @@ pub async fn spawn_response_cache_listener(
                 auth.as_deref(),
                 cache_strategy,
                 dump_remote.as_deref(),
+                dump_readonly,
             )
             .await
             {
@@ -581,6 +597,7 @@ async fn handle_single_response(
     auth: Option<&str>,
     cache_strategy: Option<CacheStrategy>,
     dump_remote: Option<&str>,
+    dump_readonly: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !ev.response.url.starts_with("http") {
         return Ok(());
@@ -682,6 +699,15 @@ async fn handle_single_response(
             };
 
             crate::cache::remote::session_cache_insert(cache_site, http_res, policy, &current_url);
+        }
+
+        // Read-only mode: skip the remote-cache dump entirely. The
+        // local cache and per-session cache have already been
+        // populated above, so lookups continue to work — only the
+        // outbound POST to the remote cache server is suppressed.
+        // Used when an upstream proxy is responsible for uploads.
+        if dump_readonly {
+            return Ok(());
         }
 
         let job = super::dump_remote::DumpJob {
