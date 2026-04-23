@@ -20,22 +20,42 @@
 //!
 //! # Lock-freedom
 //!
-//! | operation           | primitive                                               |
-//! | ------------------- | ------------------------------------------------------- |
-//! | [`submit`]          | `OnceLock::get()` + `UnboundedSender::send` (lock-free) |
-//! | [`init_worker`]     | `OnceLock::get()` fast-path; `get_or_init` only once    |
-//! | dispatcher loop     | `rx.recv_many()` (batch drain) + `tokio::spawn` per task |
-//! | cleanup execution   | each task runs on its own `tokio::spawn`'d task         |
+//! | operation           | primitive                                                |
+//! | ------------------- | -------------------------------------------------------- |
+//! | [`submit`]          | `OnceLock::get()` + `UnboundedSender::send` (lock-free)  |
+//! | [`init_worker`]     | `OnceLock::get()` fast-path; `get_or_init` only once     |
+//! | dispatcher loop     | `rx.recv_many()` (batch drain) + one `tokio::spawn` per batch |
+//! | cleanup execution   | `FuturesUnordered` on the batch worker polls all tasks concurrently |
 //!
-//! # Batched receive
+//! # Batched receive and batched spawn
 //!
-//! The dispatcher drains up to [`DISPATCH_BATCH`] tasks per wake-up via
+//! The dispatcher drains up to [`DISPATCH_BATCH`] tasks per wake via
 //! `rx.recv_many(..)` instead of one `rx.recv()` per task. Under a
-//! burst (e.g. many pages dropping streams simultaneously) this
-//! collapses N future-park/wake round-trips into one, saving ~500 ns
-//! per task on the dispatcher hot path. The per-task `tokio::spawn`
-//! is unchanged — each cleanup still runs on its own scheduler task,
-//! so batching does **not** serialise execution.
+//! burst (many pages dropping streams simultaneously) this collapses
+//! N future-park/wake cycles into one.
+//!
+//! Each drained batch is handed to **one** `tokio::spawn`'d batch
+//! worker that drives a `FuturesUnordered` of all the batch's
+//! cleanups concurrently. For a full batch this is a **64× reduction
+//! in spawn count** versus spawning each task individually, while
+//! preserving concurrency:
+//!
+//! * Inside the batch, `FuturesUnordered` polls every cleanup future;
+//!   when any future `.await`s on I/O, polling yields to the next.
+//! * The kernel I/O driver (epoll/kqueue + tokio's reactor) handles
+//!   `tokio::fs::remove_file` and CDP `send_command` I/O in parallel
+//!   across all runtime worker threads — the parallelism is in the
+//!   I/O layer, not the task layer, so a single batch worker thread
+//!   is not a bottleneck for I/O-bound cleanup.
+//! * Multiple batch workers still run concurrently on different
+//!   worker threads — the dispatcher spawns a fresh batch worker
+//!   whenever new tasks accumulate, and the runtime distributes them.
+//!
+//! If one cleanup in a batch panics, the batch worker dies but every
+//! other batch worker is unaffected (tokio::spawn contains panics).
+//! The dispatcher itself is strictly a `rx.recv_many + spawn` loop
+//! and never `.await`s on cleanup work — a hung cleanup cannot block
+//! it.
 //!
 //! # True parallelism
 //!
@@ -75,6 +95,7 @@
 
 use crate::page::Page;
 use chromiumoxide_cdp::cdp::browser_protocol::io::{CloseParams, StreamHandle};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
@@ -139,30 +160,49 @@ async fn run_task(task: CleanupTask) {
 /// once, from inside the `OnceLock::get_or_init` closure on the very
 /// first `init_worker` call.
 ///
-/// The dispatcher is extremely thin: on each wake it drains up to
-/// `DISPATCH_BATCH` tasks via `rx.recv_many(..)` and spawns each as
-/// its own `tokio::spawn`'d task so the runtime places the cleanup
-/// on whichever worker has capacity. Under a burst this collapses N
-/// recv/park cycles into one while preserving full per-task
-/// parallelism — a slow cleanup (e.g. CDP `IO.close` against a dying
-/// WebSocket) cannot block the dispatcher from picking up subsequent
-/// tasks.
+/// On each wake the dispatcher drains up to `DISPATCH_BATCH` tasks
+/// via `rx.recv_many(..)` and hands the whole batch to **one**
+/// `tokio::spawn`'d batch worker that drives a `FuturesUnordered`
+/// over every task. This gives a ~64× reduction in spawn count under
+/// burst while preserving cleanup concurrency — the `FuturesUnordered`
+/// polls all futures interleaved, and the I/O driver parallelises the
+/// actual syscalls (`tokio::fs::remove_file`, CDP WebSocket writes)
+/// across the runtime's worker threads independently of how many
+/// tokio tasks we spawn.
+///
+/// The dispatcher itself never `.await`s on cleanup work — a hung
+/// cleanup can't block it from picking up subsequent batches. A panic
+/// in any single cleanup is contained to its batch worker via
+/// `tokio::spawn`'s panic boundary.
 fn spawn_worker() -> mpsc::UnboundedSender<CleanupTask> {
     let (tx, mut rx) = mpsc::unbounded_channel::<CleanupTask>();
 
     tokio::spawn(async move {
         // Reused across iterations — `drain(..)` empties without
-        // reallocating, so the dispatcher does at most one allocation
-        // for the lifetime of the process.
+        // freeing capacity, so the dispatcher's per-iteration
+        // allocation is just one `Vec<CleanupTask>` for the batch
+        // ownership hand-off to the spawned worker.
         let mut batch: Vec<CleanupTask> = Vec::with_capacity(DISPATCH_BATCH);
         loop {
             let n = rx.recv_many(&mut batch, DISPATCH_BATCH).await;
             if n == 0 {
                 break; // channel closed — no more producers
             }
-            for task in batch.drain(..) {
-                tokio::spawn(run_task(task));
-            }
+            // Move the batch into a spawned worker. `mem::replace`
+            // swaps in a fresh pre-allocated `Vec` of the right
+            // capacity so the dispatcher's next `recv_many` doesn't
+            // need to grow the buffer incrementally. One allocation
+            // per batch, zero per-element move (just a pointer swap).
+            let tasks: Vec<CleanupTask> =
+                std::mem::replace(&mut batch, Vec::with_capacity(DISPATCH_BATCH));
+            tokio::spawn(async move {
+                let mut in_flight: FuturesUnordered<_> =
+                    tasks.into_iter().map(run_task).collect();
+                // Drain to completion; each resolved future is dropped
+                // immediately, freeing its resources (page handle refs,
+                // path buffers) before the batch as a whole finishes.
+                while in_flight.next().await.is_some() {}
+            });
         }
     });
 
