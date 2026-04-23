@@ -3,8 +3,9 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::ready;
 
-use futures_util::stream::SplitSink;
+use futures_util::stream::{FuturesOrdered, SplitSink};
 use futures_util::{SinkExt, Stream, StreamExt};
+use std::future::Future;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -276,6 +277,32 @@ const WS_CMD_CHANNEL_CAPACITY: usize = 2048;
 /// (the reader awaits channel capacity, stops draining the socket).
 const WS_READ_CHANNEL_CAPACITY: usize = 1024;
 
+/// Maximum number of in-flight decodes the reader pipeline holds at
+/// once. While any of these is still running on the blocking pool,
+/// the reader can keep draining the socket and starting new decodes,
+/// up to this cap. Applies per-connection; the resulting decoded
+/// messages are emitted to the Handler in strict WS arrival order
+/// via a `FuturesOrdered` queue — no behavior change versus the
+/// serial loop, just concurrent execution of independent decodes.
+const MAX_IN_FLIGHT_DECODES: usize = 32;
+
+/// Payload size at/above which `decode_message` runs via
+/// `tokio::task::spawn_blocking` instead of inline on the reader task.
+///
+/// `serde_json::from_slice` is CPU-bound with no `.await` points, so
+/// a multi-MB payload can occupy one tokio worker thread for tens of
+/// milliseconds. Offloading to the blocking thread pool above a
+/// threshold keeps the reader task cooperatively yielding — critical
+/// on single-threaded runtimes where the reader shares its worker
+/// with the Handler, user tasks, and timers.
+///
+/// The threshold is chosen so that typical CDP traffic (events,
+/// responses, small evaluates) stays on the inline fast path and
+/// doesn't pay the ~10-30 µs `spawn_blocking` hand-off cost, while
+/// screenshot payloads, wide network events, and huge console
+/// payloads take the offloaded path.
+const LARGE_FRAME_THRESHOLD: usize = 256 * 1024; // 256 KiB
+
 /// Split parts returned by [`Connection::into_async`].
 #[derive(Debug)]
 pub struct AsyncConnection<T: EventMessage> {
@@ -339,20 +366,102 @@ impl<T: EventMessage + Unpin + Send + 'static> Connection<T> {
     }
 }
 
+/// An entry in the reader's decode pipeline.
+///
+/// Small frames have been decoded inline on the reader task and sit
+/// in `Ready(Some(result))` waiting their turn to emit — zero
+/// allocation beyond the `Option`. Large frames were offloaded to
+/// `tokio::task::spawn_blocking`, so their entry is the
+/// corresponding `JoinHandle`.
+///
+/// A single concrete enum means `FuturesOrdered<InFlightDecode<T>>`
+/// can hold either kind without `Box<dyn Future>`, keeping the
+/// pipeline cost-proportional to the workload.
+enum InFlightDecode<T: EventMessage + Send + 'static> {
+    /// Small-frame fast path: already decoded inline. `take()`'d
+    /// exactly once when `FuturesOrdered` first polls it to Ready.
+    Ready(Option<Result<Box<Message<T>>>>),
+    /// Large-frame path: decoding on the blocking thread pool.
+    Blocking(tokio::task::JoinHandle<Result<Box<Message<T>>>>),
+}
+
+impl<T: EventMessage + Send + 'static> Future for InFlightDecode<T> {
+    type Output = Result<Box<Message<T>>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: both variants are structurally pin-agnostic —
+        // `Option<Result<..>>` is `Unpin`, and `tokio::task::JoinHandle`
+        // is documented as `Unpin`. So we can project out a `&mut`
+        // without unsafe.
+        match self.get_mut() {
+            InFlightDecode::Ready(slot) => Poll::Ready(
+                slot.take()
+                    .expect("InFlightDecode::Ready polled after completion"),
+            ),
+            InFlightDecode::Blocking(handle) => match Pin::new(handle).poll(cx) {
+                Poll::Ready(Ok(res)) => Poll::Ready(res),
+                Poll::Ready(Err(join_err)) => Poll::Ready(Err(CdpError::msg(format!(
+                    "WS decode blocking task join error: {join_err}"
+                )))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+/// Emit a single decoded-frame result to the Handler, logging parse
+/// errors. Returns `true` if the channel is still open, `false` if
+/// the Handler has dropped the receiver (caller should exit).
+async fn emit_decoded<T>(
+    tx: &mpsc::Sender<Result<Box<Message<T>>>>,
+    res: Result<Box<Message<T>>>,
+) -> bool
+where
+    T: EventMessage + Send + 'static,
+{
+    match res {
+        Ok(msg) => tx.send(Ok(msg)).await.is_ok(),
+        Err(err) => {
+            tracing::debug!(
+                target: "chromiumoxide::conn::raw_ws::parse_errors",
+                "Dropping malformed WS frame: {err}",
+            );
+            true
+        }
+    }
+}
+
+/// Drain every in-flight decode in submit order, forwarding each
+/// result to the Handler. Used at shutdown paths (stream ended,
+/// `Close` frame, transport error) so messages that had already been
+/// pulled off the socket aren't silently lost.
+async fn drain_in_flight<T>(
+    in_flight: &mut FuturesOrdered<InFlightDecode<T>>,
+    tx: &mpsc::Sender<Result<Box<Message<T>>>>,
+) where
+    T: EventMessage + Send + 'static,
+{
+    while let Some(res) = in_flight.next().await {
+        if !emit_decoded(tx, res).await {
+            return;
+        }
+    }
+}
+
 /// Background task that reads frames from the WebSocket, decodes them to
 /// typed CDP `Message<T>`, and forwards them to the Handler over a
 /// bounded mpsc.
 ///
-/// Runs on a `tokio::spawn`'d task — **not** `spawn_blocking` — so CPU
-/// time for JSON decode is charged to a regular tokio worker and not the
-/// blocking thread pool. On a multi-threaded runtime, the decode can run
-/// on a different worker than the Handler, giving true parallelism for
-/// large messages. On a single-threaded runtime, it cooperates with the
-/// Handler via `.await` points on the send channel.
+/// Runs on a `tokio::spawn`'d task. Small-to-medium frames are
+/// decoded inline (fast path); payloads at or above
+/// [`LARGE_FRAME_THRESHOLD`] are offloaded to `spawn_blocking` so
+/// multi-MB deserialization doesn't monopolise a tokio worker
+/// thread — especially important on single-threaded runtimes where
+/// the reader, Handler, and user tasks share the same worker.
 ///
 /// Flow per frame:
 ///
-/// * `Text` / `Binary` → `decode_message::<T>`; decoded `Ok(msg)` is
+/// * `Text` / `Binary` → [`decode_ws_frame`]; decoded `Ok(msg)` is
 ///   sent to the Handler. Decode errors are logged and the frame is
 ///   dropped (same behavior as the legacy inline decode path).
 /// * `Close` → loop exits cleanly, dropping `tx`. The Handler's
@@ -368,54 +477,102 @@ impl<T: EventMessage + Unpin + Send + 'static> Connection<T> {
 /// back-pressure to Chrome instead of letting memory grow without bound.
 async fn ws_read_loop<T, S>(mut stream: S, tx: mpsc::Sender<Result<Box<Message<T>>>>)
 where
-    T: EventMessage,
+    T: EventMessage + Send + 'static,
     S: Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
-    while let Some(frame) = stream.next().await {
-        match frame {
-            Ok(WsMessage::Text(text)) => {
-                match decode_message::<T>(text.as_bytes(), Some(&text)) {
-                    Ok(msg) => {
-                        if tx.send(Ok(msg)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            target: "chromiumoxide::conn::raw_ws::parse_errors",
-                            "Dropping malformed text WS frame: {err}",
-                        );
-                    }
+    // Pipeline of decodes in strict arrival order. Small-frame decodes
+    // are produced inline (zero allocation, borrowing the frame body);
+    // large-frame decodes are offloaded to `spawn_blocking`. Both
+    // variants share a single concrete `InFlightDecode<T>` so the
+    // queue avoids `Box<dyn Future>` overhead.
+    let mut in_flight: FuturesOrdered<InFlightDecode<T>> = FuturesOrdered::new();
+
+    loop {
+        tokio::select! {
+            // Bias: emit already-ready decodes before reading more
+            // frames. Keeps the pipeline small in the steady state
+            // while still allowing concurrency under burst.
+            biased;
+
+            // Emit the head of the pipeline as soon as it is ready.
+            // `FuturesOrdered::next` preserves submit order, so
+            // downstream delivery is byte-identical to the serial
+            // loop's ordering guarantee.
+            Some(res) = in_flight.next(), if !in_flight.is_empty() => {
+                if !emit_decoded(&tx, res).await {
+                    return;
                 }
             }
-            Ok(WsMessage::Binary(buf)) => match decode_message::<T>(&buf, None) {
-                Ok(msg) => {
-                    if tx.send(Ok(msg)).await.is_err() {
+
+            // Read the next frame if the pipeline has capacity.
+            // Guard prevents unbounded memory growth when the
+            // Handler is slow and back-pressure propagates here
+            // from the head of `in_flight`.
+            maybe_frame = stream.next(), if in_flight.len() < MAX_IN_FLIGHT_DECODES => {
+                match maybe_frame {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        // Zero-copy enqueue. The small-frame fast
+                        // path decodes inline *now* (borrowing
+                        // `text`, keeping the `raw_text_for_logging`
+                        // preview); the large-frame path moves the
+                        // `Utf8Bytes` (`Send + 'static`) directly
+                        // into `spawn_blocking` without an
+                        // intermediate allocation.
+                        if text.len() >= LARGE_FRAME_THRESHOLD {
+                            in_flight.push_back(InFlightDecode::Blocking(
+                                tokio::task::spawn_blocking(move || {
+                                    decode_message::<T>(text.as_bytes(), None)
+                                }),
+                            ));
+                        } else {
+                            let res = decode_message::<T>(text.as_bytes(), Some(&text));
+                            in_flight.push_back(InFlightDecode::Ready(Some(res)));
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(buf))) => {
+                        // Same shape as Text: move `Bytes`
+                        // (`Send + 'static`) into `spawn_blocking`
+                        // for large payloads, decode inline for
+                        // small ones.
+                        if buf.len() >= LARGE_FRAME_THRESHOLD {
+                            in_flight.push_back(InFlightDecode::Blocking(
+                                tokio::task::spawn_blocking(move || {
+                                    decode_message::<T>(&buf, None)
+                                }),
+                            ));
+                        } else {
+                            let res = decode_message::<T>(&buf, None);
+                            in_flight.push_back(InFlightDecode::Ready(Some(res)));
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) => {
+                        drain_in_flight(&mut in_flight, &tx).await;
+                        return;
+                    }
+                    Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => {}
+                    Some(Ok(msg)) => {
+                        tracing::debug!(
+                            target: "chromiumoxide::conn::raw_ws::parse_errors",
+                            "Unexpected WS message type: {:?}",
+                            msg
+                        );
+                    }
+                    Some(Err(err)) => {
+                        // Preserve ordering: flush already-decoded
+                        // frames that arrived before the transport
+                        // error before surfacing the error itself.
+                        drain_in_flight(&mut in_flight, &tx).await;
+                        let _ = tx.send(Err(CdpError::Ws(err))).await;
+                        return;
+                    }
+                    None => {
+                        // Stream terminated (connection closed
+                        // without a `Close` frame). Drain and exit.
+                        drain_in_flight(&mut in_flight, &tx).await;
                         return;
                     }
                 }
-                Err(err) => {
-                    tracing::debug!(
-                        target: "chromiumoxide::conn::raw_ws::parse_errors",
-                        "Dropping malformed binary WS frame: {err}",
-                    );
-                }
-            },
-            Ok(WsMessage::Close(_)) => return,
-            Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
-            Ok(msg) => {
-                tracing::debug!(
-                    target: "chromiumoxide::conn::raw_ws::parse_errors",
-                    "Unexpected WS message type: {:?}",
-                    msg
-                );
-            }
-            Err(err) => {
-                // Forward the error once, then exit. The Handler will
-                // observe it on the next `next_message()` call.
-                let _ = tx.send(Err(CdpError::Ws(err))).await;
-                return;
             }
         }
     }
@@ -829,6 +986,68 @@ mod ws_read_loop_tests {
             assert_eq!(resp.id, CallId::new(101));
         }
         assert!(rx.recv().await.is_none());
+        task.await.expect("reader task join");
+    }
+
+    /// FIFO ordering under the pipelined reader when large-frame
+    /// decodes run in parallel via `spawn_blocking`.
+    ///
+    /// This test submits an interleaved sequence of large and small
+    /// frames. Large frames take the `spawn_blocking` path (decode
+    /// on the blocking pool, variable completion order); small
+    /// frames take the inline path (decode immediately). The
+    /// pipeline's `FuturesOrdered` queue must emit them to the
+    /// Handler in strict arrival order regardless of which
+    /// blocking-pool thread finishes first.
+    ///
+    /// If the ordering guarantee were ever broken — e.g. by
+    /// accidentally swapping `FuturesOrdered` for `FuturesUnordered`
+    /// — id sequence checks here would catch it immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_large_and_small_frames_keep_fifo_order() {
+        let big = 2 * 1024 * 1024; // 2 MB payload — forces spawn_blocking
+        let frames = vec![
+            Ok(large_response_frame(1, big)),
+            Ok(response_frame(2)),
+            Ok(response_frame(3)),
+            Ok(large_response_frame(4, big)),
+            Ok(response_frame(5)),
+            Ok(large_response_frame(6, big)),
+            Ok(response_frame(7)),
+            Ok(response_frame(8)),
+        ];
+        let expected: Vec<usize> = (1..=8).collect();
+
+        let stream = stream::iter(frames);
+        let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(16);
+        let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));
+
+        let deadline = std::time::Duration::from_secs(10);
+        let observed = tokio::time::timeout(deadline, async {
+            let mut ids = Vec::with_capacity(expected.len());
+            while let Some(frame) = rx.recv().await {
+                let msg = frame.expect("decode ok");
+                if let Message::Response(resp) = *msg {
+                    ids.push(CallId::new(ids.len() + 1));
+                    assert_eq!(
+                        resp.id,
+                        *ids.last().unwrap(),
+                        "pipelined reader must emit frames in strict arrival order \
+                         regardless of per-frame decode latency"
+                    );
+                }
+            }
+            ids
+        })
+        .await
+        .expect("pipelined reader should make forward progress within 10s");
+
+        assert_eq!(
+            observed.len(),
+            expected.len(),
+            "all {} frames must reach the Handler",
+            expected.len()
+        );
         task.await.expect("reader task join");
     }
 }
