@@ -49,15 +49,46 @@ fn browser_like_headed_config(test_name: &str) -> BrowserConfig {
         .arg("--no-default-browser-check")
         .arg("--disable-extensions")
         .with_head()
-        .launch_timeout(Duration::from_secs(30))
+        // Headed Chrome under Xvfb on cold CI runners can take
+        // noticeably longer than 30s to print its first
+        // `DevTools listening on ws://` line. Give it more headroom
+        // to cover the cold-start spike — normal runs finish in
+        // well under this bound.
+        .launch_timeout(Duration::from_secs(90))
         .build()
         .expect("browser-like headed browser config")
 }
 
 async fn launch_with_handler(config: BrowserConfig) -> Browser {
-    let (browser, mut handler) = Browser::launch(config).await.expect("launch browser");
-    let _handle = tokio::spawn(async move { while let Some(_event) = handler.next().await {} });
-    browser
+    // `Browser::launch` can fail with `LaunchTimeout` on a first
+    // cold-start under CI (Xvfb warming up, dbus not yet ready,
+    // etc.). Retry a bounded number of times with a fresh clone of
+    // the config — failures on subsequent attempts indicate a real
+    // problem and propagate via the final `expect`. Each successful
+    // launch spawns the handler drain loop exactly once.
+    const MAX_LAUNCH_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<chromiumoxide::error::CdpError> = None;
+    for attempt in 1..=MAX_LAUNCH_ATTEMPTS {
+        match Browser::launch(config.clone()).await {
+            Ok((browser, mut handler)) => {
+                let _handle = tokio::spawn(async move {
+                    while let Some(_event) = handler.next().await {}
+                });
+                return browser;
+            }
+            Err(err) => {
+                eprintln!(
+                    "[chromey test] Browser::launch attempt {attempt}/{MAX_LAUNCH_ATTEMPTS} \
+                     failed: {err}"
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    panic!(
+        "launch browser: exhausted {MAX_LAUNCH_ATTEMPTS} attempts, \
+         last error: {last_err:?}"
+    );
 }
 
 async fn open_about_blank_with_timeout(
