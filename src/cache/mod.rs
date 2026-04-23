@@ -1,5 +1,9 @@
 /// Dump remote cache.
 pub mod dump_remote;
+/// Background worker for the Fetch-interceptor response-stage cache
+/// dump path — consolidates per-event spawns behind a shared
+/// batched dispatcher.
+pub mod fetch_worker;
 /// Cache manager.
 pub mod manager;
 /// Remote cache.

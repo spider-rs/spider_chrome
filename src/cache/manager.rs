@@ -753,31 +753,28 @@ pub async fn spawn_fetch_cache_interceptor(
 
     let mut events = page.event_listener::<EventRequestPaused>().await?;
 
+    // Ensure the shared fetch-response background worker is running.
+    // One `OnceLock` load per listener-start — no allocation after
+    // the first call. Submits from the loop below are wait-free.
+    super::fetch_worker::init_worker();
+
     let handle = tokio::spawn(async move {
         while let Some(ev) = events.next().await {
-            // Response-stage events (body available for streaming) are
-            // handled on a dedicated spawned task so the event listener
-            // loop stays responsive for fast request-stage decisions.
+            // Response-stage events (body available for streaming)
+            // are dispatched to the shared fetch-response worker via
+            // a lock-free `OnceLock::get + mpsc::send`, instead of
+            // spawning a dedicated task per event. This keeps the
+            // event-listener loop responsive for fast request-stage
+            // decisions and amortises spawn overhead across up to
+            // `DISPATCH_BATCH` jobs per batch worker.
             let is_response_stage = ev.response_status_code.is_some();
 
             if is_response_stage {
-                let page = page.clone();
-                let auth = auth.clone();
-                let cache_strategy = cache_strategy;
-                tokio::spawn(async move {
-                    if let Err(err) = handle_fetch_response_stage(
-                        &page,
-                        &ev,
-                        auth.as_deref(),
-                        cache_strategy.as_ref(),
-                    )
-                    .await
-                    {
-                        tracing::debug!(
-                            "cache stream interceptor error: {err:?} - {:?}",
-                            ev.request.url
-                        );
-                    }
+                super::fetch_worker::submit(super::fetch_worker::FetchResponseJob {
+                    page: page.clone(),
+                    ev,
+                    auth: auth.clone(),
+                    cache_strategy,
                 });
             } else if let Err(err) = handle_fetch_paused(
                 &page,
@@ -860,7 +857,7 @@ async fn handle_fetch_paused(
 ///
 /// In every case the request is either fulfilled or continued — never left
 /// paused, never panics, never deadlocks.
-async fn handle_fetch_response_stage(
+pub(crate) async fn handle_fetch_response_stage(
     page: &Page,
     ev: &std::sync::Arc<EventRequestPaused>,
     auth: Option<&str>,
