@@ -701,11 +701,8 @@ impl Target {
                 }
 
                 if frame.is_loaded() {
-                    waiters_remaining |= drain_waiters_bounded(
-                        &mut self.wait_for_load,
-                        req,
-                        WAITER_DRAIN_BUDGET,
-                    );
+                    waiters_remaining |=
+                        drain_waiters_bounded(&mut self.wait_for_load, req, WAITER_DRAIN_BUDGET);
                 }
 
                 if frame.is_network_idle() {
@@ -1696,7 +1693,12 @@ mod waiter_drain_tests {
     use crate::ArcHttpRequest;
     use tokio::sync::oneshot::{self, Sender};
 
-    fn make_waiters(n: usize) -> (Vec<Sender<ArcHttpRequest>>, Vec<oneshot::Receiver<ArcHttpRequest>>) {
+    fn make_waiters(
+        n: usize,
+    ) -> (
+        Vec<Sender<ArcHttpRequest>>,
+        Vec<oneshot::Receiver<ArcHttpRequest>>,
+    ) {
         let mut txs = Vec::with_capacity(n);
         let mut rxs = Vec::with_capacity(n);
         for _ in 0..n {
@@ -1777,10 +1779,7 @@ mod waiter_drain_tests {
             if !remaining {
                 break;
             }
-            assert!(
-                rounds < n,
-                "drain must make forward progress on every call"
-            );
+            assert!(rounds < n, "drain must make forward progress on every call");
         }
         assert!(queue.is_empty());
         // 10_000 / 64 = 156.25 → 157 full rounds + final clean-up = 157

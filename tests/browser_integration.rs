@@ -71,9 +71,8 @@ async fn launch_with_handler(config: BrowserConfig) -> Browser {
     for attempt in 1..=MAX_LAUNCH_ATTEMPTS {
         match Browser::launch(config.clone()).await {
             Ok((browser, mut handler)) => {
-                let _handle = tokio::spawn(async move {
-                    while let Some(_event) = handler.next().await {}
-                });
+                let _handle =
+                    tokio::spawn(async move { while let Some(_event) = handler.next().await {} });
                 return browser;
             }
             Err(err) => {

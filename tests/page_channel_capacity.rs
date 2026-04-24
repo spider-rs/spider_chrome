@@ -107,9 +107,9 @@ async fn tiny_capacity_does_not_deadlock_under_concurrent_commands() {
                     .await
                     .unwrap_or_else(|_| panic!("evaluate({i}) timed out — capacity-1 deadlock?"))
                     .unwrap_or_else(|err| panic!("evaluate({i}) failed: {err}"));
-                let n: i64 = v.into_value().unwrap_or_else(|err| {
-                    panic!("evaluate({i}) result not an integer: {err}")
-                });
+                let n: i64 = v
+                    .into_value()
+                    .unwrap_or_else(|err| panic!("evaluate({i}) result not an integer: {err}"));
                 assert_eq!(n, (i + 1) as i64);
             })
         })

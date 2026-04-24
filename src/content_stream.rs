@@ -792,11 +792,9 @@ mod drop_guard_primitive_tests {
 
     #[test]
     fn try_current_is_err_on_plain_thread() {
-        let ok_outside = std::thread::spawn(|| {
-            tokio::runtime::Handle::try_current().is_ok()
-        })
-        .join()
-        .expect("thread panicked");
+        let ok_outside = std::thread::spawn(|| tokio::runtime::Handle::try_current().is_ok())
+            .join()
+            .expect("thread panicked");
         assert!(
             !ok_outside,
             "Handle::try_current() must return Err on a std::thread that \
@@ -808,9 +806,7 @@ mod drop_guard_primitive_tests {
     #[test]
     fn try_current_is_ok_inside_runtime() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let ok_inside = rt.block_on(async {
-            tokio::runtime::Handle::try_current().is_ok()
-        });
+        let ok_inside = rt.block_on(async { tokio::runtime::Handle::try_current().is_ok() });
         assert!(
             ok_inside,
             "Handle::try_current() must return Ok inside a tokio runtime \

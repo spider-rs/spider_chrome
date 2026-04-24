@@ -579,4 +579,3 @@ mod chunk_sink_drop_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
-

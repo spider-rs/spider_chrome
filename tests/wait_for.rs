@@ -1186,9 +1186,7 @@ async fn many_concurrent_waiters_drain_without_deadlock() {
         futs.push(tokio::spawn(async move {
             timeout(Duration::from_secs(30), p.wait_for_load())
                 .await
-                .unwrap_or_else(|_| {
-                    panic!("wait_for_load({i}) timed out — drain-budget deadlock?")
-                })
+                .unwrap_or_else(|_| panic!("wait_for_load({i}) timed out — drain-budget deadlock?"))
                 .unwrap_or_else(|err| panic!("wait_for_load({i}) failed: {err}"));
         }));
     }
@@ -1200,9 +1198,7 @@ async fn many_concurrent_waiters_drain_without_deadlock() {
                 .unwrap_or_else(|_| {
                     panic!("wait_for_dom_content_loaded({i}) timed out — drain-budget deadlock?")
                 })
-                .unwrap_or_else(|err| {
-                    panic!("wait_for_dom_content_loaded({i}) failed: {err}")
-                });
+                .unwrap_or_else(|err| panic!("wait_for_dom_content_loaded({i}) failed: {err}"));
         }));
     }
 

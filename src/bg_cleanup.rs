@@ -205,8 +205,7 @@ fn spawn_worker() -> mpsc::UnboundedSender<CleanupTask> {
             let tasks: Vec<CleanupTask> =
                 std::mem::replace(&mut batch, Vec::with_capacity(next_cap));
             tokio::spawn(async move {
-                let mut in_flight: FuturesUnordered<_> =
-                    tasks.into_iter().map(run_task).collect();
+                let mut in_flight: FuturesUnordered<_> = tasks.into_iter().map(run_task).collect();
                 // Drain to completion; each resolved future is dropped
                 // immediately, freeing its resources (page handle refs,
                 // path buffers) before the batch as a whole finishes.
@@ -316,10 +315,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             init_worker();
-            assert!(
-                worker_inited(),
-                "init_worker must populate the OnceLock"
-            );
+            assert!(worker_inited(), "init_worker must populate the OnceLock");
             // Submitting from inside the runtime obviously works; the
             // safety-relevant case is submitting from outside, which
             // the previous test covers.
@@ -364,8 +360,7 @@ mod tests {
             // TestSleep task finishes its sleep and the test drains
             // the channel. We measure wall-clock from "after all N
             // submits" to "N completions observed".
-            let (done_tx, mut done_rx) =
-                mpsc::unbounded_channel::<()>();
+            let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
 
             // Wrap each TestSleep with a tiny oneshot-style follow-up
             // by submitting a RemoveFile on a sentinel path after the
@@ -383,9 +378,9 @@ mod tests {
             // serial sleeps.
             let start = std::time::Instant::now();
             for _ in 0..N {
-                submit(CleanupTask::TestSleep(
-                    std::time::Duration::from_millis(DELAY_MS),
-                ));
+                submit(CleanupTask::TestSleep(std::time::Duration::from_millis(
+                    DELAY_MS,
+                )));
             }
 
             // Spawn a probe that sleeps slightly longer than a single
@@ -394,17 +389,11 @@ mod tests {
             // it fires after ~N * DELAY_MS.
             let probe_done_tx = done_tx.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    DELAY_MS + 100,
-                ))
-                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS + 100)).await;
                 let _ = probe_done_tx.send(());
             });
 
-            done_rx
-                .recv()
-                .await
-                .expect("probe should complete");
+            done_rx.recv().await.expect("probe should complete");
             let elapsed = start.elapsed();
 
             // If cleanup were serialized we'd need ≥ N * DELAY_MS =

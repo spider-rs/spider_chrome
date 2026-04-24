@@ -461,8 +461,7 @@ where
 async fn ws_read_loop<T, S>(mut stream: S, tx: mpsc::Sender<Result<Box<Message<T>>>>)
 where
     T: EventMessage + Send + 'static,
-    S: Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
+    S: Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     // Pipeline of decodes in strict arrival order. Small-frame decodes
     // are produced inline (zero allocation, borrowing the frame body);
@@ -976,10 +975,7 @@ mod ws_read_loop_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn large_message_decodes_without_corruption() {
         let big = 2 * 1024 * 1024; // 2 MB payload
-        let frames = vec![
-            Ok(large_response_frame(100, big)),
-            Ok(response_frame(101)),
-        ];
+        let frames = vec![Ok(large_response_frame(100, big)), Ok(response_frame(101))];
         let stream = stream::iter(frames);
         let (tx, mut rx) = mpsc::channel::<Result<Box<Message<CdpEventMessage>>>>(4);
         let task = tokio::spawn(ws_read_loop::<CdpEventMessage, _>(stream, tx));

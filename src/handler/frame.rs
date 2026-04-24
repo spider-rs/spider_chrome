@@ -622,7 +622,12 @@ impl FrameManager {
                 frame.clear_contexts();
             }
         }
-        self.context_ids.clear()
+        self.context_ids.clear();
+        // Chrome just wiped every execution context, so any isolated worlds
+        // we had ensured are gone too. Clearing the cache forces
+        // `ensure_isolated_world` to re-issue `CreateIsolatedWorldParams` for
+        // the next evaluation instead of short-circuiting on stale membership.
+        self.isolated_worlds.clear();
     }
 
     /// Remove `context_ids` entries that reference frames which no longer
@@ -1186,6 +1191,64 @@ mod tests {
         assert_eq!(
             fm.main_frame_nav_count, 0,
             "same-document navigations must not count against the cross-document cap"
+        );
+    }
+
+    #[test]
+    fn execution_contexts_cleared_resets_isolated_worlds() {
+        // When Chrome fires `executionContextsCleared`, the isolated worlds
+        // we had ensured are gone along with every execution context.
+        // `isolated_worlds` must be cleared so the next `ensure_isolated_world`
+        // call re-issues the creation command rather than short-circuiting on
+        // stale membership.
+        let mut fm = FrameManager::new(Duration::from_secs(30));
+
+        let frame_id = FrameId::new("main");
+        let frame = Frame::new(frame_id.clone());
+        let world_name = frame.get_isolated_world_name().clone();
+        fm.frames.insert(frame_id.clone(), frame);
+        fm.main_frame = Some(frame_id);
+
+        // First call: the world isn't in the set, so we should produce a
+        // command chain AND record membership.
+        let first = fm.ensure_isolated_world(&world_name);
+        assert!(
+            first.is_some(),
+            "first ensure_isolated_world must emit a creation command chain"
+        );
+        assert!(
+            fm.isolated_worlds.contains(&world_name),
+            "isolated_worlds must record the ensured world"
+        );
+
+        // Second call: short-circuits because the world is already ensured.
+        let second = fm.ensure_isolated_world(&world_name);
+        assert!(
+            second.is_none(),
+            "second ensure_isolated_world must short-circuit while membership is present"
+        );
+
+        // Chrome signals that every execution context was wiped.
+        fm.on_execution_contexts_cleared();
+        assert!(
+            fm.context_ids.is_empty(),
+            "context_ids must be cleared after executionContextsCleared"
+        );
+        assert!(
+            fm.isolated_worlds.is_empty(),
+            "isolated_worlds must be cleared after executionContextsCleared"
+        );
+
+        // Third call: must re-issue the creation command because the isolated
+        // world no longer exists in Chrome.
+        let third = fm.ensure_isolated_world(&world_name);
+        assert!(
+            third.is_some(),
+            "ensure_isolated_world must re-emit a creation chain after a context wipe"
+        );
+        assert!(
+            fm.isolated_worlds.contains(&world_name),
+            "isolated_worlds must re-record the world after re-ensuring"
         );
     }
 }
