@@ -878,12 +878,20 @@ impl PageInner {
             cmd = cmd.modifiers(modifiers);
         }
 
-        if let Ok(cmd) = cmd.clone().r#type(key_down_event_type).build() {
-            self.execute(cmd).await?;
-        }
+        let key_down = cmd.clone().r#type(key_down_event_type).build().ok();
+        let key_up = cmd.r#type(DispatchKeyEventType::KeyUp).build().ok();
 
-        if let Ok(cmd) = cmd.r#type(DispatchKeyEventType::KeyUp).build() {
-            self.execute(cmd).await?;
+        match (key_down, key_up) {
+            (Some(kd), Some(ku)) => {
+                tokio::try_join!(self.execute(kd), self.execute(ku))?;
+            }
+            (Some(kd), None) => {
+                self.execute(kd).await?;
+            }
+            (None, Some(ku)) => {
+                self.execute(ku).await?;
+            }
+            (None, None) => {}
         }
 
         Ok(self)
