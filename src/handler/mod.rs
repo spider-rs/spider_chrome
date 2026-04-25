@@ -750,6 +750,7 @@ impl Handler {
         let mut ws_reader = async_conn.reader;
         let ws_tx = async_conn.cmd_tx;
         let mut writer_handle = async_conn.writer_handle;
+        let reader_handle = async_conn.reader_handle;
         let mut next_call_id = async_conn.next_id;
 
         // Helper to mint call-ids without &mut self.conn.
@@ -790,7 +791,13 @@ impl Handler {
         }
 
         // ---- main event loop ----
-        loop {
+        //
+        // Modeled as an expression-loop producing `Result<()>` so that every
+        // exit path falls through to the graceful-shutdown block below
+        // (drop ws_tx → writer drains queue + sends WS Close → reader
+        // aborted). This matters for remote browsers (`Browser::connect`)
+        // where there is no child process whose death closes the socket.
+        let run_result: Result<()> = loop {
             let now = std::time::Instant::now();
 
             // 1. Drain all target page channels (non-blocking) & advance
@@ -924,7 +931,7 @@ impl Handler {
             }
 
             if self.closing {
-                break;
+                break Ok(());
             }
 
             // 2. Multiplex all event sources via tokio::select!
@@ -1018,7 +1025,7 @@ impl Handler {
                                 }
                             }
                         }
-                        None => break, // browser handle dropped
+                        None => break Ok(()), // browser handle dropped
                     }
                 }
 
@@ -1036,19 +1043,19 @@ impl Handler {
                             tracing::error!("WS Connection error: {:?}", err);
                             if let CdpError::Ws(ref ws_error) = err {
                                 match ws_error {
-                                    tungstenite::Error::AlreadyClosed => break,
+                                    tungstenite::Error::AlreadyClosed => break Ok(()),
                                     tungstenite::Error::Protocol(detail)
                                         if detail == &ProtocolError::ResetWithoutClosingHandshake =>
                                     {
-                                        break;
+                                        break Ok(());
                                     }
-                                    _ => return Err(err),
+                                    _ => break Err(err),
                                 }
                             } else {
-                                return Err(err);
+                                break Err(err);
                             }
                         }
-                        None => break, // WS closed
+                        None => break Ok(()), // WS closed
                     }
                 }
 
@@ -1067,16 +1074,43 @@ impl Handler {
                 result = &mut writer_handle => {
                     // WS writer exited — propagate error or break.
                     match result {
-                        Ok(Ok(())) => break,
-                        Ok(Err(e)) => return Err(e),
-                        Err(e) => return Err(CdpError::msg(format!("WS writer panicked: {e}"))),
+                        Ok(Ok(())) => break Ok(()),
+                        Ok(Err(e)) => break Err(e),
+                        Err(e) => break Err(CdpError::msg(format!("WS writer panicked: {e}"))),
                     }
                 }
             }
+        };
+
+        // ---- graceful shutdown ----
+        //
+        // Drop the WS command sender so the writer task's `rx.recv()`
+        // returns `None`. The writer drains any queued commands, sends a
+        // WebSocket Close frame to Chrome, and exits. For remote browsers
+        // this is the only mechanism that closes the WS — there's no child
+        // process whose death would close the socket.
+        drop(ws_tx);
+
+        // Wait briefly for the writer to send the Close frame. If it's
+        // already done (e.g. exited via the writer-handle select arm),
+        // skip the wait. Polling a finished `JoinHandle` again would
+        // panic.
+        if !writer_handle.is_finished() {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut writer_handle)
+                .await;
+            if !writer_handle.is_finished() {
+                writer_handle.abort();
+            }
         }
 
-        writer_handle.abort();
-        Ok(())
+        // Reader may be parked on `stream.next().await` waiting for
+        // frames from Chrome. Its output channel receiver (`ws_reader`)
+        // is dropped at function exit, so there is no consumer either
+        // way — abort directly rather than waiting for the remote to
+        // ack the Close frame.
+        reader_handle.abort();
+
+        run_result
     }
 
     /// `create_page` variant for the `run()` path that submits via `ws_tx`.

@@ -606,6 +606,15 @@ async fn ws_write_loop(
         // Flush the entire batch in one write.
         sink.flush().await.map_err(CdpError::Ws)?;
     }
+
+    // Cmd channel closed → the Handler is shutting down. Send a graceful
+    // WebSocket Close frame so the remote endpoint (esp. for
+    // `Browser::connect()` to a remote DevTools URL, where there is no
+    // child process whose exit closes the socket) tears the connection
+    // down promptly instead of waiting for an idle timeout. Errors are
+    // expected during shutdown (e.g. `AlreadyClosed` if Chrome closed
+    // first) and are intentionally ignored.
+    let _ = sink.close().await;
     Ok(())
 }
 
