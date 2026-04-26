@@ -15,14 +15,27 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+/// One thread-safe entry point per active connection so tests can inject
+/// out-of-band events (e.g. force-detach a session).
+type ConnectionInjector = tokio::sync::mpsc::Sender<String>;
+
+#[derive(Default)]
+struct MockShared {
+    /// Senders into each connection's writer task; tests `inject(...)`
+    /// arbitrary CDP frames into a connection by pushing JSON strings.
+    connections: Mutex<Vec<ConnectionInjector>>,
+}
 
 /// Handle to a running mock server. Drop it to shut the server down.
 pub struct CdpMock {
     addr: SocketAddr,
     accept_task: Option<JoinHandle<()>>,
     shutdown: Arc<tokio::sync::Notify>,
+    shared: Arc<MockShared>,
 }
 
 impl CdpMock {
@@ -34,6 +47,8 @@ impl CdpMock {
         let addr = listener.local_addr().expect("local_addr");
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let shutdown_clone = shutdown.clone();
+        let shared = Arc::new(MockShared::default());
+        let shared_clone = shared.clone();
 
         let accept_task = tokio::spawn(async move {
             loop {
@@ -42,7 +57,7 @@ impl CdpMock {
                     accept = listener.accept() => {
                         match accept {
                             Ok((stream, _)) => {
-                                tokio::spawn(handle_connection(stream));
+                                tokio::spawn(handle_connection(stream, shared_clone.clone()));
                             }
                             Err(_) => break,
                         }
@@ -55,6 +70,7 @@ impl CdpMock {
             addr,
             accept_task: Some(accept_task),
             shutdown,
+            shared,
         }
     }
 
@@ -65,6 +81,23 @@ impl CdpMock {
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Force-emit a `Target.detachedFromTarget` event for `session_id` on
+    /// every active connection, simulating a tab close from the browser.
+    pub async fn detach_session(&self, session_id: &str, target_id: &str) {
+        let payload = serde_json::json!({
+            "method": "Target.detachedFromTarget",
+            "params": {
+                "sessionId": session_id,
+                "targetId": target_id,
+            }
+        })
+        .to_string();
+        let conns = self.shared.connections.lock().await;
+        for tx in conns.iter() {
+            let _ = tx.send(payload.clone()).await;
+        }
     }
 }
 
@@ -90,7 +123,7 @@ struct ConnState {
     sessions: hashbrown::HashMap<String, (String, String, String)>,
 }
 
-async fn handle_connection(stream: tokio::net::TcpStream) {
+async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<MockShared>) {
     let _ = stream.set_nodelay(true);
     let ws = match tokio_tungstenite::accept_async(tokio_tungstenite::MaybeTlsStream::Plain(
         stream,
@@ -101,43 +134,67 @@ async fn handle_connection(stream: tokio::net::TcpStream) {
         Err(_) => return,
     };
     let (mut sink, mut stream) = ws.split();
+
+    // Out-of-band injection channel — the test harness pushes raw JSON
+    // here (e.g. `Target.detachedFromTarget`) and we forward it to the
+    // connected client.
+    let (inject_tx, mut inject_rx) = tokio::sync::mpsc::channel::<String>(64);
+    {
+        let mut conns = shared.connections.lock().await;
+        conns.push(inject_tx);
+    }
+
     let mut state = ConnState::default();
 
-    while let Some(msg) = stream.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(_) => break,
-        };
-        let text = match msg {
-            WsMessage::Text(t) => t,
-            WsMessage::Binary(b) => match std::str::from_utf8(&b) {
-                Ok(s) => s.to_string().into(),
-                Err(_) => continue,
-            },
-            WsMessage::Close(_) => break,
-            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => continue,
-        };
+    loop {
+        tokio::select! {
+            biased;
 
-        let req: serde_json::Value = match serde_json::from_str(text.as_str()) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let id = req.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-        let method = req
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let session_id = req
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
+            injected = inject_rx.recv() => {
+                let Some(line) = injected else { break };
+                if sink.send(WsMessage::Text(line.into())).await.is_err() {
+                    break;
+                }
+            }
 
-        let outbox = handle_method(&mut state, id, &method, session_id.as_deref(), &params);
-        for line in outbox {
-            if sink.send(WsMessage::Text(line.into())).await.is_err() {
-                return;
+            msg = stream.next() => {
+                let Some(msg) = msg else { break };
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                let text = match msg {
+                    WsMessage::Text(t) => t,
+                    WsMessage::Binary(b) => match std::str::from_utf8(&b) {
+                        Ok(s) => s.to_string().into(),
+                        Err(_) => continue,
+                    },
+                    WsMessage::Close(_) => break,
+                    WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => continue,
+                };
+
+                let req: serde_json::Value = match serde_json::from_str(text.as_str()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let id = req.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let method = req
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let session_id = req
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
+
+                let outbox = handle_method(&mut state, id, &method, session_id.as_deref(), &params);
+                for line in outbox {
+                    if sink.send(WsMessage::Text(line.into())).await.is_err() {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -194,6 +251,49 @@ fn handle_method(
                 .insert(sid.clone(), (target_id.clone(), frame_id.clone(), loader_id));
             out.push(attached_to_target_event(&sid, &target_id));
             out.push(json_response(id, serde_json::json!({ "sessionId": sid })));
+        }
+
+        "Page.navigate" => {
+            let (frame_id, prev_loader) = session_id
+                .and_then(|s| state.sessions.get(s))
+                .map(|(_t, f, l)| (f.clone(), l.clone()))
+                .unwrap_or_else(|| ("frame-unknown".into(), "loader-unknown".into()));
+            state.next_loader += 1;
+            let new_loader = format!("loader-{:08x}", state.next_loader);
+            // Update the session record so subsequent commands see the new loader.
+            if let Some(sid) = session_id {
+                if let Some(entry) = state.sessions.get_mut(sid) {
+                    entry.2 = new_loader.clone();
+                }
+            }
+            let url = params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("about:blank")
+                .to_string();
+            out.push(json_response(
+                id,
+                serde_json::json!({
+                    "frameId": frame_id,
+                    "loaderId": new_loader,
+                }),
+            ));
+            if let Some(sid) = session_id {
+                // Frame lifecycle for the new navigation: started → init →
+                // DOMContentLoaded → load → idle → stopped. Each of these
+                // events drives `frame_manager.on_*` so the navigation
+                // watcher's `expected_lifecycle` set fills up and the
+                // navigation completes.
+                out.push(frame_started_loading(sid, &frame_id));
+                out.push(frame_navigated(sid, &frame_id, &url, &new_loader));
+                out.push(lifecycle_event(sid, &frame_id, &new_loader, "init"));
+                out.push(lifecycle_event(sid, &frame_id, &new_loader, "DOMContentLoaded"));
+                out.push(lifecycle_event(sid, &frame_id, &new_loader, "load"));
+                out.push(lifecycle_event(sid, &frame_id, &new_loader, "networkAlmostIdle"));
+                out.push(lifecycle_event(sid, &frame_id, &new_loader, "networkIdle"));
+                out.push(frame_stopped_loading(sid, &frame_id));
+            }
+            let _ = prev_loader;
         }
 
         "Page.getFrameTree" => {
@@ -287,6 +387,46 @@ fn frame_tree_frame(frame_id: &str, loader_id: &str) -> serde_json::Value {
         "crossOriginIsolatedContextType": "NotIsolated",
         "gatedAPIFeatures": []
     })
+}
+
+fn frame_started_loading(session_id: &str, frame_id: &str) -> String {
+    serde_json::json!({
+        "method": "Page.frameStartedLoading",
+        "sessionId": session_id,
+        "params": { "frameId": frame_id }
+    })
+    .to_string()
+}
+
+fn frame_stopped_loading(session_id: &str, frame_id: &str) -> String {
+    serde_json::json!({
+        "method": "Page.frameStoppedLoading",
+        "sessionId": session_id,
+        "params": { "frameId": frame_id }
+    })
+    .to_string()
+}
+
+fn frame_navigated(session_id: &str, frame_id: &str, url: &str, loader_id: &str) -> String {
+    serde_json::json!({
+        "method": "Page.frameNavigated",
+        "sessionId": session_id,
+        "params": {
+            "frame": {
+                "id": frame_id,
+                "loaderId": loader_id,
+                "url": url,
+                "domainAndRegistry": "",
+                "securityOrigin": "://",
+                "mimeType": "text/html",
+                "secureContextType": "Secure",
+                "crossOriginIsolatedContextType": "NotIsolated",
+                "gatedAPIFeatures": []
+            },
+            "type": "Navigation"
+        }
+    })
+    .to_string()
 }
 
 fn lifecycle_event(session_id: &str, frame_id: &str, loader_id: &str, name: &str) -> String {

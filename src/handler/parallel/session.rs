@@ -30,7 +30,11 @@ use tokio::sync::Notify;
 
 use crate::cmd::to_command_response;
 use crate::error::{CdpError, Result};
+use crate::handler::frame::{
+    FrameRequestedNavigation, NavigationError, NavigationId, NavigationOk,
+};
 use crate::handler::target::{Target, TargetEvent};
+use crate::handler::NavigationInProgress;
 
 use super::ids;
 use super::types::{RouterToSession, SessionToRouter};
@@ -44,6 +48,12 @@ enum SessionPending {
     /// Driven by `Page::execute()` — response unblocks the caller via this
     /// oneshot.
     External(OneshotSender<Result<Response>>),
+    /// Driven by `Page::goto()` (or any navigation command). Resolution is
+    /// gated by the navigation lifecycle: the immediate `Page.navigate`
+    /// response sets `response`, and the subsequent `Page.lifecycleEvent`
+    /// for `load`/`networkIdle` sets `navigated`. Whichever lands second
+    /// fires the oneshot.
+    Navigate(NavigationId),
 }
 
 pub(crate) struct SessionTask {
@@ -56,6 +66,9 @@ pub(crate) struct SessionTask {
     session_to_router_tx: mpsc::Sender<SessionToRouter>,
     next_seq: u64,
     pending: HashMap<CallId, (SessionPending, MethodId, Instant)>,
+    /// In-flight navigations keyed by per-session NavigationId.
+    navigations: HashMap<NavigationId, NavigationInProgress<Result<Response>>>,
+    next_nav_id: usize,
     /// Set once we've reported `SessionAttached` to the router.
     session_id_reported: bool,
     /// Reserved for future per-session eviction logic.
@@ -82,6 +95,8 @@ impl SessionTask {
             session_to_router_tx,
             next_seq: 1,
             pending: HashMap::new(),
+            navigations: HashMap::new(),
+            next_nav_id: 0,
             session_id_reported: false,
             request_timeout,
         }
@@ -121,10 +136,39 @@ impl SessionTask {
             self.drive(Instant::now()).await;
         }
 
+        self.cancel_in_flight();
         let _ = self
             .session_to_router_tx
             .send(SessionToRouter::Detached { slot: self.slot })
             .await;
+    }
+
+    /// Drop every in-flight pending command and navigation with a clear
+    /// "target gone" error so callers awaiting `Page::execute` /
+    /// `Page::goto` get a real result instead of a oneshot RecvError.
+    fn cancel_in_flight(&mut self) {
+        for (_, (pending, _, _)) in self.pending.drain() {
+            match pending {
+                SessionPending::External(tx) => {
+                    let _ = tx.send(Err(CdpError::msg("target detached or crashed")));
+                }
+                SessionPending::Navigate(nav_id) => {
+                    if let Some(nav) = self.navigations.remove(&nav_id) {
+                        let _ = nav
+                            .into_tx()
+                            .send(Err(CdpError::msg("target detached or crashed")));
+                    }
+                }
+                SessionPending::Internal => {}
+            }
+        }
+        // Drain any navigations whose pending entry was already retired
+        // (e.g. response received but lifecycle not yet completed).
+        for (_, nav) in self.navigations.drain() {
+            let _ = nav
+                .into_tx()
+                .send(Err(CdpError::msg("target detached or crashed")));
+        }
     }
 
     /// Drain the page channel, advance the Target, dispatch every event.
@@ -153,24 +197,115 @@ impl SessionTask {
                 }
                 Some(TargetEvent::Command(msg)) => {
                     if msg.is_navigation() {
-                        // Phase 2 minimum scope: the bench/smoke do not
-                        // navigate. Surface a clear error so any future
-                        // caller is alerted.
-                        let _ = msg.sender.send(Err(CdpError::msg(
-                            "navigation not yet supported by parallel handler",
-                        )));
+                        self.submit_navigation_command(msg, now).await;
                     } else {
                         self.submit_external(msg, now).await;
                     }
                 }
-                // Stub: navigation tracking deferred to a follow-up.
-                Some(TargetEvent::NavigationRequest(_, _))
-                | Some(TargetEvent::NavigationResult(_))
-                | Some(TargetEvent::BytesConsumed(_)) => {}
+                Some(TargetEvent::NavigationRequest(nav_id, req)) => {
+                    self.submit_nav_request(nav_id, req, now).await;
+                }
+                Some(TargetEvent::NavigationResult(res)) => {
+                    self.on_navigation_lifecycle_completed(res);
+                }
+                Some(TargetEvent::BytesConsumed(_)) => {}
             }
         }
 
         self.target.event_listeners_mut().flush();
+    }
+
+    fn alloc_nav_id(&mut self) -> NavigationId {
+        let id = NavigationId(self.next_nav_id);
+        self.next_nav_id = self.next_nav_id.wrapping_add(1);
+        id
+    }
+
+    async fn submit_navigation_command(&mut self, msg: crate::cmd::CommandMessage, now: Instant) {
+        let (req, sender) = msg.split();
+        let nav_id = self.alloc_nav_id();
+        // Hand the request to the FrameManager so it knows what lifecycle
+        // events to wait for (it clones the Request internally).
+        self.target.goto(FrameRequestedNavigation::new(
+            nav_id,
+            req.clone(),
+            self.request_timeout,
+        ));
+
+        let call_id = self.alloc_call_id();
+        let method = req.method.clone();
+        let call = MethodCall {
+            id: call_id,
+            method: req.method,
+            session_id: req.session_id,
+            params: req.params,
+        };
+        if self.ws_tx.send(call).await.is_err() {
+            let _ = sender.send(Err(CdpError::msg("WS writer closed")));
+            return;
+        }
+        self.pending.insert(
+            call_id,
+            (SessionPending::Navigate(nav_id), method, now),
+        );
+        self.navigations
+            .insert(nav_id, NavigationInProgress::new(sender));
+    }
+
+    async fn submit_nav_request(&mut self, nav_id: NavigationId, req: Request, now: Instant) {
+        let call_id = self.alloc_call_id();
+        let method = req.method.clone();
+        let call = MethodCall {
+            id: call_id,
+            method: req.method,
+            session_id: req.session_id,
+            params: req.params,
+        };
+        if self.ws_tx.send(call).await.is_err() {
+            // Caller's tx is held inside `self.navigations[nav_id]`; drop the
+            // entry to error the caller.
+            self.navigations.remove(&nav_id);
+            return;
+        }
+        self.pending.insert(
+            call_id,
+            (SessionPending::Navigate(nav_id), method, now),
+        );
+    }
+
+    fn on_navigation_response(&mut self, nav_id: NavigationId, resp: Response) {
+        if let Some(mut nav) = self.navigations.remove(&nav_id) {
+            if nav.is_navigated() {
+                let _ = nav.into_tx().send(Ok(resp));
+            } else {
+                nav.set_response(resp);
+                self.navigations.insert(nav_id, nav);
+            }
+        }
+    }
+
+    fn on_navigation_lifecycle_completed(
+        &mut self,
+        res: std::result::Result<NavigationOk, NavigationError>,
+    ) {
+        match res {
+            Ok(ok) => {
+                let id = *ok.navigation_id();
+                if let Some(mut nav) = self.navigations.remove(&id) {
+                    if let Some(resp) = nav.take_response() {
+                        let _ = nav.into_tx().send(Ok(resp));
+                    } else {
+                        nav.set_navigated();
+                        self.navigations.insert(id, nav);
+                    }
+                }
+            }
+            Err(err) => {
+                if let Some(nav) = self.navigations.remove(err.navigation_id()) {
+                    let _ = nav.into_tx().send(Err(err.into()));
+                }
+            }
+        }
     }
 
     fn alloc_call_id(&mut self) -> CallId {
@@ -253,6 +388,9 @@ impl SessionTask {
             }
             SessionPending::External(tx) => {
                 let _ = tx.send(Ok(resp));
+            }
+            SessionPending::Navigate(nav_id) => {
+                self.on_navigation_response(nav_id, resp);
             }
         }
     }

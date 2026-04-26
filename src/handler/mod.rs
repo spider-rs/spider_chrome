@@ -1565,7 +1565,7 @@ pub struct NavigationInProgress<T> {
 }
 
 impl<T> NavigationInProgress<T> {
-    fn new(tx: OneshotSender<T>) -> Self {
+    pub(crate) fn new(tx: OneshotSender<T>) -> Self {
         Self {
             navigated: false,
             response: None,
@@ -1574,13 +1574,31 @@ impl<T> NavigationInProgress<T> {
     }
 
     /// The response to the cdp request has arrived
-    fn set_response(&mut self, resp: Response) {
+    pub(crate) fn set_response(&mut self, resp: Response) {
         self.response = Some(resp);
     }
 
     /// The navigation process has finished, the page finished loading.
-    fn set_navigated(&mut self) {
+    pub(crate) fn set_navigated(&mut self) {
         self.navigated = true;
+    }
+
+    /// Used by the parallel handler when reconciling Page.navigate response
+    /// vs. lifecycle completion order — the existing serial handler reads
+    /// the field directly so these accessors are otherwise inert.
+    #[cfg_attr(not(feature = "parallel-handler"), allow(dead_code))]
+    pub(crate) fn is_navigated(&self) -> bool {
+        self.navigated
+    }
+
+    #[cfg_attr(not(feature = "parallel-handler"), allow(dead_code))]
+    pub(crate) fn take_response(&mut self) -> Option<Response> {
+        self.response.take()
+    }
+
+    #[cfg_attr(not(feature = "parallel-handler"), allow(dead_code))]
+    pub(crate) fn into_tx(self) -> OneshotSender<T> {
+        self.tx
     }
 }
 

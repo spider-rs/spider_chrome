@@ -247,13 +247,32 @@ impl Router {
             CdpEvent::TargetAttachedToTarget(ev) => {
                 self.on_attached_to_target((**ev).clone()).await;
             }
-            CdpEvent::TargetTargetDestroyed(_)
-            | CdpEvent::TargetTargetCrashed(_)
-            | CdpEvent::TargetDetachedFromTarget(_) => {
-                // Phase 2 minimum: targets exit when the SessionTask's
-                // router_rx drops.  Nothing to do here yet.
+            CdpEvent::TargetTargetDestroyed(ev) => {
+                self.on_target_gone(&ev.target_id).await;
+            }
+            CdpEvent::TargetTargetCrashed(ev) => {
+                self.on_target_gone(&ev.target_id).await;
+            }
+            CdpEvent::TargetDetachedFromTarget(ev) => {
+                let sid: &str = ev.session_id.as_ref();
+                if let Some(slot) = self.session_id_to_slot.get(sid).copied() {
+                    if let Some(entry) = self.sessions.get(&slot) {
+                        let _ = entry.inbox.send(RouterToSession::Shutdown).await;
+                    }
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Send Shutdown to the SessionTask owning `target_id`. The SessionTask
+    /// is responsible for cancelling its in-flight oneshots and emitting
+    /// `Detached` back to the Router.
+    async fn on_target_gone(&mut self, target_id: &TargetId) {
+        if let Some(slot) = self.target_id_to_slot.get(target_id).copied() {
+            if let Some(entry) = self.sessions.get(&slot) {
+                let _ = entry.inbox.send(RouterToSession::Shutdown).await;
+            }
         }
     }
 
