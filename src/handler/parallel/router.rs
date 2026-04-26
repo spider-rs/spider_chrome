@@ -31,7 +31,7 @@ use crate::handler::target::{Target, TargetConfig};
 use crate::handler::{BrowserContext, HandlerConfig, HandlerMessage};
 use crate::page::Page;
 
-use super::ids;
+use super::ids::CallIdAllocator;
 use super::session::SessionTask;
 use super::types::{RouterToSession, SessionToRouter};
 
@@ -71,8 +71,10 @@ pub(crate) struct Router {
     ws_reader: WsReader<CdpEventMessage>,
     /// Shared writer half — cloned to every SessionTask.
     ws_tx: mpsc::Sender<MethodCall>,
-    /// Slot 0 next-call seq.
-    next_seq: u64,
+    /// Shared call-id allocator. Mints monotonic small ids (so Chrome's
+    /// JSON serializer keeps them as integers) and records the routing
+    /// slot for every dispatched command in a lock-free DashMap.
+    ids: CallIdAllocator,
     /// Pending requests waiting for a slot-0 response.
     pending: HashMap<CallId, (RouterPending, MethodId)>,
     /// All live sessions, indexed by slot.
@@ -83,6 +85,11 @@ pub(crate) struct Router {
     session_id_to_slot: HashMap<String, u16>,
     /// Slot allocator — slot 0 reserved for the Router.
     next_slot: u16,
+    /// Initiators parked while waiting for `Target.targetCreated` to arrive.
+    /// Real Chrome can deliver the `Target.createTarget` response before the
+    /// matching event; the initiator gets handed off as soon as the event
+    /// lands and the SessionTask is spawned.
+    pending_initiators: HashMap<TargetId, OneshotSender<Result<Page>>>,
     /// SessionTasks signal lifecycle events here (attached / detached).
     session_lifecycle_rx: mpsc::Receiver<SessionToRouter>,
     session_lifecycle_tx: mpsc::Sender<SessionToRouter>,
@@ -111,12 +118,13 @@ impl Router {
             from_browser,
             ws_reader,
             ws_tx,
-            next_seq: next_call_id as u64,
+            ids: CallIdAllocator::new(next_call_id as u64),
             pending,
             sessions: HashMap::new(),
             target_id_to_slot: HashMap::new(),
             session_id_to_slot: HashMap::new(),
             next_slot: 1,
+            pending_initiators: HashMap::new(),
             session_lifecycle_rx,
             session_lifecycle_tx,
         }
@@ -174,17 +182,18 @@ impl Router {
 
     async fn on_response(&mut self, resp: Response) {
         let call_id = resp.id;
-        let slot = ids::decode_slot(call_id);
-        if slot == 0 {
-            self.handle_router_response(call_id, resp).await;
-        } else if let Some(entry) = self.sessions.get(&slot) {
-            // `Internal` pending tracks a method id, but the SessionTask owns
-            // its pending map and re-derives the method via its own record —
-            // so the dummy `""` is never inspected.
-            let _ = entry
-                .inbox
-                .send(RouterToSession::Response(call_id, resp, MethodId::from("")))
-                .await;
+        // Resolve routing: SessionTask-owned ids land in the allocator's
+        // routing map; ids without an entry are router-owned (slot 0).
+        match self.ids.take_route(call_id) {
+            Some(slot) => {
+                if let Some(entry) = self.sessions.get(&slot) {
+                    let _ = entry
+                        .inbox
+                        .send(RouterToSession::Response(call_id, resp, MethodId::from("")))
+                        .await;
+                }
+            }
+            None => self.handle_router_response(call_id, resp).await,
         }
     }
 
@@ -213,7 +222,12 @@ impl Router {
                                 }
                             }
                             None => {
-                                let _ = tx.send(Err(CdpError::NotFound));
+                                // Race: real Chrome may deliver the
+                                // `Target.createTarget` response before the
+                                // `Target.targetCreated` event. Park the
+                                // initiator until the event lands and
+                                // resolve it from `on_target_created`.
+                                self.pending_initiators.insert(target_id, tx);
                             }
                         }
                     }
@@ -234,8 +248,7 @@ impl Router {
                     return;
                 }
             }
-            // Session not yet registered (race during attach): drop the event;
-            // the init chain rebuilds frame state from `Page.getFrameTree`.
+            // Session not yet registered (race during attach): drop the event.
             return;
         }
 
@@ -332,20 +345,27 @@ impl Router {
             router_rx,
             self.ws_tx.clone(),
             self.session_lifecycle_tx.clone(),
+            self.ids.clone(),
             self.config.request_timeout,
         );
 
         self.target_id_to_slot.insert(target_id.clone(), slot);
+        let parked_initiator = self.pending_initiators.remove(&target_id);
         self.sessions.insert(
             slot,
             SessionEntry {
-                inbox: router_tx,
+                inbox: router_tx.clone(),
                 target_id,
                 session_id: None,
                 page_wake,
             },
         );
         tokio::spawn(session.run());
+        // If the createTarget response already landed before this event,
+        // hand its initiator off now that the SessionTask is alive.
+        if let Some(tx) = parked_initiator {
+            let _ = router_tx.send(RouterToSession::SetInitiator(tx)).await;
+        }
     }
 
     async fn on_attached_to_target(&mut self, ev: EventAttachedToTarget) {
@@ -408,7 +428,7 @@ impl Router {
             }
         };
 
-        let call_id = self.alloc_router_call_id();
+        let call_id = self.ids.alloc(0);
         let call = MethodCall {
             id: call_id,
             method: method.clone(),
@@ -450,7 +470,7 @@ impl Router {
         }
 
         // Browser-level command (no session) — dispatch on slot 0.
-        let call_id = self.alloc_router_call_id();
+        let call_id = self.ids.alloc(0);
         let method = cmd.method.clone();
         let (req, sender) = cmd.split();
         let call = MethodCall {
@@ -467,21 +487,15 @@ impl Router {
             .insert(call_id, (RouterPending::BrowserCommand(sender), method));
     }
 
-    /// Submit a session-keyed command directly through the writer using the
-    /// session's slot, so the response routes back to the SessionTask via
-    /// its existing pending map.
+    /// Forward a session-keyed `Browser::execute` command through ws_tx with
+    /// a router-owned id (responses come back to the Router itself, which
+    /// fulfills the caller's oneshot directly).
     async fn dispatch_session_command_via_ws(
         &mut self,
         _slot: u16,
         cmd: CommandMessage,
     ) {
-        // Note: this path is currently unused by `Page::execute` (which
-        // submits commands through the Page's own mpsc, not the browser
-        // channel). It exists for `Browser::execute(...)` calls that
-        // somehow set a session_id, which the typical API does not do.
-        // Treat it like a browser-level command so the caller still gets
-        // a response.
-        let call_id = self.alloc_router_call_id();
+        let call_id = self.ids.alloc(0);
         let method = cmd.method.clone();
         let (req, sender) = cmd.split();
         let call = MethodCall {
@@ -506,18 +520,15 @@ impl Router {
         slot
     }
 
-    fn alloc_router_call_id(&mut self) -> CallId {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        ids::encode(0, seq)
-    }
-
     fn remove_session(&mut self, slot: u16) {
         if let Some(entry) = self.sessions.remove(&slot) {
             self.target_id_to_slot.remove(&entry.target_id);
             if let Some(sid) = entry.session_id {
                 self.session_id_to_slot.remove(&sid);
             }
+            // Drop any in-flight routing entries pointing at this slot so
+            // the DashMap doesn't grow unbounded under heavy session churn.
+            self.ids.drop_slot(slot);
         }
     }
 

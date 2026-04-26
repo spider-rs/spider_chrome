@@ -135,7 +135,7 @@ cache = ["_cache", "http-global-cache/cache"]
 cache_mem = ["_cache", "http-global-cache/cache_mem"]
 serde_stacker = ["dep:serde_stacker", "serde_json/unbounded_depth"]
 io_uring = ["dep:io-uring"]
-parallel-handler = []
+parallel-handler = ["dep:dashmap"]
 
 # Temporary features until cargo weak dependencies bug is fixed
 # See https://github.com/rust-lang/cargo/issues/10801
@@ -213,3 +213,8 @@ harness = false
 [[bench]]
 name = "parallel_pages_bench"
 harness = false
+
+[[bench]]
+name = "parallel_e2e_bench"
+harness = false
+required-features = ["parallel-handler"]

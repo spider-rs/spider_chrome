@@ -348,6 +348,17 @@ impl<T: EventMessage + Unpin + Send + 'static> Connection<T> {
         let (cmd_tx, cmd_rx) = mpsc::channel(WS_CMD_CHANNEL_CAPACITY);
         let (msg_tx, msg_rx) = mpsc::channel::<Result<Box<Message<T>>>>(WS_READ_CHANNEL_CAPACITY);
 
+        // Replay any commands queued via `submit_command` before the
+        // split — most notably the boot `Target.setDiscoverTargets`
+        // pushed by `Handler::new`. Without this, real Chrome never
+        // emits `Target.targetCreated` and `new_page` hangs forever.
+        // Capacity is `WS_CMD_CHANNEL_CAPACITY`, so the boot batch fits
+        // easily — `try_send` would only fail in a pathological case
+        // and we'd lose those commands either way.
+        for call in self.pending_commands {
+            let _ = cmd_tx.try_send(call);
+        }
+
         let writer_handle = tokio::spawn(ws_write_loop(ws_sink, cmd_rx));
         let reader_handle = tokio::spawn(ws_read_loop::<T, _>(ws_stream, msg_tx));
 

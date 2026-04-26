@@ -36,7 +36,7 @@ use crate::handler::frame::{
 use crate::handler::target::{Target, TargetEvent};
 use crate::handler::NavigationInProgress;
 
-use super::ids;
+use super::ids::CallIdAllocator;
 use super::types::{RouterToSession, SessionToRouter};
 
 /// One in-flight CDP request.
@@ -64,7 +64,9 @@ pub(crate) struct SessionTask {
     router_rx: mpsc::Receiver<RouterToSession>,
     ws_tx: mpsc::Sender<MethodCall>,
     session_to_router_tx: mpsc::Sender<SessionToRouter>,
-    next_seq: u64,
+    /// Shared call-id allocator (Router-owned, cloned in). All commands
+    /// route back here via the Router's DashMap.
+    ids: CallIdAllocator,
     pending: HashMap<CallId, (SessionPending, MethodId, Instant)>,
     /// In-flight navigations keyed by per-session NavigationId.
     navigations: HashMap<NavigationId, NavigationInProgress<Result<Response>>>,
@@ -84,6 +86,7 @@ impl SessionTask {
         router_rx: mpsc::Receiver<RouterToSession>,
         ws_tx: mpsc::Sender<MethodCall>,
         session_to_router_tx: mpsc::Sender<SessionToRouter>,
+        ids: CallIdAllocator,
         request_timeout: Duration,
     ) -> Self {
         Self {
@@ -93,7 +96,7 @@ impl SessionTask {
             router_rx,
             ws_tx,
             session_to_router_tx,
-            next_seq: 1,
+            ids,
             pending: HashMap::new(),
             navigations: HashMap::new(),
             next_nav_id: 0,
@@ -308,10 +311,8 @@ impl SessionTask {
         }
     }
 
-    fn alloc_call_id(&mut self) -> CallId {
-        let id = ids::encode(self.slot, self.next_seq);
-        self.next_seq = self.next_seq.wrapping_add(1);
-        id
+    fn alloc_call_id(&self) -> CallId {
+        self.ids.alloc(self.slot)
     }
 
     async fn submit_internal(&mut self, req: Request, now: Instant) {
