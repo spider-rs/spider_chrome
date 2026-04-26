@@ -208,3 +208,7 @@ harness = false
 [[bench]]
 name = "waiter_drain_bench"
 harness = false
+
+[[bench]]
+name = "parallel_pages_bench"
+harness = false
