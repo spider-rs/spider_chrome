@@ -41,6 +41,16 @@ impl CallId {
     pub fn new(id: usize) -> Self {
         CallId(id)
     }
+
+    /// Returns the raw integer value of this id.
+    ///
+    /// Useful when call ids are encoded with routing bits (e.g. a parallel
+    /// handler embedding a slot index in the high bits) so the receiver can
+    /// recover the slot without a lookup table.
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
 }
 
 /// Trait that all the request types have to implement.

@@ -49,6 +49,8 @@ mod job;
 pub mod network;
 pub mod network_utils;
 pub mod page;
+#[cfg(feature = "parallel-handler")]
+pub mod parallel;
 pub mod sender;
 mod session;
 pub mod target;
@@ -1156,6 +1158,47 @@ impl Handler {
         } else {
             let _ = tx.send(Err(CdpError::NotFound)).ok();
         }
+    }
+
+    /// Run the handler with one task per attached page (parallel handler).
+    ///
+    /// Opt-in via the `parallel-handler` Cargo feature. The single-task
+    /// `Handler::run()` path is unchanged. See `src/handler/parallel/mod.rs`
+    /// for the architectural notes and current scope limits.
+    #[cfg(feature = "parallel-handler")]
+    pub async fn run_parallel(mut self) -> Result<()> {
+        // Reuse the existing setup that `run()` did inline: split the WS
+        // connection, kick the boot `Target.setDiscoverTargets` command,
+        // and hand everything to the Router.
+        let conn = self
+            .conn
+            .take()
+            .ok_or_else(|| CdpError::msg("Handler::run_parallel() called with no connection"))?;
+        let async_conn = conn.into_async();
+
+        // The boot command has already been pushed by `Handler::new`; it
+        // sits at call_id `next_id - 1`.
+        let next_id = async_conn.next_id;
+        let boot_call_id = chromiumoxide_types::CallId::new(next_id.saturating_sub(1));
+        let boot_method = DISCOVER_ID.0.clone();
+
+        let router = parallel::Router::new(
+            self.config,
+            self.default_browser_context,
+            self.from_browser,
+            async_conn.reader,
+            async_conn.cmd_tx,
+            boot_call_id,
+            boot_method,
+            next_id,
+        );
+        let result = router.run().await;
+
+        // Make sure the writer drains and the reader task exits cleanly.
+        async_conn.writer_handle.abort();
+        async_conn.reader_handle.abort();
+
+        result
     }
 }
 

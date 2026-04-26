@@ -42,7 +42,25 @@ struct Harness {
     _handler: tokio::task::JoinHandle<chromiumoxide::error::Result<()>>,
 }
 
-async fn setup(rt: &tokio::runtime::Handle, pages: usize) -> Harness {
+/// Which handler driver to use for a given setup.
+#[derive(Copy, Clone, Debug)]
+enum Driver {
+    Serial,
+    #[cfg(feature = "parallel-handler")]
+    Parallel,
+}
+
+impl Driver {
+    fn label(self) -> &'static str {
+        match self {
+            Driver::Serial => "serial",
+            #[cfg(feature = "parallel-handler")]
+            Driver::Parallel => "parallel",
+        }
+    }
+}
+
+async fn setup(rt: &tokio::runtime::Handle, pages: usize, driver: Driver) -> Harness {
     let mock = cdp_mock::CdpMock::spawn().await;
     let cfg = HandlerConfig {
         request_timeout: Duration::from_secs(10),
@@ -51,7 +69,11 @@ async fn setup(rt: &tokio::runtime::Handle, pages: usize) -> Harness {
     let (browser, handler) = Browser::connect_with_config(mock.ws_url(), cfg)
         .await
         .expect("connect to mock");
-    let handle = rt.spawn(handler.run());
+    let handle = match driver {
+        Driver::Serial => rt.spawn(handler.run()),
+        #[cfg(feature = "parallel-handler")]
+        Driver::Parallel => rt.spawn(handler.run_parallel()),
+    };
     let browser = Arc::new(browser);
 
     let mut create_tasks = Vec::with_capacity(pages);
@@ -73,6 +95,13 @@ async fn setup(rt: &tokio::runtime::Handle, pages: usize) -> Harness {
     }
 }
 
+fn drivers() -> Vec<Driver> {
+    let mut v = vec![Driver::Serial];
+    #[cfg(feature = "parallel-handler")]
+    v.push(Driver::Parallel);
+    v
+}
+
 fn bench_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -84,11 +113,13 @@ fn bench_throughput(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(8));
 
+    for driver in drivers() {
     for &pages in PAGE_COUNTS {
-        let harness = rt.block_on(setup(rt.handle(), pages));
+        let harness = rt.block_on(setup(rt.handle(), pages, driver));
         group.throughput(Throughput::Elements((pages * CMDS_PER_PAGE) as u64));
 
-        group.bench_with_input(BenchmarkId::from_parameter(pages), &pages, |b, _| {
+        let id = BenchmarkId::new(driver.label(), pages);
+        group.bench_with_input(id, &pages, |b, _| {
             b.iter_custom(|iters| {
                 rt.block_on(async {
                     let start = Instant::now();
@@ -119,6 +150,7 @@ fn bench_throughput(c: &mut Criterion) {
         // Drop the harness explicitly to free the mock port between page sizes.
         drop(harness);
     }
+    }
     group.finish();
 }
 
@@ -133,10 +165,12 @@ fn bench_single_cmd_latency_under_load(c: &mut Criterion) {
     group.sample_size(40);
     group.measurement_time(Duration::from_secs(6));
 
+    for driver in drivers() {
     for &pages in PAGE_COUNTS {
-        let harness = rt.block_on(setup(rt.handle(), pages));
+        let harness = rt.block_on(setup(rt.handle(), pages, driver));
 
-        group.bench_with_input(BenchmarkId::from_parameter(pages), &pages, |b, _| {
+        let id = BenchmarkId::new(driver.label(), pages);
+        group.bench_with_input(id, &pages, |b, _| {
             b.iter_custom(|iters| {
                 rt.block_on(async {
                     let page = harness.pages[0].clone();
@@ -152,6 +186,7 @@ fn bench_single_cmd_latency_under_load(c: &mut Criterion) {
         });
 
         drop(harness);
+    }
     }
     group.finish();
 }
