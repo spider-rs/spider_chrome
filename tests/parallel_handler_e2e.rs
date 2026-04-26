@@ -50,7 +50,7 @@ async fn e2e_serial_handler_about_blank_round_trip() {
     };
 
     let (browser, mut handler) = Browser::launch(config).await.expect("launch chrome");
-    let _h = tokio::spawn(async move { while let Some(_) = handler.next().await {} });
+    let _h = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let page = timeout(Duration::from_secs(20), browser.new_page("about:blank"))
         .await

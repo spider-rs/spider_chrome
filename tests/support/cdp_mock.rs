@@ -90,11 +90,7 @@ impl CdpMock {
     /// will not respond. Test harness uses this to drive the parallel
     /// handler's per-session eviction path.
     pub async fn swallow_method(&self, method: &str) {
-        self.shared
-            .swallow
-            .lock()
-            .await
-            .insert(method.to_string());
+        self.shared.swallow.lock().await.insert(method.to_string());
     }
 
     /// Force-emit a `Target.detachedFromTarget` event for `session_id` on
@@ -139,10 +135,8 @@ struct ConnState {
 
 async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<MockShared>) {
     let _ = stream.set_nodelay(true);
-    let ws = match tokio_tungstenite::accept_async(tokio_tungstenite::MaybeTlsStream::Plain(
-        stream,
-    ))
-    .await
+    let ws = match tokio_tungstenite::accept_async(tokio_tungstenite::MaybeTlsStream::Plain(stream))
+        .await
     {
         Ok(ws) => ws,
         Err(_) => return,
@@ -264,9 +258,10 @@ fn handle_method(
             let sid = format!("session-{:08x}", state.next_session);
             let frame_id = format!("frame-{}", &sid);
             let loader_id = format!("loader-{:08x}", state.next_loader);
-            state
-                .sessions
-                .insert(sid.clone(), (target_id.clone(), frame_id.clone(), loader_id));
+            state.sessions.insert(
+                sid.clone(),
+                (target_id.clone(), frame_id.clone(), loader_id),
+            );
             out.push(attached_to_target_event(&sid, &target_id));
             out.push(json_response(id, serde_json::json!({ "sessionId": sid })));
         }
@@ -305,9 +300,19 @@ fn handle_method(
                 out.push(frame_started_loading(sid, &frame_id));
                 out.push(frame_navigated(sid, &frame_id, &url, &new_loader));
                 out.push(lifecycle_event(sid, &frame_id, &new_loader, "init"));
-                out.push(lifecycle_event(sid, &frame_id, &new_loader, "DOMContentLoaded"));
+                out.push(lifecycle_event(
+                    sid,
+                    &frame_id,
+                    &new_loader,
+                    "DOMContentLoaded",
+                ));
                 out.push(lifecycle_event(sid, &frame_id, &new_loader, "load"));
-                out.push(lifecycle_event(sid, &frame_id, &new_loader, "networkAlmostIdle"));
+                out.push(lifecycle_event(
+                    sid,
+                    &frame_id,
+                    &new_loader,
+                    "networkAlmostIdle",
+                ));
                 out.push(lifecycle_event(sid, &frame_id, &new_loader, "networkIdle"));
                 out.push(frame_stopped_loading(sid, &frame_id));
             }
@@ -332,7 +337,12 @@ fn handle_method(
             // state can deliver the Page back to the caller of `new_page`.
             if let Some(sid) = session_id {
                 out.push(lifecycle_event(sid, &frame_id, &loader_id, "init"));
-                out.push(lifecycle_event(sid, &frame_id, &loader_id, "DOMContentLoaded"));
+                out.push(lifecycle_event(
+                    sid,
+                    &frame_id,
+                    &loader_id,
+                    "DOMContentLoaded",
+                ));
                 out.push(lifecycle_event(sid, &frame_id, &loader_id, "load"));
             }
         }

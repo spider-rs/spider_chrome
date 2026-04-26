@@ -96,6 +96,7 @@ async fn setup(rt: &tokio::runtime::Handle, pages: usize, driver: Driver) -> Har
 }
 
 fn drivers() -> Vec<Driver> {
+    #[cfg_attr(not(feature = "parallel-handler"), allow(unused_mut))]
     let mut v = vec![Driver::Serial];
     #[cfg(feature = "parallel-handler")]
     v.push(Driver::Parallel);
@@ -114,42 +115,42 @@ fn bench_throughput(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(8));
 
     for driver in drivers() {
-    for &pages in PAGE_COUNTS {
-        let harness = rt.block_on(setup(rt.handle(), pages, driver));
-        group.throughput(Throughput::Elements((pages * CMDS_PER_PAGE) as u64));
+        for &pages in PAGE_COUNTS {
+            let harness = rt.block_on(setup(rt.handle(), pages, driver));
+            group.throughput(Throughput::Elements((pages * CMDS_PER_PAGE) as u64));
 
-        let id = BenchmarkId::new(driver.label(), pages);
-        group.bench_with_input(id, &pages, |b, _| {
-            b.iter_custom(|iters| {
-                rt.block_on(async {
-                    let start = Instant::now();
-                    for _ in 0..iters {
-                        // One task per page. Each task issues K commands
-                        // *sequentially* (await each round-trip before the
-                        // next), but page tasks run in parallel.
-                        let mut tasks = Vec::with_capacity(pages);
-                        for page in &harness.pages {
-                            let p = page.clone();
-                            tasks.push(tokio::spawn(async move {
-                                for i in 0..CMDS_PER_PAGE {
-                                    p.execute(EvaluateParams::new(format!("'p{i}'")))
-                                        .await
-                                        .expect("evaluate");
-                                }
-                            }));
+            let id = BenchmarkId::new(driver.label(), pages);
+            group.bench_with_input(id, &pages, |b, _| {
+                b.iter_custom(|iters| {
+                    rt.block_on(async {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            // One task per page. Each task issues K commands
+                            // *sequentially* (await each round-trip before the
+                            // next), but page tasks run in parallel.
+                            let mut tasks = Vec::with_capacity(pages);
+                            for page in &harness.pages {
+                                let p = page.clone();
+                                tasks.push(tokio::spawn(async move {
+                                    for i in 0..CMDS_PER_PAGE {
+                                        p.execute(EvaluateParams::new(format!("'p{i}'")))
+                                            .await
+                                            .expect("evaluate");
+                                    }
+                                }));
+                            }
+                            for t in tasks {
+                                t.await.expect("join");
+                            }
                         }
-                        for t in tasks {
-                            t.await.expect("join");
-                        }
-                    }
-                    start.elapsed()
-                })
+                        start.elapsed()
+                    })
+                });
             });
-        });
 
-        // Drop the harness explicitly to free the mock port between page sizes.
-        drop(harness);
-    }
+            // Drop the harness explicitly to free the mock port between page sizes.
+            drop(harness);
+        }
     }
     group.finish();
 }
@@ -166,30 +167,34 @@ fn bench_single_cmd_latency_under_load(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(6));
 
     for driver in drivers() {
-    for &pages in PAGE_COUNTS {
-        let harness = rt.block_on(setup(rt.handle(), pages, driver));
+        for &pages in PAGE_COUNTS {
+            let harness = rt.block_on(setup(rt.handle(), pages, driver));
 
-        let id = BenchmarkId::new(driver.label(), pages);
-        group.bench_with_input(id, &pages, |b, _| {
-            b.iter_custom(|iters| {
-                rt.block_on(async {
-                    let page = harness.pages[0].clone();
-                    let start = Instant::now();
-                    for _ in 0..iters {
-                        page.execute(EvaluateParams::new("'x'"))
-                            .await
-                            .expect("evaluate");
-                    }
-                    start.elapsed()
-                })
+            let id = BenchmarkId::new(driver.label(), pages);
+            group.bench_with_input(id, &pages, |b, _| {
+                b.iter_custom(|iters| {
+                    rt.block_on(async {
+                        let page = harness.pages[0].clone();
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            page.execute(EvaluateParams::new("'x'"))
+                                .await
+                                .expect("evaluate");
+                        }
+                        start.elapsed()
+                    })
+                });
             });
-        });
 
-        drop(harness);
-    }
+            drop(harness);
+        }
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_throughput, bench_single_cmd_latency_under_load);
+criterion_group!(
+    benches,
+    bench_throughput,
+    bench_single_cmd_latency_under_load
+);
 criterion_main!(benches);

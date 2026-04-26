@@ -76,9 +76,7 @@ async fn setup(rt: &tokio::runtime::Handle, pages: usize, driver: Driver) -> Opt
     let join = match driver {
         Driver::Serial => {
             let mut h = handler;
-            rt.spawn(async move {
-                while let Some(_) = h.next().await {}
-            })
+            rt.spawn(async move { while h.next().await.is_some() {} })
         }
         Driver::Parallel => rt.spawn(async move {
             let _ = handler.run_parallel().await;
@@ -133,10 +131,7 @@ fn bench_e2e_throughput(c: &mut Criterion) {
     for driver in [Driver::Serial, Driver::Parallel] {
         for &pages in PAGE_COUNTS {
             let Some(harness) = rt.block_on(setup(rt.handle(), pages, driver)) else {
-                eprintln!(
-                    "skipping {}/{pages}: setup failed",
-                    driver.label()
-                );
+                eprintln!("skipping {}/{pages}: setup failed", driver.label());
                 continue;
             };
             group.throughput(Throughput::Elements((pages * CMDS_PER_PAGE) as u64));

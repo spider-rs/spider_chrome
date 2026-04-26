@@ -34,10 +34,7 @@ pub(crate) enum RouterToSession {
 pub(crate) enum SessionToRouter {
     /// The session has resolved its session_id (after `Target.attachToTarget`
     /// succeeded). Router uses this to populate `session_id → slot`.
-    SessionAttached {
-        slot: u16,
-        session_id: String,
-    },
+    SessionAttached { slot: u16, session_id: String },
 
     /// Session task has exited (target closed, error, or shutdown). Router
     /// frees the slot and removes routing entries.

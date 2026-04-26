@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chromiumoxide_cdp::cdp::browser_protocol::target::{
     CreateTargetParams, EventAttachedToTarget, TargetId, TargetInfo,
@@ -76,8 +76,13 @@ pub(crate) struct Router {
     /// JSON serializer keeps them as integers) and records the routing
     /// slot for every dispatched command in a lock-free DashMap.
     ids: CallIdAllocator,
-    /// Pending requests waiting for a slot-0 response.
-    pending: HashMap<CallId, (RouterPending, MethodId)>,
+    /// Pending requests waiting for a slot-0 response. The `Instant` is
+    /// the dispatch time so the eviction tick can time them out.
+    pending: HashMap<CallId, (RouterPending, MethodId, Instant)>,
+    /// Insertion times for `pending_initiators` so the eviction tick can
+    /// time out parked CreateTarget initiators if the matching
+    /// `Target.targetCreated` event never arrives.
+    pending_initiator_ts: HashMap<TargetId, Instant>,
     /// All live sessions, indexed by slot.
     sessions: HashMap<u16, SessionEntry>,
     /// `target_id → slot` so we can route `Target.attachedToTarget` events.
@@ -101,6 +106,7 @@ pub(crate) struct Router {
 }
 
 impl Router {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: HandlerConfig,
         default_browser_context: BrowserContext,
@@ -115,7 +121,10 @@ impl Router {
             mpsc::channel(SESSION_LIFECYCLE_CAPACITY);
 
         let mut pending = HashMap::new();
-        pending.insert(boot_call_id, (RouterPending::Boot, boot_method));
+        pending.insert(
+            boot_call_id,
+            (RouterPending::Boot, boot_method, Instant::now()),
+        );
 
         Self {
             config,
@@ -130,6 +139,7 @@ impl Router {
             session_id_to_slot: HashMap::new(),
             next_slot: 1,
             pending_initiators: HashMap::new(),
+            pending_initiator_ts: HashMap::new(),
             session_lifecycle_rx,
             session_lifecycle_tx,
             event_listeners: EventListeners::default(),
@@ -137,6 +147,15 @@ impl Router {
     }
 
     pub async fn run(mut self) -> Result<()> {
+        use tokio::time::MissedTickBehavior;
+
+        let request_timeout = self.config.request_timeout;
+        let mut evict = tokio::time::interval_at(
+            tokio::time::Instant::now() + request_timeout,
+            request_timeout,
+        );
+        evict.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         loop {
             // Push any queued listener events to subscribers between
             // select wakeups. Runs on every iteration regardless of arm —
@@ -145,6 +164,10 @@ impl Router {
 
             tokio::select! {
                 biased;
+
+                _ = evict.tick() => {
+                    self.evict_router_pending(Instant::now(), request_timeout);
+                }
 
                 msg = self.ws_reader.next_message() => {
                     match msg {
@@ -209,7 +232,7 @@ impl Router {
     }
 
     async fn handle_router_response(&mut self, call_id: CallId, resp: Response) {
-        let Some((pending, method)) = self.pending.remove(&call_id) else {
+        let Some((pending, method, _ts)) = self.pending.remove(&call_id) else {
             return;
         };
         match pending {
@@ -224,10 +247,8 @@ impl Router {
                         match self.target_id_to_slot.get(&target_id).copied() {
                             Some(slot) => {
                                 if let Some(entry) = self.sessions.get(&slot) {
-                                    let _ = entry
-                                        .inbox
-                                        .send(RouterToSession::SetInitiator(tx))
-                                        .await;
+                                    let _ =
+                                        entry.inbox.send(RouterToSession::SetInitiator(tx)).await;
                                 } else {
                                     let _ = tx.send(Err(CdpError::NotFound));
                                 }
@@ -238,6 +259,8 @@ impl Router {
                                 // `Target.targetCreated` event. Park the
                                 // initiator until the event lands and
                                 // resolve it from `on_target_created`.
+                                self.pending_initiator_ts
+                                    .insert(target_id.clone(), Instant::now());
                                 self.pending_initiators.insert(target_id, tx);
                             }
                         }
@@ -255,7 +278,10 @@ impl Router {
         if let Some(sid) = event.session_id.as_deref() {
             if let Some(slot) = self.session_id_to_slot.get(sid).copied() {
                 if let Some(entry) = self.sessions.get(&slot) {
-                    let _ = entry.inbox.send(RouterToSession::Event(Box::new(event))).await;
+                    let _ = entry
+                        .inbox
+                        .send(RouterToSession::Event(Box::new(event)))
+                        .await;
                     return;
                 }
             }
@@ -369,6 +395,7 @@ impl Router {
 
         self.target_id_to_slot.insert(target_id.clone(), slot);
         let parked_initiator = self.pending_initiators.remove(&target_id);
+        self.pending_initiator_ts.remove(&target_id);
         self.sessions.insert(
             slot,
             SessionEntry {
@@ -426,11 +453,7 @@ impl Router {
         }
     }
 
-    async fn create_page(
-        &mut self,
-        params: CreateTargetParams,
-        tx: OneshotSender<Result<Page>>,
-    ) {
+    async fn create_page(&mut self, params: CreateTargetParams, tx: OneshotSender<Result<Page>>) {
         let about_blank = params.url == "about:blank";
         let http_check =
             !about_blank && (params.url.starts_with("http") || params.url.starts_with("file://"));
@@ -459,8 +482,10 @@ impl Router {
             let _ = tx.send(Err(CdpError::msg("WS writer closed")));
             return;
         }
-        self.pending
-            .insert(call_id, (RouterPending::CreateTarget(tx), method));
+        self.pending.insert(
+            call_id,
+            (RouterPending::CreateTarget(tx), method, Instant::now()),
+        );
     }
 
     async fn dispatch_browser_command(&mut self, cmd: CommandMessage) {
@@ -503,18 +528,20 @@ impl Router {
             let _ = sender.send(Err(CdpError::msg("WS writer closed")));
             return;
         }
-        self.pending
-            .insert(call_id, (RouterPending::BrowserCommand(sender), method));
+        self.pending.insert(
+            call_id,
+            (
+                RouterPending::BrowserCommand(sender),
+                method,
+                Instant::now(),
+            ),
+        );
     }
 
     /// Forward a session-keyed `Browser::execute` command through ws_tx with
     /// a router-owned id (responses come back to the Router itself, which
     /// fulfills the caller's oneshot directly).
-    async fn dispatch_session_command_via_ws(
-        &mut self,
-        _slot: u16,
-        cmd: CommandMessage,
-    ) {
+    async fn dispatch_session_command_via_ws(&mut self, _slot: u16, cmd: CommandMessage) {
         let call_id = self.ids.alloc(0);
         let method = cmd.method.clone();
         let (req, sender) = cmd.split();
@@ -528,8 +555,14 @@ impl Router {
             let _ = sender.send(Err(CdpError::msg("WS writer closed")));
             return;
         }
-        self.pending
-            .insert(call_id, (RouterPending::BrowserCommand(sender), method));
+        self.pending.insert(
+            call_id,
+            (
+                RouterPending::BrowserCommand(sender),
+                method,
+                Instant::now(),
+            ),
+        );
     }
 
     fn alloc_slot(&mut self) -> u16 {
@@ -538,6 +571,49 @@ impl Router {
             "router exhausted 65535 session slots — implausibly many tabs in one Browser handle",
         );
         slot
+    }
+
+    /// Time out any router-owned (slot 0) pending command and any parked
+    /// CreateTarget initiator older than `request_timeout`. Mirrors
+    /// `Handler::evict_timed_out_commands` for the parallel split.
+    fn evict_router_pending(&mut self, now: Instant, request_timeout: Duration) {
+        let deadline = match now.checked_sub(request_timeout) {
+            Some(d) => d,
+            None => return,
+        };
+        let stale: Vec<CallId> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, _, ts))| *ts < deadline)
+            .map(|(k, _)| *k)
+            .collect();
+        for id in stale {
+            if let Some((pending, _, _)) = self.pending.remove(&id) {
+                match pending {
+                    RouterPending::Boot => {}
+                    RouterPending::BrowserCommand(tx) => {
+                        let _ = tx.send(Err(CdpError::Timeout));
+                    }
+                    RouterPending::CreateTarget(tx) => {
+                        let _ = tx.send(Err(CdpError::Timeout));
+                    }
+                }
+            }
+        }
+        // Time out parked initiators (createTarget responded but the
+        // matching targetCreated event never arrived).
+        let stale_targets: Vec<TargetId> = self
+            .pending_initiator_ts
+            .iter()
+            .filter(|(_, ts)| **ts < deadline)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for tid in stale_targets {
+            self.pending_initiator_ts.remove(&tid);
+            if let Some(tx) = self.pending_initiators.remove(&tid) {
+                let _ = tx.send(Err(CdpError::Timeout));
+            }
+        }
     }
 
     fn remove_session(&mut self, slot: u16) {

@@ -79,6 +79,7 @@ pub(crate) struct SessionTask {
 }
 
 impl SessionTask {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         slot: u16,
         target: Target,
@@ -154,10 +155,15 @@ impl SessionTask {
         }
 
         self.cancel_in_flight();
+        // try_send (non-awaiting): a full lifecycle channel only happens
+        // if the Router has stalled — and if it has stalled while we are
+        // trying to send `Detached`, awaiting here would deadlock against
+        // Router waiting on `entry.inbox.send()` for *this* session. The
+        // Router will reap our slot on its eviction tick / via the
+        // closed-router_rx detection on its next send attempt to us.
         let _ = self
             .session_to_router_tx
-            .send(SessionToRouter::Detached { slot: self.slot })
-            .await;
+            .try_send(SessionToRouter::Detached { slot: self.slot });
     }
 
     /// Time out any pending command that was issued more than
@@ -295,10 +301,8 @@ impl SessionTask {
             let _ = sender.send(Err(CdpError::msg("WS writer closed")));
             return;
         }
-        self.pending.insert(
-            call_id,
-            (SessionPending::Navigate(nav_id), method, now),
-        );
+        self.pending
+            .insert(call_id, (SessionPending::Navigate(nav_id), method, now));
         self.navigations
             .insert(nav_id, NavigationInProgress::new(sender));
     }
@@ -318,10 +322,8 @@ impl SessionTask {
             self.navigations.remove(&nav_id);
             return;
         }
-        self.pending.insert(
-            call_id,
-            (SessionPending::Navigate(nav_id), method, now),
-        );
+        self.pending
+            .insert(call_id, (SessionPending::Navigate(nav_id), method, now));
     }
 
     fn on_navigation_response(&mut self, nav_id: NavigationId, resp: Response) {
@@ -419,17 +421,18 @@ impl SessionTask {
                         self.target.set_session_id(sid.clone());
                         if !self.session_id_reported {
                             self.session_id_reported = true;
-                            let slot = self.slot;
-                            let sid_str: String = sid.into();
-                            let tx = self.session_to_router_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = tx
-                                    .send(SessionToRouter::SessionAttached {
-                                        slot,
-                                        session_id: sid_str,
-                                    })
-                                    .await;
-                            });
+                            // Lifecycle channel is sized for low-rate signals
+                            // (256 slots; one SessionAttached per session). A
+                            // failed try_send means the Router has dropped
+                            // (browser tearing down) — the SessionTask will
+                            // observe the same drop on its next router_rx
+                            // recv and exit, so the message is not load-bearing.
+                            let _ = self.session_to_router_tx.try_send(
+                                SessionToRouter::SessionAttached {
+                                    slot: self.slot,
+                                    session_id: sid.into(),
+                                },
+                            );
                         }
                     }
                 }

@@ -30,7 +30,9 @@ async fn parallel_handler_errors_on_detached_target() {
     let target_id: String = page.target_id().clone().into();
 
     // Sanity: a normal command works before detach.
-    page.execute(EvaluateParams::new("'pre'")).await.expect("pre");
+    page.execute(EvaluateParams::new("'pre'"))
+        .await
+        .expect("pre");
 
     // Force-detach the session.
     mock.detach_session(&session_id, &target_id).await;
