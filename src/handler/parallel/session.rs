@@ -106,9 +106,19 @@ impl SessionTask {
     }
 
     pub async fn run(mut self) {
+        use tokio::time::MissedTickBehavior;
         // First tick: kick the init state machine immediately so the Target
         // emits `Target.attachToTarget`.
         self.drive(Instant::now()).await;
+
+        // Per-session eviction tick. Bounds in-flight oneshot lifetime to
+        // ~request_timeout when the wire goes silent (Chrome stalls, mock
+        // drops the response, etc.).
+        let mut evict = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.request_timeout,
+            self.request_timeout,
+        );
+        evict.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -134,6 +144,10 @@ impl SessionTask {
                 _ = self.page_wake.notified() => {
                     // page_rx will be drained in `drive()` below
                 }
+
+                _ = evict.tick() => {
+                    self.evict_stale(Instant::now());
+                }
             }
 
             self.drive(Instant::now()).await;
@@ -144,6 +158,40 @@ impl SessionTask {
             .session_to_router_tx
             .send(SessionToRouter::Detached { slot: self.slot })
             .await;
+    }
+
+    /// Time out any pending command that was issued more than
+    /// `request_timeout` ago. Mirrors `Handler::evict_timed_out_commands`
+    /// for the parallel split.
+    fn evict_stale(&mut self, now: Instant) {
+        let deadline = match now.checked_sub(self.request_timeout) {
+            Some(d) => d,
+            None => return,
+        };
+        let stale: Vec<CallId> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, _, ts))| *ts < deadline)
+            .map(|(k, _)| *k)
+            .collect();
+        for id in stale {
+            // Drop the routing entry too so a late response is silently
+            // ignored by the Router.
+            self.ids.take_route(id);
+            if let Some((pending, _, _)) = self.pending.remove(&id) {
+                match pending {
+                    SessionPending::Internal => {}
+                    SessionPending::External(tx) => {
+                        let _ = tx.send(Err(CdpError::Timeout));
+                    }
+                    SessionPending::Navigate(nav_id) => {
+                        if let Some(nav) = self.navigations.remove(&nav_id) {
+                            let _ = nav.into_tx().send(Err(CdpError::Timeout));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Drop every in-flight pending command and navigation with a clear

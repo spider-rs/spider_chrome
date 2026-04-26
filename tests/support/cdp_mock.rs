@@ -28,6 +28,9 @@ struct MockShared {
     /// Senders into each connection's writer task; tests `inject(...)`
     /// arbitrary CDP frames into a connection by pushing JSON strings.
     connections: Mutex<Vec<ConnectionInjector>>,
+    /// CDP method names whose requests the mock should silently swallow
+    /// (no response). Lets eviction tests exercise the timeout path.
+    swallow: Mutex<hashbrown::HashSet<String>>,
 }
 
 /// Handle to a running mock server. Drop it to shut the server down.
@@ -81,6 +84,17 @@ impl CdpMock {
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Swallow any subsequent request whose `method` matches — the mock
+    /// will not respond. Test harness uses this to drive the parallel
+    /// handler's per-session eviction path.
+    pub async fn swallow_method(&self, method: &str) {
+        self.shared
+            .swallow
+            .lock()
+            .await
+            .insert(method.to_string());
     }
 
     /// Force-emit a `Target.detachedFromTarget` event for `session_id` on
@@ -189,6 +203,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<MockShared
                     .map(str::to_string);
                 let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
 
+                if shared.swallow.lock().await.contains(&method) {
+                    // Test asked us to drop this method — emit nothing.
+                    continue;
+                }
                 let outbox = handle_method(&mut state, id, &method, session_id.as_deref(), &params);
                 for line in outbox {
                     if sink.send(WsMessage::Text(line.into())).await.is_err() {

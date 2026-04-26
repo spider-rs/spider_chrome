@@ -29,6 +29,7 @@ use crate::conn::WsReader;
 use crate::error::{CdpError, Result};
 use crate::handler::target::{Target, TargetConfig};
 use crate::handler::{BrowserContext, HandlerConfig, HandlerMessage};
+use crate::listeners::EventListeners;
 use crate::page::Page;
 
 use super::ids::CallIdAllocator;
@@ -93,6 +94,10 @@ pub(crate) struct Router {
     /// SessionTasks signal lifecycle events here (attached / detached).
     session_lifecycle_rx: mpsc::Receiver<SessionToRouter>,
     session_lifecycle_tx: mpsc::Sender<SessionToRouter>,
+    /// Browser-level event listeners (subscribed via `Browser::event_listener`).
+    /// Per-target listeners ride on Target's own `EventListeners` and are
+    /// driven by the SessionTask via `target.on_event`.
+    event_listeners: EventListeners,
 }
 
 impl Router {
@@ -127,11 +132,17 @@ impl Router {
             pending_initiators: HashMap::new(),
             session_lifecycle_rx,
             session_lifecycle_tx,
+            event_listeners: EventListeners::default(),
         }
     }
 
     pub async fn run(mut self) -> Result<()> {
         loop {
+            // Push any queued listener events to subscribers between
+            // select wakeups. Runs on every iteration regardless of arm —
+            // that's where the existing serial handler does it too.
+            self.event_listeners.flush();
+
             tokio::select! {
                 biased;
 
@@ -276,6 +287,13 @@ impl Router {
             }
             _ => {}
         }
+
+        // Fan out the browser-level event to subscribers (`Browser::event_listener`).
+        let CdpEventMessage { params, method, .. } = event;
+        chromiumoxide_cdp::consume_event!(match params {
+            |ev| self.event_listeners.start_send(ev),
+            |json| { let _ = self.event_listeners.try_send_custom(&method, json); }
+        });
     }
 
     /// Send Shutdown to the SessionTask owning `target_id`. The SessionTask
@@ -402,7 +420,9 @@ impl Router {
                 let _ = tx.send(Ok(Vec::new()));
             }
             HandlerMessage::InsertContext(_) | HandlerMessage::DisposeContext(_) => {}
-            HandlerMessage::AddEventListener(_) => {}
+            HandlerMessage::AddEventListener(req) => {
+                self.event_listeners.add_listener(req);
+            }
         }
     }
 
