@@ -837,7 +837,7 @@ impl Page {
             self.spawn_cache_listener(
                 &cache_site,
                 auth_opt.map(|f| f.into()),
-                cache_strategy.clone(),
+                cache_strategy,
                 remote.map(|f| f.into()),
                 false,
                 namespace,
@@ -941,7 +941,7 @@ impl Page {
             self.spawn_cache_listener(
                 &cache_site,
                 auth_opt.map(|f| f.into()),
-                cache_strategy.clone(),
+                cache_strategy,
                 remote.map(|f| f.into()),
                 false,
                 namespace,
@@ -1030,7 +1030,7 @@ impl Page {
             .set_cache_key((Some(cache_site.clone()), cache_policy.clone()))
             .await;
 
-        self.seed_cache(&navigation_url, auth_opt.clone(), remote, namespace)
+        self.seed_cache(&navigation_url, auth_opt, remote, namespace)
             .await?;
 
         self.goto_with_cache(navigate_params, auth_opt).await?;
@@ -3100,7 +3100,7 @@ impl Page {
     #[cfg(feature = "_cache")]
     /// Clear the local cache after navigation.
     pub async fn clear_local_cache(&self, cache_site: &str) -> Result<&Self> {
-        crate::cache::remote::clear_local_session_cache(&cache_site).await;
+        crate::cache::remote::clear_local_session_cache(cache_site).await;
         Ok(self)
     }
 
@@ -3129,7 +3129,7 @@ impl Page {
         remote: Option<&str>,
         namespace: Option<&str>,
     ) -> Result<&Self> {
-        crate::cache::remote::get_cache_site(&cache_site, auth, remote, namespace).await;
+        crate::cache::remote::get_cache_site(cache_site, auth, remote, namespace).await;
         Ok(self)
     }
 
@@ -3173,7 +3173,7 @@ impl Page {
 
         let handle = crate::cache::spawn_response_cache_listener(
             self.clone(),
-            cache_site.into(),
+            cache_site,
             auth,
             cache_strategy,
             dump_remote,

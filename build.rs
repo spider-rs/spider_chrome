@@ -77,7 +77,7 @@ mod easylist {
         // Follow a single 301/302 redirect if needed.
         if response.starts_with("HTTP/1.1 301") || response.starts_with("HTTP/1.1 302") {
             if let Some(loc) = extract_header(&response, "Location") {
-                if let Some((rhost, rpath)) = parse_https_url(&loc) {
+                if let Some((rhost, rpath)) = parse_https_url(loc) {
                     return fetch_https_direct(&rhost, &rpath);
                 }
             }

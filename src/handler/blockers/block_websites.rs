@@ -1,7 +1,7 @@
 /// Firewall protection. This does nothing without the [firewall] flag.
 #[cfg(feature = "firewall")]
 pub(crate) fn block_website(u: &str) -> bool {
-    spider_firewall::is_bad_website_url_clean(&u)
+    spider_firewall::is_bad_website_url_clean(u)
 }
 
 /// Firewall protection. This does nothing without the [firewall] flag.
@@ -13,7 +13,7 @@ pub(crate) fn block_website(_u: &str) -> bool {
 /// Firewall protection xhr. This does nothing without the [firewall] flag.
 #[cfg(feature = "firewall")]
 pub(crate) fn block_xhr(u: &str) -> bool {
-    spider_firewall::is_networking_website_url_clean(&u)
+    spider_firewall::is_networking_website_url_clean(u)
 }
 
 /// Firewall protection xhr. This does nothing without the [firewall] flag.
@@ -25,7 +25,7 @@ pub(crate) fn block_xhr(_u: &str) -> bool {
 /// Firewall protection ads. This does nothing without the [firewall] flag.
 #[cfg(feature = "firewall")]
 pub(crate) fn block_ads(u: &str) -> bool {
-    spider_firewall::is_ad_website_url_clean(&u)
+    spider_firewall::is_ad_website_url_clean(u)
 }
 
 /// Firewall protection ads. This does nothing without the [firewall] flag.

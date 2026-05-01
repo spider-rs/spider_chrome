@@ -345,7 +345,7 @@ pub fn get_session_cache_item(
 pub fn check_session_cache_item(cache_key: &str, target_url: &str) -> bool {
     LOCAL_SESSION_CACHE
         .get(cache_key)
-        .map_or(false, |local_cache| local_cache.contains_key(target_url))
+        .is_some_and(|local_cache| local_cache.contains_key(target_url))
 }
 
 /// Mark a URL as "stream in-flight" so the Network listener skips it.

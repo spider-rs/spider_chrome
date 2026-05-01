@@ -128,14 +128,13 @@ pub async fn rewrite_base_tag(html: &[u8], base_url: Option<&str>) -> String {
                     Ok(())
                 }),
                 element!("body", move |el: &mut lol_html::send::Element<'_, '_>| {
-                    if !saw_head_for_body.load(Ordering::Relaxed) {
-                        if state_for_body
+                    if !saw_head_for_body.load(Ordering::Relaxed)
+                        && state_for_body
                             .compare_exchange(UNSET, INSERTED, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
                         {
                             el.before(&head_with_base, ContentType::Html);
                         }
-                    }
                     Ok(())
                 }),
             ],
@@ -205,7 +204,7 @@ pub fn create_site_key(target_url: &str, auth: Option<&str>, method: Option<&str
 
 /// Get a cached url from the hybrid cache.
 pub async fn get_cached_url(target_url: &str, auth_opt: Option<&str>) -> Option<Vec<u8>> {
-    let cache_url = create_cache_key_raw(target_url, None, auth_opt.as_deref());
+    let cache_url = create_cache_key_raw(target_url, None, auth_opt);
 
     let result = tokio::time::timeout(std::time::Duration::from_millis(60), async {
         CACACHE_MANAGER.get(&cache_url).await
@@ -256,7 +255,7 @@ pub async fn get_cached_url_with_metadata(
     auth_opt: Option<&str>,
     policy: Option<&BasicCachePolicy>,
 ) -> Option<(Vec<u8>, HashMap<String, String>)> {
-    let cache_key = create_cache_key_raw(target_url, None, auth_opt.as_deref());
+    let cache_key = create_cache_key_raw(target_url, None, auth_opt);
 
     let result = tokio::time::timeout(std::time::Duration::from_millis(250), async {
         CACACHE_MANAGER.get(&cache_key).await
@@ -344,7 +343,7 @@ pub async fn put_hybrid_cache(
 
         if dump_remote.is_some() && !dump_readonly {
             let result = tokio::time::timeout(std::time::Duration::from_millis(250), async {
-                CACACHE_MANAGER.get(&cache_key).await
+                CACACHE_MANAGER.get(cache_key).await
             })
             .await;
 
@@ -711,11 +710,11 @@ async fn handle_single_response(
         }
 
         let job = super::dump_remote::DumpJob {
-            cache_key: cache_key,
+            cache_key,
             cache_site: cache_site.to_string(),
             url: url.to_string(),
             method: method.to_string(),
-            status: status,
+            status,
             request_headers: req_headers,
             response_headers: resp_headers,
             body: body_bytes,
@@ -830,7 +829,7 @@ async fn handle_fetch_paused(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let current_url = ev.request.url.as_str();
 
-    let eligible_for_cache = allow_cache_response(&ev.resource_type, cache_strategy.as_deref());
+    let eligible_for_cache = allow_cache_response(&ev.resource_type, cache_strategy);
 
     if !eligible_for_cache || !current_url.starts_with("http") {
         let params = ContinueRequestParams::new(ev.request_id.clone());
@@ -846,7 +845,7 @@ async fn handle_fetch_paused(
     }
 
     if let Some((body, metadata)) =
-        get_cached_url_with_metadata(current_url, auth.as_deref(), policy).await
+        get_cached_url_with_metadata(current_url, auth, policy).await
     {
         tracing::debug!("Cache HIT: {}", current_url);
         let mut resp_headers = Vec::<HeaderEntry>::with_capacity(metadata.len());
@@ -898,7 +897,7 @@ pub(crate) async fn handle_fetch_response_stage(
         return Ok(());
     }
 
-    let eligible_for_cache = allow_cache_response(&ev.resource_type, cache_strategy.as_deref());
+    let eligible_for_cache = allow_cache_response(&ev.resource_type, cache_strategy);
 
     if !eligible_for_cache || !current_url.starts_with("http") {
         let params = ContinueRequestParams::new(ev.request_id.clone());

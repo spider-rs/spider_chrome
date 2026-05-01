@@ -923,8 +923,8 @@ impl NetworkManager {
 
         for (k, v) in headers.iter() {
             resp_headers.push(HeaderEntry {
-                name: k.clone().into(),
-                value: v.clone().into(),
+                name: k.clone(),
+                value: v.clone(),
             });
         }
 
@@ -1027,7 +1027,36 @@ impl NetworkManager {
             }
         }
 
-        skip_networking = self.detect_ad_if_enabled(event, skip_networking);
+        // Skip ad detection for the user-requested top-level Document and
+        // every step of its redirect chain. The crawler explicitly targets
+        // this URL — fulfilling-empty-200 a page just because its host
+        // matches an ad classifier breaks the user's intent (you can
+        // legitimately want to scrape an ad page). Reproduced on
+        // https://logrocket.com/careers, where the firewall ad list
+        // flagged the host and chromey emitted a 17-byte stub for the
+        // document; downstream sub-resources (script/img/iframe/etc.)
+        // remain subject to ad blocking through the rest of the tree.
+        //
+        // Signals in short-circuit order (cheap → expensive):
+        //   1. `redirected_request_id.is_some()` — explicit redirect hop
+        //   2. `had_replacer` — chromey's masked-URL repair path
+        //   3. `document_target_url.is_empty()` — very first nav, tracker
+        //      not yet populated
+        //   4. URL equality against the target — last because string
+        //      compare is the only non-O(1) op (`handle_document_
+        //      replacement_and_tracking` above just set the target to
+        //      the current url, so this is the always-true fallback)
+        //
+        // Sub-resources (Script/Image/Font/Stylesheet/XHR/iframe content)
+        // remain subject to ad blocking through the rest of the tree.
+        let is_main_document_request = document_resource
+            && (event.redirected_request_id.is_some()
+                || had_replacer
+                || self.document_target_url.is_empty()
+                || event.request.url == self.document_target_url);
+        if !is_main_document_request {
+            skip_networking = self.detect_ad_if_enabled(event, skip_networking);
+        }
 
         // Ignore embedded scripts, tracker stylesheets, and tracker images when only_html or ignore_visuals is set.
         if !skip_networking
@@ -1254,7 +1283,7 @@ impl NetworkManager {
 
                 filter_set.add_filters(
                     &*spider_network_blocker::adblock::ADBLOCK_PATTERNS,
-                    rules.clone(),
+                    rules,
                 );
 
                 // When adblock_easylist is enabled, EasyList + EasyPrivacy are
@@ -1265,7 +1294,7 @@ impl NetworkManager {
                     static EASYPRIVACY: &str = include_str!(concat!(env!("OUT_DIR"), "/easyprivacy.txt"));
 
                     if !EASYLIST.is_empty() {
-                        filter_set.add_filter_list(EASYLIST, rules.clone());
+                        filter_set.add_filter_list(EASYLIST, rules);
                     }
                     if !EASYPRIVACY.is_empty() {
                         filter_set.add_filter_list(EASYPRIVACY, rules);

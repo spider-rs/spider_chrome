@@ -234,7 +234,7 @@ impl Target {
             // Include built-in patterns.
             filter_set.add_filters(
                 &*spider_network_blocker::adblock::ADBLOCK_PATTERNS,
-                opts.clone(),
+                opts,
             );
             // Merge user-supplied rules (e.g. EasyList / EasyPrivacy content).
             filter_set.add_filters(rules.iter().map(|s| s.as_str()), opts);
