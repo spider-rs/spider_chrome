@@ -257,24 +257,36 @@ impl<T: IntoEventKind> EventStream<T> {
     }
 }
 
+/// Per-poll budget: how many wrong-type events may be drained inside one
+/// `poll_next` call before we cooperatively yield.  Wrong-type events only
+/// occur when two custom-event listeners share a `method_id` but expect
+/// different Rust types (see `EventListeners::try_send_custom`); without a
+/// cap, a steady producer of those mismatches could keep one tokio worker
+/// inside `poll_next` for an unbounded number of synchronous iterations.
+const MAX_WRONG_TYPE_PER_POLL: usize = 32;
+
 impl<T: IntoEventKind + Unpin> Stream for EventStream<T> {
     type Item = Arc<T>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let pin = self.get_mut();
-        loop {
+        for _ in 0..MAX_WRONG_TYPE_PER_POLL {
             match pin.events.poll_recv(cx) {
                 Poll::Ready(Some(event)) => {
                     if let Ok(e) = event.into_any_arc().downcast() {
                         return Poll::Ready(Some(e));
                     }
-                    // wrong type — try the next message in the channel
+                    // wrong type — drop and try the next message
                     continue;
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }
+        // Hit the per-poll cap.  Re-arm ourselves so the runtime
+        // re-polls us, then yield — other tasks get a chance to run.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -351,5 +363,136 @@ mod tests {
 
         // The listener was removed, so nothing should have been sent
         assert!(rx.try_recv().is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Per-poll budget regression tests for `EventStream::poll_next`.
+    //
+    // Wrong-type messages reach a stream when two custom-event listeners
+    // share a `method_id` but have different Rust types (the dispatcher
+    // sends one converted `Arc<dyn Event>` to all of them; the second
+    // listener's `downcast` then fails). Without a per-poll cap, a steady
+    // stream of those would loop synchronously inside one `poll_next`
+    // call, blocking the worker.
+    // ---------------------------------------------------------------
+
+    use serde::Deserialize;
+
+    #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
+    struct WrongA {
+        a: i32,
+    }
+    impl MethodType for WrongA {
+        fn method_id() -> MethodId {
+            "Custom.PollBudget".into()
+        }
+    }
+    impl CustomEvent for WrongA {}
+
+    #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
+    struct RightB {
+        b: i32,
+    }
+    impl MethodType for RightB {
+        fn method_id() -> MethodId {
+            "Custom.PollBudget".into()
+        }
+    }
+    impl CustomEvent for RightB {}
+
+    /// A flood of wrong-type events larger than `MAX_WRONG_TYPE_PER_POLL`
+    /// is fully drained and the trailing right-type event is still
+    /// delivered — proving the per-poll cap doesn't lose events.
+    #[tokio::test]
+    async fn poll_next_drains_wrong_type_flood() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = EventStream::<RightB>::new(rx);
+
+        // Use ~10x the budget so the stream must yield-and-resume several
+        // times across separate poll calls.
+        let flood = MAX_WRONG_TYPE_PER_POLL * 10;
+        for i in 0..flood {
+            let msg: Arc<dyn Event> = Arc::new(WrongA { a: i as i32 });
+            tx.send(msg).unwrap();
+        }
+        let target = RightB { b: 7 };
+        let target_msg: Arc<dyn Event> = Arc::new(target.clone());
+        tx.send(target_msg).unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("stream must not hang under wrong-type flood")
+            .expect("stream should yield the right-type event");
+        assert_eq!(&*got, &target);
+    }
+
+    /// One `poll_next` call must consume at most `MAX_WRONG_TYPE_PER_POLL`
+    /// wrong-type messages and then return `Pending` (re-arming itself via
+    /// the waker). With strictly more wrong-type events queued than the
+    /// budget, the first poll must NOT keep going to completion.
+    #[tokio::test]
+    async fn poll_next_returns_pending_after_budget() {
+        use std::pin::Pin;
+        use std::task::Poll;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = EventStream::<RightB>::new(rx);
+
+        // Strictly more wrong-type events than the budget, with no
+        // right-type event queued yet. Without the cap, the loop would
+        // synchronously drain everything and then block on `Pending`.
+        let queued = MAX_WRONG_TYPE_PER_POLL + 5;
+        for i in 0..queued {
+            let msg: Arc<dyn Event> = Arc::new(WrongA { a: i as i32 });
+            tx.send(msg).unwrap();
+        }
+
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let res = Pin::new(&mut stream).poll_next(&mut cx);
+        assert!(
+            matches!(res, Poll::Pending),
+            "first poll must yield once the per-poll budget is consumed"
+        );
+
+        // The exact remaining count isn't part of the contract, but at
+        // least `queued - MAX_WRONG_TYPE_PER_POLL` events must still be
+        // sitting in the channel — the cap really did stop early.
+        let mut remaining = 0usize;
+        while stream.events.try_recv().is_ok() {
+            remaining += 1;
+        }
+        assert!(
+            remaining >= queued - MAX_WRONG_TYPE_PER_POLL,
+            "expected at least {} events left after budget poll, found {}",
+            queued - MAX_WRONG_TYPE_PER_POLL,
+            remaining
+        );
+    }
+
+    /// After yielding under the budget cap, a follow-up poll must resume
+    /// draining and ultimately deliver a trailing right-type event — the
+    /// re-arm via `wake_by_ref` is what keeps the stream live.
+    #[tokio::test]
+    async fn poll_next_resumes_after_budget_yield() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = EventStream::<RightB>::new(rx);
+
+        // > 1 budget worth of wrong types, then the right-type tail.
+        for i in 0..(MAX_WRONG_TYPE_PER_POLL + 5) {
+            let msg: Arc<dyn Event> = Arc::new(WrongA { a: i as i32 });
+            tx.send(msg).unwrap();
+        }
+        let target = RightB { b: 99 };
+        let target_msg: Arc<dyn Event> = Arc::new(target.clone());
+        tx.send(target_msg).unwrap();
+
+        // Awaiting `next()` exercises the wake-and-resume path — if the
+        // re-arm were missing, this would hang.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("re-arm must wake the stream after budget yield")
+            .expect("right-type event should be delivered");
+        assert_eq!(&*got, &target);
     }
 }

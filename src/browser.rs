@@ -142,7 +142,13 @@ impl Browser {
             for attempt in 0..=retries {
                 let retry = || async {
                     if attempt < retries {
-                        let backoff_ms = 50u64 * 3u64.saturating_pow(attempt);
+                        // Cap at conn.rs MAX_BACKOFF_MS so a large
+                        // `connection_retries` can't synthesise a multi-day
+                        // sleep — `50 * 3^attempt` blows past u64 around
+                        // attempt=40 and overshoots a sane bound far earlier.
+                        let backoff_ms = 50u64
+                            .saturating_mul(3u64.saturating_pow(attempt))
+                            .min(crate::conn::MAX_BACKOFF_MS);
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     }
                 };

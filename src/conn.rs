@@ -56,7 +56,7 @@ pub const DEFAULT_CONNECTION_RETRIES: u32 = 4;
 const INITIAL_BACKOFF_MS: u64 = 50;
 
 /// Maximum backoff delay between connection retries (in milliseconds).
-const MAX_BACKOFF_MS: u64 = 2_000;
+pub(crate) const MAX_BACKOFF_MS: u64 = 2_000;
 
 impl<T: EventMessage + Unpin> Connection<T> {
     pub async fn connect(debug_ws_url: impl AsRef<str>) -> Result<Self> {
