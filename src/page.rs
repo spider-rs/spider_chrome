@@ -561,26 +561,28 @@ impl Page {
         /// Default timeout when the caller passes `None` — prevents an
         /// infinite polling loop when the selector never matches.
         const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        const BACKOFF: [u64; 6] = [0, 20, 50, 100, 100, 500];
+        /// Saturating backoff (ms). The step index clamps to the last entry,
+        /// so long polls hold at 500 ms instead of cycling back to 0 ms (which
+        /// would re-introduce a near-busy retry path after 6 iterations).
+        const BACKOFF_MS: [u64; 6] = [0, 20, 50, 100, 100, 500];
 
         let selector = selector.into();
-        let poll = async {
-            let mut i = 0;
+        let t = timeout.unwrap_or(DEFAULT_TIMEOUT);
+        tokio::time::timeout(t, async move {
+            let mut step: usize = 0;
             loop {
-                let delay = BACKOFF[i % BACKOFF.len()];
-                if delay > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
                 if let Ok(el) = self.find_element(&selector).await {
                     return Ok(el);
                 }
-                i += 1;
+                let delay = BACKOFF_MS[step];
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                step = (step + 1).min(BACKOFF_MS.len() - 1);
             }
-        };
-        let t = timeout.unwrap_or(DEFAULT_TIMEOUT);
-        tokio::time::timeout(t, poll)
-            .await
-            .map_err(|_| CdpError::Timeout)?
+        })
+        .await
+        .map_err(|_| CdpError::Timeout)?
     }
 
     /// Sleep for a fixed duration. Useful as a floor in wait chains.
