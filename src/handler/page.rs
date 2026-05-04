@@ -505,7 +505,16 @@ impl PageInner {
             .r#type(DispatchMouseEventType::MousePressed)
             .build()
         {
-            self.move_mouse(point).await?.send_command(cmd).await?;
+            self.move_mouse(point).await?;
+            // Pre-click dwell: real users hold the cursor at the target
+            // for a few tens of ms before pressing. A zero-gap
+            // mousemove→mousedown is a common antibot fingerprint.
+            // Disabled by setting `pre_click_dwell_ms = None` (or
+            // `Some((0, 0))`) on the SmartMouseConfig.
+            if let Some(dwell) = self.smart_mouse.pre_click_dwell() {
+                tokio::time::sleep(dwell).await;
+            }
+            self.send_command(cmd).await?;
         }
 
         if let Ok(cmd) = cmd.r#type(DispatchMouseEventType::MouseReleased).build() {

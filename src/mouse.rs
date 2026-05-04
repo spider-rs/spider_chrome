@@ -13,16 +13,41 @@ use std::time::Duration;
 /// Configuration for smart mouse movement behavior.
 #[derive(Debug, Clone)]
 pub struct SmartMouseConfig {
-    /// Number of intermediate steps for movement (higher = smoother). Default: 25.
+    /// Number of intermediate steps for movement (higher = smoother).
+    /// Used directly when [`auto_size`](Self::auto_size) is `false`. With
+    /// `auto_size` enabled the step count is derived from move distance
+    /// instead and this field is ignored. Default: 25.
     pub steps: usize,
     /// Overshoot factor past the target (0.0 = none, 1.0 = full distance). Default: 0.15.
     pub overshoot: f64,
     /// Per-step jitter in CSS pixels. Default: 1.5.
     pub jitter: f64,
-    /// Base delay between movement steps in milliseconds. Default: 8.
+    /// Target delay between movement steps in milliseconds. With
+    /// `auto_size`, this is the *target* spacing — the actual per-step
+    /// delay is the auto-sized total duration divided by the auto-sized
+    /// step count, which can differ when the step count clamps. Default: 8.
     pub step_delay_ms: u64,
     /// Whether to apply ease-in-out timing (acceleration/deceleration). Default: true.
     pub easing: bool,
+    /// Scale step count and total duration to move distance using a
+    /// Fitts'-law-style formula. When `false`, every move uses exactly
+    /// [`steps`](Self::steps) intermediate points spaced at
+    /// [`step_delay_ms`](Self::step_delay_ms) regardless of distance —
+    /// which makes every gesture take the same wall-clock time and is
+    /// itself a detection signal. Default: true.
+    pub auto_size: bool,
+    /// Lower bound on auto-sized total move duration in milliseconds. Default: 100.
+    pub min_duration_ms: u64,
+    /// Upper bound on auto-sized total move duration in milliseconds. Default: 800.
+    pub max_duration_ms: u64,
+    /// Inclusive range for the randomized pause between the final
+    /// `mouseMoved` of a move and the `mousePressed` of the click that
+    /// follows, in milliseconds. `None` disables the dwell entirely;
+    /// `Some((0, 0))` is also treated as disabled. Default:
+    /// `Some((40, 120))` — short enough to feel responsive but long
+    /// enough to break the move→press timing fingerprint that common
+    /// antibot heuristics flag.
+    pub pre_click_dwell_ms: Option<(u64, u64)>,
 }
 
 impl Default for SmartMouseConfig {
@@ -33,8 +58,35 @@ impl Default for SmartMouseConfig {
             jitter: 1.5,
             step_delay_ms: 8,
             easing: true,
+            auto_size: true,
+            min_duration_ms: 100,
+            max_duration_ms: 800,
+            pre_click_dwell_ms: Some((40, 120)),
         }
     }
+}
+
+/// Lower clamp on auto-sized step count. A few intermediate points are
+/// enough to produce a curved trajectory; below this the path looks like
+/// a straight teleport.
+const MIN_AUTO_STEPS: usize = 6;
+/// Upper clamp on auto-sized step count. Real OS pointer integration
+/// rarely emits more than this for a single gesture, and going higher
+/// just spends more wall-clock for diminishing realism.
+const MAX_AUTO_STEPS: usize = 40;
+
+/// Compute the target wall-clock duration for a move of the given
+/// distance, using a Fitts'-law-style formula `T = a + b · log₂(D/W + 1)`.
+/// Constants are tuned so common UI clicks land in the 150-350ms range
+/// and full-screen sweeps stay under the configured upper bound.
+fn fitts_total_ms(distance: f64, config: &SmartMouseConfig) -> f64 {
+    const A_MS: f64 = 80.0;
+    const B_MS: f64 = 110.0;
+    const W_PX: f64 = 40.0;
+    let raw = A_MS + B_MS * (distance / W_PX + 1.0).log2();
+    let lo = config.min_duration_ms as f64;
+    let hi = (config.max_duration_ms as f64).max(lo);
+    raw.clamp(lo, hi)
 }
 
 /// A single step in a mouse movement path.
@@ -78,7 +130,6 @@ fn ease_in_out(t: f64) -> f64 {
 /// produce a realistic-looking cursor trajectory with natural timing.
 pub fn generate_path(from: Point, to: Point, config: &SmartMouseConfig) -> Vec<MovementStep> {
     let mut rng = rand::rng();
-    let steps = config.steps.max(2);
 
     let dx = to.x - from.x;
     let dy = to.y - from.y;
@@ -91,6 +142,23 @@ pub fn generate_path(from: Point, to: Point, config: &SmartMouseConfig) -> Vec<M
             delay: Duration::from_millis(config.step_delay_ms),
         }];
     }
+
+    // Resolve the path's step count and per-step delay. With `auto_size`,
+    // both are functions of distance: the total duration follows
+    // Fitts'-law, the step count is the duration divided by the
+    // configured target spacing (clamped to a human-plausible range),
+    // and the actual per-step delay is back-derived so total ≈ Fitts.
+    // Without `auto_size`, the legacy fixed-step / fixed-delay shape is
+    // preserved exactly.
+    let (steps, step_delay_ms) = if config.auto_size {
+        let total_ms = fitts_total_ms(distance, config);
+        let target = (config.step_delay_ms as f64).max(1.0);
+        let raw = (total_ms / target).round() as usize;
+        let s = raw.clamp(MIN_AUTO_STEPS, MAX_AUTO_STEPS);
+        (s, total_ms / s as f64)
+    } else {
+        (config.steps.max(2), config.step_delay_ms as f64)
+    };
 
     // Perpendicular unit vector for control point offsets
     let (perp_x, perp_y) = if distance > 0.001 {
@@ -113,8 +181,10 @@ pub fn generate_path(from: Point, to: Point, config: &SmartMouseConfig) -> Vec<M
         y: from.y + dy * 0.75 + perp_y * offset2,
     };
 
-    // Determine whether to overshoot
-    let should_overshoot = config.overshoot > 0.0 && distance > 10.0;
+    // Overshoot is human-shaped only on long sweeps. On short moves
+    // (clicking a button a few hundred px away) people don't overshoot,
+    // so emitting an overshoot+correction there is itself a tell.
+    let should_overshoot = config.overshoot > 0.0 && distance > 200.0;
 
     let overshoot_target = if should_overshoot {
         let overshoot_amount = distance * config.overshoot * rng.random_range(0.5..1.5);
@@ -159,7 +229,7 @@ pub fn generate_path(from: Point, to: Point, config: &SmartMouseConfig) -> Vec<M
 
         // Vary delay for natural timing
         let delay_variation: f64 = rng.random_range(0.7..1.3);
-        let delay = Duration::from_millis((config.step_delay_ms as f64 * delay_variation) as u64);
+        let delay = Duration::from_millis((step_delay_ms * delay_variation) as u64);
 
         path.push(MovementStep { point: p, delay });
     }
@@ -178,7 +248,7 @@ pub fn generate_path(from: Point, to: Point, config: &SmartMouseConfig) -> Vec<M
                 y: last.y + (to.y - last.y) * t,
             };
 
-            let delay = Duration::from_millis((config.step_delay_ms as f64 * 0.6) as u64);
+            let delay = Duration::from_millis((step_delay_ms * 0.6) as u64);
             path.push(MovementStep { point: p, delay });
         }
     }
@@ -259,6 +329,29 @@ impl SmartMouse {
         let from = self.position();
         self.set_position(target);
         generate_path(from, target, &self.config)
+    }
+
+    /// Sample a randomized pre-click dwell duration from the configured
+    /// range, or `None` if the dwell is disabled.
+    ///
+    /// The dwell is the pause between the final `mouseMoved` of an
+    /// approach and the `mousePressed` of the click. Real users always
+    /// take at least a few tens of milliseconds to commit; bot drivers
+    /// commonly press in the same task tick. Inserting this gap is one
+    /// of the cheaper detection-shape wins available.
+    pub fn pre_click_dwell(&self) -> Option<Duration> {
+        let (lo, hi) = self.config.pre_click_dwell_ms?;
+        if hi == 0 {
+            return None;
+        }
+        let lo = lo.min(hi);
+        let ms = if lo == hi {
+            lo
+        } else {
+            let mut rng = rand::rng();
+            rng.random_range(lo..=hi)
+        };
+        Some(Duration::from_millis(ms))
     }
 }
 
@@ -369,6 +462,7 @@ mod tests {
         let to = Point::new(200.0, 200.0);
         let config = SmartMouseConfig {
             overshoot: 0.0,
+            auto_size: false,
             ..Default::default()
         };
 
@@ -404,6 +498,7 @@ mod tests {
         let config = SmartMouseConfig {
             steps: 30,
             overshoot: 0.2,
+            auto_size: false,
             ..Default::default()
         };
 
@@ -501,6 +596,8 @@ mod tests {
             jitter: 0.0,
             step_delay_ms: 16,
             easing: false,
+            auto_size: false,
+            ..Default::default()
         };
 
         let mouse = SmartMouse::with_config(config.clone());
@@ -536,5 +633,169 @@ mod tests {
         assert!((config.jitter - 1.5).abs() < 1e-10);
         assert_eq!(config.step_delay_ms, 8);
         assert!(config.easing);
+        assert!(config.auto_size);
+        assert_eq!(config.min_duration_ms, 100);
+        assert_eq!(config.max_duration_ms, 800);
+        assert_eq!(config.pre_click_dwell_ms, Some((40, 120)));
+    }
+
+    #[test]
+    fn test_auto_size_scales_with_distance() {
+        // Disable overshoot so the path length equals the auto-sized
+        // step count exactly — the comparison is what we're testing.
+        let config = SmartMouseConfig {
+            overshoot: 0.0,
+            jitter: 0.0,
+            ..Default::default()
+        };
+
+        let short = generate_path(Point::new(0.0, 0.0), Point::new(60.0, 0.0), &config);
+        let long = generate_path(Point::new(0.0, 0.0), Point::new(1500.0, 0.0), &config);
+
+        assert!(
+            long.len() > short.len(),
+            "auto_size should give longer moves more steps: short={}, long={}",
+            short.len(),
+            long.len()
+        );
+    }
+
+    #[test]
+    fn test_auto_size_clamps_step_count() {
+        let config = SmartMouseConfig {
+            overshoot: 0.0,
+            jitter: 0.0,
+            ..Default::default()
+        };
+
+        // Short non-trivial move clamps to MIN_AUTO_STEPS
+        let tiny = generate_path(Point::new(0.0, 0.0), Point::new(8.0, 0.0), &config);
+        assert!(
+            tiny.len() >= MIN_AUTO_STEPS,
+            "tiny move should hit min step floor, got {}",
+            tiny.len()
+        );
+
+        // Massive move clamps to MAX_AUTO_STEPS
+        let huge = generate_path(Point::new(0.0, 0.0), Point::new(5000.0, 5000.0), &config);
+        assert!(
+            huge.len() <= MAX_AUTO_STEPS,
+            "huge move should hit max step ceiling, got {}",
+            huge.len()
+        );
+    }
+
+    #[test]
+    fn test_auto_size_total_duration_within_bounds() {
+        let config = SmartMouseConfig {
+            overshoot: 0.0,
+            jitter: 0.0,
+            ..Default::default()
+        };
+
+        let path = generate_path(Point::new(0.0, 0.0), Point::new(800.0, 600.0), &config);
+        let total_ms: u128 = path.iter().map(|s| s.delay.as_millis()).sum();
+
+        // Per-step delay variance is ±30%, so total can drift either way.
+        // Allow generous slack on the upper bound; the point is that
+        // auto_size actually caps duration, not that it's exact.
+        assert!(
+            (total_ms as u64) <= config.max_duration_ms + 300,
+            "auto-sized total {} ms should stay near max_duration_ms ({})",
+            total_ms,
+            config.max_duration_ms
+        );
+    }
+
+    #[test]
+    fn test_overshoot_skipped_for_short_moves() {
+        // Distance 150px is below the 200px overshoot threshold — the
+        // path must NOT include overshoot+correction shape, even with
+        // overshoot enabled in config. With overshoot off, the loop
+        // produces exactly `steps` items.
+        let config = SmartMouseConfig {
+            steps: 10,
+            overshoot: 0.5,
+            jitter: 0.0,
+            easing: false,
+            auto_size: false,
+            ..Default::default()
+        };
+
+        let path = generate_path(Point::new(0.0, 0.0), Point::new(150.0, 0.0), &config);
+        assert_eq!(path.len(), config.steps);
+    }
+
+    #[test]
+    fn test_overshoot_engages_for_long_moves() {
+        // Engagement is about *shape*, not length: at moderate step
+        // counts, `main_steps (~85%) + correction (~15%, min 3)` rounds
+        // back to ~steps. Detect engagement by checking that some
+        // intermediate point passes the target along the move axis,
+        // since correction is what brings it back.
+        let config = SmartMouseConfig {
+            steps: 20,
+            overshoot: 0.5,
+            jitter: 0.0,
+            easing: false,
+            auto_size: false,
+            ..Default::default()
+        };
+
+        let target_x = 800.0;
+        let path = generate_path(Point::new(0.0, 0.0), Point::new(target_x, 0.0), &config);
+
+        let passed_target = path.iter().any(|s| s.point.x > target_x + 1.0);
+        assert!(
+            passed_target,
+            "long move with overshoot should pass the target before correcting back"
+        );
+
+        // And the final point still lands exactly on target.
+        let last = path.last().expect("non-empty path");
+        assert!((last.point.x - target_x).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_pre_click_dwell_in_range() {
+        let mouse = SmartMouse::with_config(SmartMouseConfig {
+            pre_click_dwell_ms: Some((50, 100)),
+            ..Default::default()
+        });
+
+        for _ in 0..100 {
+            let dwell = mouse.pre_click_dwell().expect("dwell enabled");
+            let ms = dwell.as_millis() as u64;
+            assert!(
+                (50..=100).contains(&ms),
+                "dwell out of [50,100] range: {} ms",
+                ms
+            );
+        }
+    }
+
+    #[test]
+    fn test_pre_click_dwell_disabled() {
+        let mouse = SmartMouse::with_config(SmartMouseConfig {
+            pre_click_dwell_ms: None,
+            ..Default::default()
+        });
+        assert!(mouse.pre_click_dwell().is_none());
+
+        let mouse = SmartMouse::with_config(SmartMouseConfig {
+            pre_click_dwell_ms: Some((0, 0)),
+            ..Default::default()
+        });
+        assert!(mouse.pre_click_dwell().is_none());
+    }
+
+    #[test]
+    fn test_pre_click_dwell_fixed_when_min_eq_max() {
+        let mouse = SmartMouse::with_config(SmartMouseConfig {
+            pre_click_dwell_ms: Some((75, 75)),
+            ..Default::default()
+        });
+        let dwell = mouse.pre_click_dwell().expect("dwell enabled");
+        assert_eq!(dwell.as_millis(), 75);
     }
 }

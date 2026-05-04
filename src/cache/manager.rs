@@ -132,9 +132,9 @@ pub async fn rewrite_base_tag(html: &[u8], base_url: Option<&str>) -> String {
                         && state_for_body
                             .compare_exchange(UNSET, INSERTED, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
-                        {
-                            el.before(&head_with_base, ContentType::Html);
-                        }
+                    {
+                        el.before(&head_with_base, ContentType::Html);
+                    }
                     Ok(())
                 }),
             ],
@@ -844,9 +844,7 @@ async fn handle_fetch_paused(
         return Ok(());
     }
 
-    if let Some((body, metadata)) =
-        get_cached_url_with_metadata(current_url, auth, policy).await
-    {
+    if let Some((body, metadata)) = get_cached_url_with_metadata(current_url, auth, policy).await {
         tracing::debug!("Cache HIT: {}", current_url);
         let mut resp_headers = Vec::<HeaderEntry>::with_capacity(metadata.len());
 
