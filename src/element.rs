@@ -260,6 +260,22 @@ impl Element {
         Ok(self)
     }
 
+    /// Click this element after approaching it along a human-like bezier
+    /// path with the configured pre-click dwell.
+    ///
+    /// Same scroll-into-view + clickable-point resolution as
+    /// [`click`](Self::click), but routes the dispatch through
+    /// [`Page::click_smooth`](crate::Page::click_smooth) so the cursor
+    /// arrives via a smart-mouse trajectory instead of teleporting. Use
+    /// this on antibot-sensitive flows (captcha, login forms,
+    /// challenge widgets) where the move→press timing fingerprint
+    /// matters.
+    pub async fn click_smooth(&self) -> Result<&Self> {
+        let center = self.scroll_into_view().await?.clickable_point().await?;
+        self.tab.click_smooth(center).await?;
+        Ok(self)
+    }
+
     /// Type the input
     ///
     /// # Example type text into an input element

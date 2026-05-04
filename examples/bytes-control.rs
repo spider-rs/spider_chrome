@@ -19,12 +19,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let handle = tokio::task::spawn(async move {
-        loop {
-            if let Some(e) = handler.next().await {
-                println!("{:?}", e);
-            } else {
-                break;
-            }
+        while let Some(e) = handler.next().await {
+            println!("{:?}", e);
         }
     });
 

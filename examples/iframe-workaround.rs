@@ -16,7 +16,7 @@ async fn main() {
     .await
     .expect("failed to connect to browser");
 
-    let _ = tokio::task::spawn(async move {
+    tokio::task::spawn(async move {
         while let Some(event) = handler.next().await {
             tracing::debug!(event = ?event);
         }

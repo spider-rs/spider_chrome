@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (mut browser, mut handler) =
         Browser::launch(BrowserConfig::builder().with_head().build()?).await?;
-    let _ = tokio::spawn(async move { while let Some(_) = handler.next().await {} });
+    tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let _ = browser.new_page("https://setcookie.net/").await?;
     let example_cookie = CookieParam::builder()
