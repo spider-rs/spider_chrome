@@ -220,6 +220,9 @@ impl Target {
         network_manager.block_prefetch = config.ignore_prefetch;
 
         network_manager.block_stylesheets = config.ignore_stylesheets;
+        network_manager.allow_first_party_stylesheets = config.allow_first_party_stylesheets;
+        network_manager.allow_first_party_javascript = config.allow_first_party_javascript;
+        network_manager.allow_first_party_visuals = config.allow_first_party_visuals;
         network_manager.only_html = config.only_html;
         network_manager.intercept_manager = config.intercept_manager;
 
@@ -1412,6 +1415,16 @@ pub struct TargetConfig {
     /// If `true`, block stylesheets and related CSS resources for this target.
     /// This can reduce bandwidth when only raw HTML is needed.
     pub ignore_stylesheets: bool,
+    /// When `ignore_stylesheets` would skip a stylesheet, allow it through if
+    /// the request URL is first-party (registrable domain matches the page's
+    /// primary frame). Default `true`. Set `false` for strict block-all.
+    pub allow_first_party_stylesheets: bool,
+    /// When a downstream blocker would skip a script, allow it through if
+    /// first-party. Default `true`.
+    pub allow_first_party_javascript: bool,
+    /// When `ignore_visuals` would skip an image/media/font, allow it through
+    /// if first-party. Default `true`.
+    pub allow_first_party_visuals: bool,
     /// If `true`, only HTML documents will be fetched/kept.
     /// Non-HTML subresources may be skipped entirely.
     pub only_html: bool,
@@ -1464,6 +1477,9 @@ impl Default for TargetConfig {
             ignore_javascript: false,
             ignore_visuals: false,
             ignore_stylesheets: false,
+            allow_first_party_stylesheets: true,
+            allow_first_party_javascript: true,
+            allow_first_party_visuals: true,
             ignore_analytics: true,
             ignore_prefetch: true,
             only_html: false,

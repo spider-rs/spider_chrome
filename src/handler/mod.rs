@@ -528,6 +528,9 @@ impl Handler {
                 ignore_javascript: self.config.ignore_javascript,
                 ignore_analytics: self.config.ignore_analytics,
                 ignore_prefetch: self.config.ignore_prefetch,
+                allow_first_party_stylesheets: self.config.allow_first_party_stylesheets,
+                allow_first_party_javascript: self.config.allow_first_party_javascript,
+                allow_first_party_visuals: self.config.allow_first_party_visuals,
                 extra_headers: self.config.extra_headers.clone(),
                 only_html: self.config.only_html && self.config.created_first_target,
                 intercept_manager: self.config.intercept_manager,
@@ -1466,6 +1469,19 @@ pub struct HandlerConfig {
     pub ignore_stylesheets: bool,
     /// Whether to ignore Javascript only allowing critical framework or lib based rendering.
     pub ignore_javascript: bool,
+    /// When `ignore_stylesheets` would skip a stylesheet, allow it through if
+    /// the request URL is first-party (registrable domain matches the page's
+    /// primary frame). Default `true` so SPAs that load their own CSS via
+    /// dynamic imports still hydrate. Set `false` for strict block-all.
+    pub allow_first_party_stylesheets: bool,
+    /// When a downstream blocker (intercept manager / adblock / blocklists)
+    /// would skip a script, allow it through if first-party. Default `true`
+    /// so SPA bootloaders are not collateral damage from third-party rules.
+    pub allow_first_party_javascript: bool,
+    /// When `ignore_visuals` would skip an image/media/font, allow it through
+    /// if the request URL is first-party. Default `true`. Set `false` for
+    /// strict bandwidth-minimal crawls that drop ALL visuals.
+    pub allow_first_party_visuals: bool,
     /// Whether to ignore analytics.
     pub ignore_analytics: bool,
     /// Ignore prefetch request. Defaults to true.
@@ -1533,6 +1549,9 @@ impl Default for HandlerConfig {
             ignore_stylesheets: false,
             ignore_ads: false,
             ignore_javascript: false,
+            allow_first_party_stylesheets: true,
+            allow_first_party_javascript: true,
+            allow_first_party_visuals: true,
             ignore_analytics: true,
             ignore_prefetch: true,
             only_html: false,

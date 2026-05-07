@@ -202,6 +202,9 @@ impl Browser {
             ignore_analytics: config.ignore_analytics,
             ignore_prefetch: config.ignore_prefetch,
             ignore_ads: config.ignore_ads,
+            allow_first_party_stylesheets: config.allow_first_party_stylesheets,
+            allow_first_party_javascript: config.allow_first_party_javascript,
+            allow_first_party_visuals: config.allow_first_party_visuals,
             extra_headers: config.extra_headers.clone(),
             only_html: config.only_html,
             service_worker_enabled: config.service_worker_enabled,
@@ -304,6 +307,9 @@ impl Browser {
             ignore_analytics: config.ignore_analytics,
             ignore_prefetch: config.ignore_prefetch,
             ignore_ads: config.ignore_ads,
+            allow_first_party_stylesheets: config.allow_first_party_stylesheets,
+            allow_first_party_javascript: config.allow_first_party_javascript,
+            allow_first_party_visuals: config.allow_first_party_visuals,
             extra_headers: config.extra_headers.clone(),
             only_html: config.only_html,
             service_worker_enabled: config.service_worker_enabled,
@@ -894,6 +900,16 @@ pub struct BrowserConfig {
     /// Whether to ignore JavaScript requests during interception.
     /// This still allows critical framework bundles to pass when applicable.
     pub ignore_javascript: bool,
+    /// When `ignore_stylesheets` would skip a stylesheet, allow it through if
+    /// the request URL is first-party (registrable domain matches the page's
+    /// primary frame). Default `true`. Set `false` for strict block-all.
+    pub allow_first_party_stylesheets: bool,
+    /// When a downstream blocker would skip a script, allow it through if
+    /// first-party. Default `true`.
+    pub allow_first_party_javascript: bool,
+    /// When `ignore_visuals` would skip an image/media/font, allow it through
+    /// if first-party. Default `true`.
+    pub allow_first_party_visuals: bool,
     /// Whether to ignore analytics/telemetry requests during interception.
     pub ignore_analytics: bool,
     /// Ignore prefetch request.
@@ -986,6 +1002,15 @@ pub struct BrowserConfigBuilder {
     ignore_javascript: bool,
     /// Drop stylesheet (CSS) requests when interception is enabled.
     ignore_stylesheets: bool,
+    /// Allow first-party stylesheets through when `ignore_stylesheets` is on.
+    /// Default `true`. Set `false` to strictly block all CSS.
+    allow_first_party_stylesheets: bool,
+    /// Allow first-party JS through when downstream blockers would skip it.
+    /// Default `true`.
+    allow_first_party_javascript: bool,
+    /// Allow first-party visuals through when `ignore_visuals` is on.
+    /// Default `true`.
+    allow_first_party_visuals: bool,
     /// Ignore prefetch domains.
     ignore_prefetch: bool,
     /// Drop analytics/telemetry requests when interception is enabled.
@@ -1057,6 +1082,9 @@ impl Default for BrowserConfigBuilder {
             ignore_javascript: false,
             ignore_analytics: false,
             ignore_stylesheets: false,
+            allow_first_party_stylesheets: true,
+            allow_first_party_javascript: true,
+            allow_first_party_visuals: true,
             ignore_prefetch: true,
             only_html: false,
             extra_headers: Default::default(),
@@ -1262,6 +1290,28 @@ impl BrowserConfigBuilder {
         self
     }
 
+    /// When `ignore_stylesheets` is on, allow first-party CSS through.
+    /// Default `true`. Set `false` for strict block-all-CSS semantics.
+    pub fn allow_first_party_stylesheets(mut self, allow: bool) -> Self {
+        self.allow_first_party_stylesheets = allow;
+        self
+    }
+
+    /// Allow first-party scripts through downstream blockers (intercept
+    /// manager / adblock / blocklists). Default `true`.
+    pub fn allow_first_party_javascript(mut self, allow: bool) -> Self {
+        self.allow_first_party_javascript = allow;
+        self
+    }
+
+    /// When `ignore_visuals` is on, allow first-party images/media/fonts
+    /// through. Default `true`. Set `false` for strictly bandwidth-minimal
+    /// crawls that drop ALL visuals.
+    pub fn allow_first_party_visuals(mut self, allow: bool) -> Self {
+        self.allow_first_party_visuals = allow;
+        self
+    }
+
     /// Set extra request headers.
     pub fn set_extra_headers(
         mut self,
@@ -1349,6 +1399,9 @@ impl BrowserConfigBuilder {
             ignore_javascript: self.ignore_javascript,
             ignore_analytics: self.ignore_analytics,
             ignore_stylesheets: self.ignore_stylesheets,
+            allow_first_party_stylesheets: self.allow_first_party_stylesheets,
+            allow_first_party_javascript: self.allow_first_party_javascript,
+            allow_first_party_visuals: self.allow_first_party_visuals,
             ignore_prefetch: self.ignore_prefetch,
             extra_headers: self.extra_headers,
             only_html: self.only_html,
