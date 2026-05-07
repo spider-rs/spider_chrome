@@ -737,6 +737,22 @@ async fn concurrent_navigation_and_content_extraction() {
     }
 }
 
+/// Probe whether an external URL is reachable within `probe_timeout`.
+/// Returns `false` for any transport-layer failure (DNS, connect, TLS,
+/// response timeout). Used to skip integration tests that depend on a
+/// real third-party host when that host is currently unresponsive, so
+/// upstream outages do not falsely flag library regressions.
+async fn external_url_reachable(url: &str, probe_timeout: Duration) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(probe_timeout)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+    else {
+        return false;
+    };
+    client.get(url).send().await.is_ok()
+}
+
 /// Navigate to a real-world URL that may involve cross-origin redirects
 /// (e.g. adding `www.` prefix or CDN routing). This exercises the fix for
 /// navigation watchers losing track of the main frame when its ID changes
@@ -748,6 +764,16 @@ async fn goto_cross_origin_redirect_url_loads() {
         return;
     }
 
+    // The unit test `navigation_watcher_tracks_main_frame_id_change`
+    // already covers the fix logic deterministically; this test is a
+    // real-world smoke test, so skip cleanly when the upstream is down
+    // rather than panic on what looks like — but is not — a regression.
+    let target_url = "https://clickz.com/the-tiktok-perfume-effect-what-moroccanoils-measurement-gap-tells-every-senior-marketer";
+    if !external_url_reachable(target_url, Duration::from_secs(15)).await {
+        eprintln!("skipping: {target_url} not reachable in this environment");
+        return;
+    }
+
     let browser = launch_with_handler(browser_like_config("cross-origin-redirect")).await;
 
     let page = timeout(Duration::from_secs(30), browser.new_page("about:blank"))
@@ -755,8 +781,6 @@ async fn goto_cross_origin_redirect_url_loads() {
         .expect("new_page should not time out")
         .expect("new_page should resolve");
 
-    // Navigate to a real page that is known to redirect (clickz.com article).
-    let target_url = "https://clickz.com/the-tiktok-perfume-effect-what-moroccanoils-measurement-gap-tells-every-senior-marketer";
     let result = timeout(Duration::from_secs(60), page.goto(target_url)).await;
 
     match result {
