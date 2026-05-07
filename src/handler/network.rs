@@ -354,6 +354,22 @@ pub struct NetworkManager {
     /// NOTE: With "allow all scripts unless blocklisted", this no longer blocks scripts
     /// by itself (it remains for config compatibility).
     pub block_javascript: bool,
+    /// When `block_stylesheets` would skip a stylesheet, allow it through if
+    /// the request URL is first-party (registrable domain matches the page's
+    /// primary frame). Default `true` so SPAs that load their own CSS via
+    /// dynamic imports still hydrate when callers pass `block_stylesheets`
+    /// for bandwidth. Set `false` to strictly block ALL stylesheets.
+    pub allow_first_party_stylesheets: bool,
+    /// When a downstream blocker (intercept_manager / adblock / blocklists)
+    /// would skip a script, allow it through if the request URL is
+    /// first-party. Default `true` so SPA bootloaders are not collateral
+    /// damage from third-party tracker rules.
+    pub allow_first_party_javascript: bool,
+    /// When `ignore_visuals` would skip an image/media/font, allow it through
+    /// if the request URL is first-party. Default `true` so first-party
+    /// image-driven SPA renderers (gallery code-splits, font-blocking
+    /// hydration) still complete when callers pass `ignore_visuals`.
+    pub allow_first_party_visuals: bool,
     /// Block analytics from rendering
     pub block_analytics: bool,
     /// Block pre-fetch request
@@ -423,6 +439,9 @@ impl NetworkManager {
             ignore_visuals: false,
             block_javascript: false,
             block_stylesheets: false,
+            allow_first_party_stylesheets: true,
+            allow_first_party_javascript: true,
+            allow_first_party_visuals: true,
             block_prefetch: true,
             block_analytics: true,
             only_html: false,
@@ -974,17 +993,13 @@ impl NetworkManager {
             return self.fail_request_blocked(&event.request_id);
         }
 
-        // Capture the initiator type (set by Chrome on
+        // Capture the CDP initiator type (set by Chrome on
         // `Network.requestWillBeSent`) before consuming the cached event.
-        // Used below to override `block_stylesheets` for first-party CSS.
-        // For parser-dispatched <link rel="stylesheet"> requests Chrome
-        // routinely fires `Fetch.requestPaused` *before* the companion
-        // `Network.requestWillBeSent` arrives, so this is `None` for the
-        // first-party case — the override below treats unknown as
-        // "not-Script" and lets the request through. Tracker stylesheets
-        // injected by JS execute after the parser yields, by which point
-        // requestWillBeSent has populated the cache, so they carry
-        // initiator `Script` and stay blocked.
+        // Used by the legacy stylesheet heuristic below as an additive
+        // fallback alongside the new `allow_first_party_*` flags — keeping
+        // both keeps 2.48.2's third-party-with-unknown-initiator stylesheet
+        // pass-through bug-compatible (strict superset of allowed traffic).
+        // Cheap clone of an `Option<InitiatorType>` enum (no allocation).
         let initiator_type: Option<InitiatorType> = event
             .network_id
             .as_ref()
@@ -1122,33 +1137,50 @@ impl NetworkManager {
             skip_networking = false;
         }
 
-        // First-party stylesheet allow.
+        // First-party allow (default ON for stylesheets/javascript/visuals).
         //
-        // `block_stylesheets` was originally a coarse "drop all CSS"
-        // bandwidth optimization, but modern SPAs (React/Next.js with
-        // dynamic `import()`, AppFabric, requirejs-style loaders, etc.)
-        // gate hydration on the `load` event of stylesheets they themselves
+        // `block_stylesheets` and `ignore_visuals` were originally coarse
+        // "drop all" bandwidth optimizations, but modern SPAs (React/Next.js
+        // with dynamic `import()`, AppFabric, requirejs-style loaders, etc.)
+        // gate hydration on the `load` event of resources they themselves
         // load — blocking those leaves outer_html_bytes capturing only the
-        // pre-hydration shell. We can't always cleanly tell first-party CSS
-        // from third-party tracker CSS by `initiator.url` alone (page-owned
-        // CDNs differ from the document eTLD+1, e.g. intuit.com vs
-        // intuitcdn.net), so we use the CDP event-ordering signal instead:
+        // pre-hydration shell. To stay flexible without regressing the
+        // bandwidth case, we use registrable-domain (eTLD+1) matching:
+        // when a request is first-party to the page's primary frame, the
+        // corresponding `allow_first_party_*` flag (default `true`) lets it
+        // through; third-party requests still hit the original block path.
         //
-        //   - Parser-dispatched <link rel="stylesheet"> AND CSS injected by
-        //     code that runs synchronously during the document parse (every
-        //     SPA bootstrap loader) all reach `Fetch.requestPaused` before
-        //     the companion `Network.requestWillBeSent` lands in our
-        //     `requests_will_be_sent` cache, so `initiator_type` is `None`.
-        //   - Tracker CSS injected by JS that runs *after* the parser
-        //     yields (analytics tags, Hotjar, etc.) reach requestPaused
-        //     after requestWillBeSent has populated the cache, so
-        //     `initiator_type` is `Some(Script)`.
+        // Set the matching `allow_first_party_*` flag to `false` to restore
+        // the strict "block ALL of this resource type" semantics.
+        if skip_networking && !self.document_target_domain.is_empty() {
+            let allow = match event.resource_type {
+                ResourceType::Stylesheet => self.allow_first_party_stylesheets,
+                ResourceType::Script => self.allow_first_party_javascript,
+                _ if IGNORE_VISUAL_RESOURCE_MAP.contains(event.resource_type.as_ref()) => {
+                    self.allow_first_party_visuals
+                }
+                _ => false,
+            };
+            if allow && self.is_first_party_url(current_url) {
+                skip_networking = false;
+            }
+        }
+
+        // Legacy stylesheet allow (kept as additive fallback for strict
+        // bug-compat with chromey 2.48.2). For parser-dispatched
+        // <link rel="stylesheet"> Chrome routinely fires
+        // `Fetch.requestPaused` *before* the companion
+        // `Network.requestWillBeSent`, so `initiator_type` is `None`; this
+        // rescues those even on cross-origin CDNs where the eTLD+1 differs
+        // from the page (e.g. intuit.com → intuitcdn.net). Tracker CSS
+        // injected by JS that runs after parser yield carries
+        // `Some(InitiatorType::Script)` and stays blocked here.
         //
-        // So: when block_stylesheets would block a stylesheet, allow it
-        // through *unless* we positively observed `initiator = Script`.
-        // Behavior change is confined to stylesheets only — no other path
-        // is touched.
+        // Gated on `allow_first_party_stylesheets=true` so callers who opt
+        // out of first-party allow get a strict "block ALL stylesheets"
+        // semantics with no surprises from the heuristic side-channel.
         if skip_networking
+            && self.allow_first_party_stylesheets
             && self.block_stylesheets
             && event.resource_type == ResourceType::Stylesheet
             && !matches!(initiator_type, Some(InitiatorType::Script))
@@ -1220,6 +1252,21 @@ impl NetworkManager {
     /// Does the network manager have a target domain?
     pub fn has_target_domain(&self) -> bool {
         !self.document_target_url.is_empty()
+    }
+
+    /// True when `url`'s registrable domain matches the page's primary
+    /// frame. Empty `document_target_domain` (no nav yet, or a redirect
+    /// reset) returns `false` so we don't accidentally treat every URL
+    /// as first-party.
+    #[inline]
+    fn is_first_party_url(&self, url: &str) -> bool {
+        if self.document_target_domain.is_empty() {
+            return false;
+        }
+        match host_and_rest(url) {
+            Some((host, _)) => base_domain_from_host(host) == self.document_target_domain,
+            None => false,
+        }
     }
 
     /// Set the target page url for tracking.
@@ -2061,6 +2108,150 @@ mod tests {
                 false,
             ),
             "strict blacklist should win over whitelist"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_first_party_stylesheet_passes_when_block_stylesheets_on() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://developer.intuit.com/".to_string());
+        nm.block_stylesheets = true;
+
+        assert!(
+            !run_full_interception(
+                &mut nm,
+                "https://developer.intuit.com/static/app.css",
+                ResourceType::Stylesheet,
+                true,
+            ),
+            "first-party CSS must pass when allow_first_party_stylesheets default-true"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_first_party_stylesheet_blocked_when_allow_disabled() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://developer.intuit.com/".to_string());
+        nm.block_stylesheets = true;
+        nm.allow_first_party_stylesheets = false;
+
+        assert!(
+            run_full_interception(
+                &mut nm,
+                "https://developer.intuit.com/static/app.css",
+                ResourceType::Stylesheet,
+                true,
+            ),
+            "first-party CSS must be blocked when allow_first_party_stylesheets=false"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_third_party_stylesheet_still_blocked_with_default_allow() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        // requestWillBeSent fired with `initiator.type = "script"` —
+        // disqualifies the legacy heuristic fallback. Default first-party
+        // allow is on but this URL is third-party, so it should still block.
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://developer.intuit.com/".to_string());
+        nm.block_stylesheets = true;
+        // Required for `on_request_will_be_sent` to actually cache the
+        // RWBS event into `requests_will_be_sent` (otherwise it dispatches
+        // straight to `on_request` and the initiator lookup misses).
+        nm.protocol_request_interception_enabled = true;
+
+        let rwbs_url = "https://tracker.evil.example/track.css";
+        let rwbs_json = serde_json::json!({
+            "requestId": "tp-css-1",
+            "loaderId": "test-loader",
+            "documentURL": "https://developer.intuit.com/",
+            "request": {
+                "url": rwbs_url,
+                "method": "GET",
+                "headers": {},
+                "initialPriority": "Medium",
+                "referrerPolicy": "no-referrer"
+            },
+            "timestamp": 0.0,
+            "wallTime": 0.0,
+            "initiator": { "type": "script" },
+            "redirectHasExtraInfo": false,
+            "type": "Stylesheet",
+            "frameId": "frame1"
+        });
+        let rwbs_event: chromiumoxide_cdp::cdp::browser_protocol::network::EventRequestWillBeSent =
+            serde_json::from_value(rwbs_json).unwrap();
+        nm.on_request_will_be_sent(&rwbs_event);
+
+        // Use the same requestId in the requestPaused event so the
+        // initiator capture finds the cached RWBS entry.
+        use super::NetworkEvent;
+        while nm.poll().is_some() {}
+        let mut paused_event = make_request_paused(rwbs_url, ResourceType::Stylesheet, false);
+        paused_event.network_id = Some(
+            chromiumoxide_cdp::cdp::browser_protocol::network::RequestId::from(
+                "tp-css-1".to_string(),
+            ),
+        );
+        nm.on_fetch_request_paused(&paused_event);
+
+        let mut blocked = false;
+        while let Some(ev) = nm.poll() {
+            if let NetworkEvent::SendCdpRequest((method, _)) = &ev {
+                let m: &str = method.as_ref();
+                if m == "Fetch.fulfillRequest" || m == "Fetch.failRequest" {
+                    blocked = true;
+                }
+            }
+        }
+        assert!(blocked, "third-party Script-initiated CSS must remain blocked");
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_first_party_image_passes_when_ignore_visuals_on() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://shop.example/".to_string());
+        nm.ignore_visuals = true;
+
+        assert!(
+            !run_full_interception(
+                &mut nm,
+                "https://shop.example/img/hero.png",
+                ResourceType::Image,
+                true,
+            ),
+            "first-party image must pass when allow_first_party_visuals default-true"
+        );
+    }
+
+    #[cfg(feature = "adblock")]
+    #[test]
+    fn test_e2e_third_party_image_blocked_when_ignore_visuals_on() {
+        use chromiumoxide_cdp::cdp::browser_protocol::network::ResourceType;
+
+        let mut nm = NetworkManager::new(false, Duration::from_secs(30));
+        nm.set_page_url("https://shop.example/".to_string());
+        nm.ignore_visuals = true;
+
+        assert!(
+            run_full_interception(
+                &mut nm,
+                "https://cdn.thirdparty.io/banner.png",
+                ResourceType::Image,
+                false,
+            ),
+            "third-party image must remain blocked when ignore_visuals=true"
         );
     }
 
