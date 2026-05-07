@@ -16,8 +16,8 @@ use chromiumoxide_cdp::cdp::browser_protocol::fetch::{RequestPattern, RequestSta
 use chromiumoxide_cdp::cdp::browser_protocol::network::{
     EmulateNetworkConditionsByRuleParams, EventLoadingFailed, EventLoadingFinished,
     EventRequestServedFromCache, EventRequestWillBeSent, EventResponseReceived, Headers,
-    InterceptionId, NetworkConditions, RequestId, ResourceType, Response, SetCacheDisabledParams,
-    SetExtraHttpHeadersParams,
+    InitiatorType, InterceptionId, NetworkConditions, RequestId, ResourceType, Response,
+    SetCacheDisabledParams, SetExtraHttpHeadersParams,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::{
     fetch::{
@@ -974,6 +974,23 @@ impl NetworkManager {
             return self.fail_request_blocked(&event.request_id);
         }
 
+        // Capture the initiator type (set by Chrome on
+        // `Network.requestWillBeSent`) before consuming the cached event.
+        // Used below to override `block_stylesheets` for first-party CSS.
+        // For parser-dispatched <link rel="stylesheet"> requests Chrome
+        // routinely fires `Fetch.requestPaused` *before* the companion
+        // `Network.requestWillBeSent` arrives, so this is `None` for the
+        // first-party case — the override below treats unknown as
+        // "not-Script" and lets the request through. Tracker stylesheets
+        // injected by JS execute after the parser yields, by which point
+        // requestWillBeSent has populated the cache, so they carry
+        // initiator `Script` and stay blocked.
+        let initiator_type: Option<InitiatorType> = event
+            .network_id
+            .as_ref()
+            .and_then(|nid| self.requests_will_be_sent.get(nid.as_ref()))
+            .map(|(rwbs, _)| rwbs.initiator.r#type.clone());
+
         if let Some(network_id) = event.network_id.as_ref() {
             if let Some((request_will_be_sent, _)) =
                 self.requests_will_be_sent.remove(network_id.as_ref())
@@ -1102,6 +1119,40 @@ impl NetworkManager {
 
         // check if the url is in the whitelist.
         if skip_networking && self.is_whitelisted(current_url) {
+            skip_networking = false;
+        }
+
+        // First-party stylesheet allow.
+        //
+        // `block_stylesheets` was originally a coarse "drop all CSS"
+        // bandwidth optimization, but modern SPAs (React/Next.js with
+        // dynamic `import()`, AppFabric, requirejs-style loaders, etc.)
+        // gate hydration on the `load` event of stylesheets they themselves
+        // load — blocking those leaves outer_html_bytes capturing only the
+        // pre-hydration shell. We can't always cleanly tell first-party CSS
+        // from third-party tracker CSS by `initiator.url` alone (page-owned
+        // CDNs differ from the document eTLD+1, e.g. intuit.com vs
+        // intuitcdn.net), so we use the CDP event-ordering signal instead:
+        //
+        //   - Parser-dispatched <link rel="stylesheet"> AND CSS injected by
+        //     code that runs synchronously during the document parse (every
+        //     SPA bootstrap loader) all reach `Fetch.requestPaused` before
+        //     the companion `Network.requestWillBeSent` lands in our
+        //     `requests_will_be_sent` cache, so `initiator_type` is `None`.
+        //   - Tracker CSS injected by JS that runs *after* the parser
+        //     yields (analytics tags, Hotjar, etc.) reach requestPaused
+        //     after requestWillBeSent has populated the cache, so
+        //     `initiator_type` is `Some(Script)`.
+        //
+        // So: when block_stylesheets would block a stylesheet, allow it
+        // through *unless* we positively observed `initiator = Script`.
+        // Behavior change is confined to stylesheets only — no other path
+        // is touched.
+        if skip_networking
+            && self.block_stylesheets
+            && event.resource_type == ResourceType::Stylesheet
+            && !matches!(initiator_type, Some(InitiatorType::Script))
+        {
             skip_networking = false;
         }
 
