@@ -135,10 +135,62 @@ impl<T: EventMessage + Unpin> Connection<T> {
     }
 
     /// Default path: let tokio-tungstenite handle TCP connect + WS handshake.
+    ///
+    /// For a plaintext `ws://` endpoint addressed by **hostname**, the resolution
+    /// is served from [`crate::dns`] (a short-TTL cache) and the handshake runs
+    /// over a pre-connected socket — the same shape the io_uring path uses — so
+    /// repeated (re)connects skip `getaddrinfo`. The original request is passed
+    /// to `client_async_with_config`, preserving the `Host` header. Everything
+    /// else — `wss://` (TLS), IP-literal hosts (no DNS), or any URL parse issue —
+    /// falls through to `connect_async_with_config` exactly as before, so TLS
+    /// handling and behavior are unchanged. The cache only maps host→IP; the port
+    /// and path always come from `url`, so it can never retarget a connection.
     async fn connect_default(
         url: &str,
         config: WebSocketConfig,
     ) -> Result<WebSocketStream<ConnectStream>> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        if let Ok(request) = url.into_client_request() {
+            let uri = request.uri();
+            let is_plain_ws = uri.scheme_str() == Some("ws");
+            let host = uri.host().map(str::to_string);
+            let port = uri.port_u16().unwrap_or(9222);
+
+            if is_plain_ws && crate::dns::enabled() {
+                if let Some(h) = host {
+                    // Hostname only — IP literals need no DNS and are left to the
+                    // default path below.
+                    if !crate::dns::is_ip_literal(&h) {
+                        if let Ok(addrs) = crate::dns::resolve(&h, port).await {
+                            match tokio::net::TcpStream::connect(&addrs[..]).await {
+                                Ok(stream) => {
+                                    if *DISABLE_NAGLE {
+                                        let _ = stream.set_nodelay(true);
+                                    }
+                                    let (ws, _) = tokio_tungstenite::client_async_with_config(
+                                        request,
+                                        MaybeTlsStream::Plain(stream),
+                                        Some(config),
+                                    )
+                                    .await?;
+                                    return Ok(ws);
+                                }
+                                Err(e) => {
+                                    // A cached address that won't connect may be
+                                    // stale — drop it so the retry re-resolves.
+                                    crate::dns::invalidate(&h, port);
+                                    return Err(CdpError::Io(e));
+                                }
+                            }
+                        }
+                        // resolve failed → fall through to the default path, which
+                        // surfaces the real connection error.
+                    }
+                }
+            }
+        }
+
         let (ws, _) =
             tokio_tungstenite::connect_async_with_config(url, Some(config), *DISABLE_NAGLE).await?;
         Ok(ws)

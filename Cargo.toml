@@ -31,6 +31,7 @@ tokio = { version = "1", features = [
     "fs",
     "macros",
     "process",
+    "net",
 ] }
 tracing = "0.1"
 pin-project-lite = "0.2"
@@ -62,7 +63,7 @@ auto_encoder = { version = "0.1", optional = true }
 serde_stacker = { version = "0.1", optional = true }
 blake3 = { version = "1", optional = true }
 hex = { version = "0.4", optional = true }
-dashmap = { version = "6", optional = true }
+dashmap = { version = "6" }
 spider_remote_cache = { version = "0.3", optional = true, default-features = false }
 
 [dependencies.spider_fingerprint]
@@ -126,7 +127,6 @@ _cache = [
     "dep:auto_encoder",
     "dep:blake3",
     "dep:hex",
-    "dep:dashmap",
     "dep:spider_remote_cache",
     "_cache_stream_disk"
     ]
@@ -135,7 +135,7 @@ cache = ["_cache", "http-global-cache/cache"]
 cache_mem = ["_cache", "http-global-cache/cache_mem"]
 serde_stacker = ["dep:serde_stacker", "serde_json/unbounded_depth"]
 io_uring = ["dep:io-uring"]
-parallel-handler = ["dep:dashmap"]
+parallel-handler = []
 
 # Temporary features until cargo weak dependencies bug is fixed
 # See https://github.com/rust-lang/cargo/issues/10801

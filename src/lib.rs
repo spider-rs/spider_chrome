@@ -75,6 +75,7 @@ pub mod http;
 pub mod cmd;
 pub mod conn;
 pub mod detection;
+pub mod dns;
 pub mod element;
 pub mod error;
 pub mod handler;
