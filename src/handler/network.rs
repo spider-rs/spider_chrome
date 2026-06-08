@@ -412,6 +412,17 @@ pub struct NetworkManager {
     blacklist_matcher: Option<AhoCorasick>,
     /// If true, blacklist always wins (cannot be unblocked by whitelist/3p allow).
     blacklist_strict: bool,
+    /// When true, push the interception policy (flags + per-job
+    /// blacklist/whitelist + page url) to a capable remote engine once per
+    /// navigation via `Interception.setPolicy`, so it can resolve block/allow
+    /// decisions locally instead of round-tripping each `Fetch.requestPaused`.
+    /// Default `false` — a real Chrome target 200-OK-ignores the unknown
+    /// method, and an engine that does not implement it simply keeps the
+    /// round-trip path, so this is safe to leave on. Carries no engine-
+    /// specific data: only this manager's existing config fields are
+    /// serialized; the per-job lists travel as the opaque strings the caller
+    /// already supplied.
+    remote_local_policy: bool,
     /// Custom adblock engine built from user-supplied filter rules.
     /// When `Some`, takes precedence over the global default engine.
     #[cfg(feature = "adblock")]
@@ -455,6 +466,7 @@ impl NetworkManager {
             blacklist_patterns: Vec::new(),
             blacklist_matcher: None,
             blacklist_strict: true,
+            remote_local_policy: false,
             max_bytes_allowed: None,
             max_redirects: None,
             #[cfg(feature = "_cache")]
@@ -657,6 +669,65 @@ impl NetworkManager {
 
     pub fn set_block_all(&mut self, block_all: bool) {
         self.block_all = block_all;
+    }
+
+    /// Enable/disable pushing the interception policy to a capable remote
+    /// engine (see [`NetworkManager::remote_local_policy`]).
+    pub fn set_remote_local_policy(&mut self, enabled: bool) {
+        self.remote_local_policy = enabled;
+    }
+
+    /// Serialize the current interception configuration into the
+    /// `Interception.setPolicy` params. Pure serialization of fields this
+    /// manager already holds — no engine-specific logic, no list contents
+    /// beyond the caller-supplied per-job substrings.
+    fn request_policy_params(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "enabled": true,
+            "flags": {
+                "blockAll": self.block_all,
+                "blockVisuals": self.ignore_visuals,
+                "blockStylesheets": self.block_stylesheets,
+                "blockJavascript": self.block_javascript,
+                "blockAnalytics": self.block_analytics,
+                "blockAds": self.block_ads_enabled(),
+                "blockPrefetch": self.block_prefetch,
+                "onlyHtml": self.only_html,
+                "blacklistStrict": self.blacklist_strict,
+                "allowFirstPartyStylesheets": self.allow_first_party_stylesheets,
+                "allowFirstPartyJavascript": self.allow_first_party_javascript,
+                "allowFirstPartyVisuals": self.allow_first_party_visuals,
+            },
+            "blacklist": self.blacklist_patterns,
+            "whitelist": self.whitelist_patterns,
+            // Discriminant only — a non-default manager signals the engine to
+            // keep the round-trip (the manager's detection stays here).
+            "interceptManager": format!("{:?}", self.intercept_manager),
+            "pageUrl": self.document_target_url,
+        })
+    }
+
+    /// Ad blocking is governed by the `firewall` build (the `block_websites`
+    /// /`detect_ad` path). When that feature is off this manager performs no
+    /// ad blocking, so the pushed policy must report `false` to stay in parity.
+    #[inline]
+    fn block_ads_enabled(&self) -> bool {
+        cfg!(feature = "firewall")
+    }
+
+    /// Push the one-shot `Interception.setPolicy` to the remote engine when
+    /// enabled and Fetch interception is active. No-op otherwise (default), so
+    /// callers that never opt in pay nothing and behavior is unchanged.
+    pub fn emit_request_policy(&mut self) {
+        if !self.remote_local_policy || !self.protocol_request_interception_enabled {
+            return;
+        }
+        let params = self.request_policy_params();
+        self.queued_events.push_back(NetworkEvent::SendCdpRequest((
+            Cow::Borrowed("Interception.setPolicy"),
+            params,
+        )));
     }
 
     pub fn set_request_interception(&mut self, enabled: bool) {
@@ -1277,6 +1348,11 @@ impl NetworkManager {
 
         self.document_target_domain = host_base.to_string();
         self.document_target_url = page_target_url;
+
+        // Re-push the policy on navigation so the remote engine's first-party
+        // origin tracks the new page. No-op unless `remote_local_policy` is on
+        // and interception is active.
+        self.emit_request_policy();
     }
 
     /// Clear the initial target domain on every navigation.
@@ -2212,7 +2288,10 @@ mod tests {
                 }
             }
         }
-        assert!(blocked, "third-party Script-initiated CSS must remain blocked");
+        assert!(
+            blocked,
+            "third-party Script-initiated CSS must remain blocked"
+        );
     }
 
     #[cfg(feature = "adblock")]

@@ -366,6 +366,7 @@ impl Router {
                 extra_headers: self.config.extra_headers.clone(),
                 only_html: self.config.only_html && self.config.created_first_target,
                 intercept_manager: self.config.intercept_manager,
+                remote_local_policy: self.config.remote_local_policy,
                 max_bytes_allowed: self.config.max_bytes_allowed,
                 max_redirects: self.config.max_redirects,
                 max_main_frame_navigations: self.config.max_main_frame_navigations,

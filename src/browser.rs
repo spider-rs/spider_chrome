@@ -320,6 +320,10 @@ impl Browser {
             max_main_frame_navigations: config.max_main_frame_navigations,
             whitelist_patterns: config.whitelist_patterns.clone(),
             blacklist_patterns: config.blacklist_patterns.clone(),
+            // The local-launch path drives a real Chrome, which ignores the
+            // vendor `Interception.setPolicy` method — so leave it off here.
+            // Remote engines opt in via `HandlerConfig`/`connect_with_config`.
+            remote_local_policy: false,
             #[cfg(feature = "adblock")]
             adblock_filter_rules: config.adblock_filter_rules.clone(),
             channel_capacity: config.channel_capacity,

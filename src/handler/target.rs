@@ -225,6 +225,12 @@ impl Target {
         network_manager.allow_first_party_visuals = config.allow_first_party_visuals;
         network_manager.only_html = config.only_html;
         network_manager.intercept_manager = config.intercept_manager;
+        network_manager.set_remote_local_policy(config.remote_local_policy);
+
+        // Push the one-shot interception policy now that every field above is
+        // configured (must run AFTER the field setup — `set_request_interception`
+        // above only queued `Fetch.enable`). No-op unless opted in.
+        network_manager.emit_request_policy();
 
         #[cfg(feature = "adblock")]
         if let Some(rules) = &config.adblock_filter_rules {
@@ -1437,6 +1443,11 @@ pub struct TargetConfig {
     /// Network intercept manager used to make allow/deny/modify decisions
     /// for requests when `request_intercept` is enabled.
     pub intercept_manager: NetworkInterceptManager,
+    /// Push the interception policy to a capable remote engine once per
+    /// navigation (`Interception.setPolicy`) so it resolves block/allow
+    /// locally instead of round-tripping each `Fetch.requestPaused`. Default
+    /// `false`; safe against any target.
+    pub remote_local_policy: bool,
     /// The maximum number of response bytes allowed for this target.
     /// When set, responses larger than this limit may be truncated or aborted.
     pub max_bytes_allowed: Option<u64>,
@@ -1485,6 +1496,7 @@ impl Default for TargetConfig {
             only_html: false,
             extra_headers: Default::default(),
             intercept_manager: NetworkInterceptManager::Unknown,
+            remote_local_policy: false,
             max_bytes_allowed: None,
             max_redirects: None,
             max_main_frame_navigations: None,
