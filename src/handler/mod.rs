@@ -534,6 +534,7 @@ impl Handler {
                 extra_headers: self.config.extra_headers.clone(),
                 only_html: self.config.only_html && self.config.created_first_target,
                 intercept_manager: self.config.intercept_manager,
+                remote_local_policy: self.config.remote_local_policy,
                 max_bytes_allowed: self.config.max_bytes_allowed,
                 max_redirects: self.config.max_redirects,
                 max_main_frame_navigations: self.config.max_main_frame_navigations,
@@ -1513,6 +1514,11 @@ pub struct HandlerConfig {
     pub whitelist_patterns: Option<Vec<String>>,
     /// Optional per-run/per-site blacklist of URL substrings (scripts/resources).
     pub blacklist_patterns: Option<Vec<String>>,
+    /// Push the interception policy to a capable remote engine once per
+    /// navigation (`Interception.setPolicy`) so it can resolve block/allow
+    /// locally instead of round-tripping each `Fetch.requestPaused`. Default
+    /// `false`; safe to enable against any target (unknown method is ignored).
+    pub remote_local_policy: bool,
     /// Extra ABP/uBO filter rules for the adblock engine.
     #[cfg(feature = "adblock")]
     pub adblock_filter_rules: Option<Vec<String>>,
@@ -1563,6 +1569,7 @@ impl Default for HandlerConfig {
             max_main_frame_navigations: None,
             whitelist_patterns: None,
             blacklist_patterns: None,
+            remote_local_policy: false,
             #[cfg(feature = "adblock")]
             adblock_filter_rules: None,
             channel_capacity: 4096,
