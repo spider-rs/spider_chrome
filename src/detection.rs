@@ -7,6 +7,14 @@ pub struct DetectionOptions {
     pub msedge: bool,
     /// Detect unstable installations (beta, dev, unstable)
     pub unstable: bool,
+    /// Prefer Microsoft Edge over Chrome/Chromium when both are installed.
+    ///
+    /// By default Chrome/Chromium binaries are checked first, so a system with
+    /// both Chrome and Edge resolves to Chrome even when [`Self::msedge`] is
+    /// set. Enabling this checks Edge binaries first and falls back to
+    /// Chrome/Chromium only when no Edge install is found. Has no effect unless
+    /// [`Self::msedge`] is also enabled.
+    pub prefer_msedge: bool,
 }
 
 impl Default for DetectionOptions {
@@ -14,6 +22,7 @@ impl Default for DetectionOptions {
         Self {
             msedge: true,
             unstable: false,
+            prefer_msedge: false,
         }
     }
 }
@@ -57,9 +66,15 @@ fn get_by_env_var() -> Option<PathBuf> {
     None
 }
 
+/// Ordered list of `which`-resolvable binary names with their allowed flags.
+///
+/// Chrome/Chromium candidates come first by default; when
+/// [`DetectionOptions::prefer_msedge`] is set the Edge candidates are moved
+/// ahead of them. Disallowed entries are retained (flagged `false`) so the
+/// caller skips them — keeping the relative order stable for either branch.
 #[cfg(feature = "auto-detect-executable")]
-fn get_by_name(options: &DetectionOptions) -> Option<PathBuf> {
-    let default_apps = [
+fn name_candidates(options: &DetectionOptions) -> Vec<(&'static str, bool)> {
+    let chrome_apps = [
         ("chrome", true),
         ("chrome-browser", true),
         ("google-chrome-stable", true),
@@ -69,13 +84,25 @@ fn get_by_name(options: &DetectionOptions) -> Option<PathBuf> {
         ("chromium", true),
         ("chromium-browser", true),
         ("brave", true),
+    ];
+    let edge_apps = [
         ("msedge", options.msedge),
         ("microsoft-edge", options.msedge),
         ("microsoft-edge-stable", options.msedge),
         ("microsoft-edge-beta", options.msedge && options.unstable),
         ("microsoft-edge-dev", options.msedge && options.unstable),
     ];
-    for (app, allowed) in default_apps {
+
+    if options.prefer_msedge {
+        edge_apps.into_iter().chain(chrome_apps).collect()
+    } else {
+        chrome_apps.into_iter().chain(edge_apps).collect()
+    }
+}
+
+#[cfg(feature = "auto-detect-executable")]
+fn get_by_name(options: &DetectionOptions) -> Option<PathBuf> {
+    for (app, allowed) in name_candidates(options) {
         if !allowed {
             continue;
         }
@@ -95,19 +122,25 @@ fn get_by_name(_options: &DetectionOptions) -> Option<PathBuf> {
 #[allow(unused_variables)]
 fn get_by_path(options: &DetectionOptions) -> Option<PathBuf> {
     #[cfg(all(unix, not(target_os = "macos")))]
-    let default_paths: [(&str, bool); 3] = [
+    let chrome_paths: [(&str, bool); 3] = [
         ("/opt/chromium.org/chromium", true),
         ("/opt/google/chrome", true),
         // test for lambda
         ("/tmp/aws/lib", true),
     ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let edge_paths: [(&str, bool); 0] = [];
+
     #[cfg(windows)]
-    let default_paths = [(
+    let chrome_paths: [(&str, bool); 0] = [];
+    #[cfg(windows)]
+    let edge_paths: [(&str, bool); 1] = [(
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         options.msedge,
     )];
+
     #[cfg(target_os = "macos")]
-    let default_paths = [
+    let chrome_paths: [(&str, bool); 5] = [
         (
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             true,
@@ -125,6 +158,9 @@ fn get_by_path(options: &DetectionOptions) -> Option<PathBuf> {
             options.unstable,
         ),
         ("/Applications/Chromium.app/Contents/MacOS/Chromium", true),
+    ];
+    #[cfg(target_os = "macos")]
+    let edge_paths: [(&str, bool); 4] = [
         (
             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
             options.msedge,
@@ -143,16 +179,23 @@ fn get_by_path(options: &DetectionOptions) -> Option<PathBuf> {
         ),
     ];
 
-    for (path, allowed) in default_paths {
-        if !allowed {
-            continue;
+    let search = |paths: &[(&str, bool)]| -> Option<PathBuf> {
+        for &(path, allowed) in paths {
+            if !allowed {
+                continue;
+            }
+            if Path::new(path).exists() {
+                return Some(path.into());
+            }
         }
-        if Path::new(path).exists() {
-            return Some(path.into());
-        }
-    }
+        None
+    };
 
-    None
+    if options.prefer_msedge {
+        search(&edge_paths).or_else(|| search(&chrome_paths))
+    } else {
+        search(&chrome_paths).or_else(|| search(&edge_paths))
+    }
 }
 
 #[cfg(windows)]
@@ -166,4 +209,66 @@ fn get_by_registry() -> Option<PathBuf> {
         .and_then(|key| key.get_value::<String, _>(""))
         .map(PathBuf::from)
         .ok()
+}
+
+#[cfg(all(test, feature = "auto-detect-executable"))]
+mod tests {
+    use super::*;
+
+    fn names(options: &DetectionOptions) -> Vec<&'static str> {
+        name_candidates(options)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Regression guard: the default order checks Chrome before Edge, matching
+    /// historical behavior so existing detections resolve identically.
+    #[test]
+    fn default_order_checks_chrome_before_edge() {
+        let order = names(&DetectionOptions::default());
+        let chrome = order.iter().position(|n| *n == "chrome").unwrap();
+        let edge = order.iter().position(|n| *n == "msedge").unwrap();
+        assert!(chrome < edge);
+        assert_eq!(order.first(), Some(&"chrome"));
+    }
+
+    /// `prefer_msedge` moves every Edge candidate ahead of Chrome/Chromium.
+    #[test]
+    fn prefer_msedge_checks_edge_before_chrome() {
+        let options = DetectionOptions {
+            msedge: true,
+            unstable: false,
+            prefer_msedge: true,
+        };
+        let order = names(&options);
+        let chrome = order.iter().position(|n| *n == "chrome").unwrap();
+        let edge = order.iter().position(|n| *n == "msedge").unwrap();
+        assert!(edge < chrome);
+        assert_eq!(order.first(), Some(&"msedge"));
+    }
+
+    /// Reordering only swaps group order — no candidate is dropped, so Chrome
+    /// remains a fallback when no Edge install is present.
+    #[test]
+    fn prefer_msedge_keeps_all_candidates() {
+        let base = DetectionOptions {
+            msedge: true,
+            unstable: true,
+            prefer_msedge: false,
+        };
+        let preferred = DetectionOptions {
+            prefer_msedge: true,
+            ..base.clone()
+        };
+
+        let mut base_sorted = names(&base);
+        let mut preferred_sorted = names(&preferred);
+        base_sorted.sort_unstable();
+        preferred_sorted.sort_unstable();
+
+        assert_eq!(base_sorted, preferred_sorted);
+        assert!(preferred_sorted.contains(&"chrome"));
+        assert!(preferred_sorted.contains(&"brave"));
+    }
 }

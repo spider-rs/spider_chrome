@@ -1212,6 +1212,17 @@ impl BrowserConfigBuilder {
         self
     }
 
+    /// Prefer Microsoft Edge over Chrome/Chromium during auto-detection.
+    ///
+    /// Convenience over [`Self::chrome_detection`] that enables both
+    /// [`DetectionOptions::msedge`] and [`DetectionOptions::prefer_msedge`] so
+    /// Edge binaries are resolved first when both browsers are installed.
+    pub fn prefer_edge(mut self) -> Self {
+        self.executation_detection.msedge = true;
+        self.executation_detection.prefer_msedge = true;
+        self
+    }
+
     pub fn extension(mut self, extension: impl Into<String>) -> Self {
         self.extensions.push(extension.into());
         self
@@ -1503,6 +1514,7 @@ pub fn default_executable() -> Result<std::path::PathBuf, String> {
     let options = DetectionOptions {
         msedge: false,
         unstable: false,
+        prefer_msedge: false,
     };
     detection::default_executable(options)
 }
