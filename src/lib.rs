@@ -89,6 +89,7 @@ pub mod page;
 pub mod runtime_release;
 pub mod uring_fs;
 pub mod utils;
+pub mod webmcp;
 
 use crate::handler::http::HttpRequest;
 use std::sync::Arc;

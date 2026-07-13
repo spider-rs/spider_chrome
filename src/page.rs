@@ -48,6 +48,7 @@ use crate::javascript::extract::{
 use crate::js::{Evaluation, EvaluationResult};
 use crate::layout::{Delta, Point, ScrollBehavior};
 use crate::listeners::{EventListenerRequest, EventStream};
+use crate::webmcp::{CallToolParams, ListToolsParams, Tool};
 use crate::{utils, ArcHttpRequest};
 use aho_corasick::AhoCorasick;
 
@@ -2665,6 +2666,33 @@ impl Page {
         self.execute(ClearCookiesParams::default()).await?;
 
         Ok(self)
+    }
+
+    /// Lists the agent-callable WebMCP tools the current page declared, via
+    /// the `WebMCP.listTools` method.
+    ///
+    /// This requires a remote engine that implements the non-standard
+    /// `WebMCP` domain; browsers without it respond with a protocol error.
+    pub async fn list_tools(&self) -> Result<Vec<Tool>> {
+        Ok(self.execute(ListToolsParams::default()).await?.result.tools)
+    }
+
+    /// Invokes a page-declared WebMCP tool by name with the given JSON
+    /// `arguments`, via the `WebMCP.callTool` method, returning the result as
+    /// opaque JSON.
+    ///
+    /// Forward-looking seam: engines that have not shipped `WebMCP.callTool`
+    /// yet respond with a protocol error. Discover available tools and their
+    /// `inputSchema` with [`Page::list_tools`].
+    pub async fn call_tool(
+        &self,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Ok(self
+            .execute(CallToolParams::new(name, arguments))
+            .await?
+            .result)
     }
 
     /// Set a single cookie
