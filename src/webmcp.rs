@@ -88,12 +88,17 @@ impl chromiumoxide_types::Command for ListToolsParams {
 /// Invoke a page-declared tool by name.
 /// [callTool]: method `WebMCP.callTool`.
 ///
-/// Forward-looking seam: not every engine implements `WebMCP.callTool` yet.
-/// Depending on the engine's unknown-method policy, an unimplemented call
-/// surfaces either a protocol error or an empty success result — treat an
-/// empty object as "not supported yet" and discover live tools via
-/// `WebMCP.listTools`. The response is returned as opaque JSON
-/// ([`serde_json::Value`]) so the client does not constrain the result shape.
+/// An engine that implements `WebMCP.callTool` runs the tool and returns its
+/// result as opaque JSON — commonly a WebMCP tool-result object with a
+/// `content` array and an `isError` flag (a failing tool is reported in-band as
+/// `isError: true`, not as a protocol error).
+///
+/// Not every engine implements `WebMCP.callTool`. Depending on the engine's
+/// unknown-method policy, an unimplemented call surfaces either a protocol
+/// error or an empty success result — treat an empty object as "not supported
+/// yet" and discover live tools via `WebMCP.listTools`. The response is
+/// returned as opaque JSON ([`serde_json::Value`]) so the client does not
+/// constrain the result shape.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CallToolParams {
     /// The name of the tool to invoke, as reported by `WebMCP.listTools`.
