@@ -2681,9 +2681,11 @@ impl Page {
     /// `arguments`, via the `WebMCP.callTool` method, returning the result as
     /// opaque JSON.
     ///
-    /// Forward-looking seam: engines that have not shipped `WebMCP.callTool`
-    /// yet respond with a protocol error. Discover available tools and their
-    /// `inputSchema` with [`Page::list_tools`].
+    /// Forward-looking seam: not every engine implements `WebMCP.callTool`
+    /// yet. Depending on the engine's unknown-method policy, an unimplemented
+    /// call surfaces either a protocol error or an empty success result —
+    /// treat an empty object as "not supported yet". Discover available tools
+    /// and their `inputSchema` with [`Page::list_tools`].
     pub async fn call_tool(
         &self,
         name: impl Into<String>,
