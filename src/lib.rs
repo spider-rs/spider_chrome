@@ -68,6 +68,7 @@ pub mod bg_cleanup;
 pub mod browser;
 #[cfg(feature = "_cache")]
 pub mod cache;
+pub mod content_markdown;
 pub mod content_stream;
 #[cfg(feature = "_cache")]
 pub mod http;

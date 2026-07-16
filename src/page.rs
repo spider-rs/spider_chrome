@@ -3437,6 +3437,57 @@ impl Page {
         crate::content_stream::content_stream(self, chunk_units)
     }
 
+    /// Returns the page content rendered as **Markdown**, via the vendor
+    /// `Content.getMarkdown` CDP method (single-shot, `stream: false`).
+    ///
+    /// This requires a remote engine that implements the non-standard
+    /// `Content` domain. Not every engine implements `Content.getMarkdown`.
+    /// Depending on the engine's unknown-method policy, an unimplemented call
+    /// surfaces either a protocol error or an empty success result — an empty
+    /// object is returned as `Ok(None)`, meaning "not supported yet". On
+    /// either signal, fall back to [`Page::content`] and convert the HTML to
+    /// Markdown locally.
+    pub async fn content_markdown(&self) -> Result<Option<String>> {
+        crate::content_markdown::content_markdown(self).await
+    }
+
+    /// Streaming variant of [`Page::content_markdown`]: issues
+    /// `Content.getMarkdown` with `stream: true` and accumulates the pushed
+    /// `Content.markdownChunk` events into one `String` until the terminal
+    /// `Content.markdownDone` event.
+    ///
+    /// `Ok(None)` means the engine acknowledged the request but never emitted
+    /// a stream event within the event timeout — the streaming analogue of
+    /// the empty-object "not supported yet" response — so fall back to
+    /// [`Page::content`] plus local conversion (a protocol error means the
+    /// same). See [`content_markdown_streaming`] for the guardrails
+    /// (per-event timeout, accumulated-bytes cap and their env overrides).
+    ///
+    /// [`content_markdown_streaming`]: crate::content_markdown::content_markdown_streaming
+    pub async fn content_markdown_streaming(&self) -> Result<Option<String>> {
+        crate::content_markdown::content_markdown_streaming(self).await
+    }
+
+    /// Pump-style async [`Stream`] of the page's Markdown — yields each
+    /// `Content.markdownChunk` fragment as the engine pushes it, without
+    /// accumulating, ending cleanly on `Content.markdownDone`.
+    ///
+    /// The first poll subscribes to the events and issues
+    /// `Content.getMarkdown` with `stream: true`. An engine that doesn't
+    /// support the method yields one error (protocol error, or an
+    /// unsupported-method report if the request was acknowledged but no
+    /// stream event ever arrived) — on any error, fall back to
+    /// [`Page::content`] plus local conversion. Drop the stream early to
+    /// stop consuming. See [`content_markdown_stream`] for details.
+    ///
+    /// [`Stream`]: futures_util::Stream
+    /// [`content_markdown_stream`]: crate::content_markdown::content_markdown_stream
+    pub fn content_markdown_stream(
+        &self,
+    ) -> impl futures_util::Stream<Item = Result<String>> + Send + 'static {
+        crate::content_markdown::content_markdown_stream(self)
+    }
+
     /// Returns the full serialized content of the page (HTML or XML)
     pub async fn content_bytes_xml(&self) -> Result<Vec<u8>> {
         Ok(self.evaluate(FULL_XML_SERIALIZER_JS).await?.into_bytes()?)

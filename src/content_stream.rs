@@ -63,7 +63,9 @@ fn clamp_chunk_units(units: u32) -> u32 {
 /// Hard cap on chunk round-trips (guards against a mutating page or
 /// pathological slice loop).  At [`DEFAULT_CHUNK_UNITS`] per chunk this
 /// caps streaming at ~16 Gi code units — far beyond any realistic document.
-const MAX_CHUNKS: usize = 262_144;
+/// Shared with [`crate::content_markdown`] so both content streams honour
+/// the same bound.
+pub(crate) const MAX_CHUNKS: usize = 262_144;
 
 /// JS that builds the document HTML (matching
 /// [`crate::javascript::extract::OUTER_HTML`]) and wraps it in an object so
@@ -619,9 +621,10 @@ async fn read_chunks(
 
 /// Resolve the accumulated-bytes cap for this process.  Honours
 /// `CHROMEY_CONTENT_STREAM_MAX_BYTES` (integer bytes) when set; otherwise
-/// returns [`DEFAULT_MAX_ACCUMULATED_BYTES`].
+/// returns [`DEFAULT_MAX_ACCUMULATED_BYTES`].  Shared with
+/// [`crate::content_markdown`] so one operator knob caps both.
 #[inline]
-fn max_accumulated_bytes() -> usize {
+pub(crate) fn max_accumulated_bytes() -> usize {
     std::env::var("CHROMEY_CONTENT_STREAM_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
