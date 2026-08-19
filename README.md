@@ -5,7 +5,7 @@
 
 Chrome DevTools Protocol library for Rust.
 
-## Quick Start
+## Quick start
 
 ```toml
 chromey = "2"
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Features
 
-Optional features enabled via Cargo feature flags:
+Turn these on with Cargo feature flags.
 
 | Flag | Description |
 |---|---|
@@ -62,7 +62,7 @@ Optional features enabled via Cargo feature flags:
 | `io_uring` | Linux io_uring I/O |
 | `serde_stacker` | Deeply nested CDP payload parsing |
 
-## Auto-Download Chrome
+## Auto-download Chrome
 
 ```rust
 use std::path::Path;
@@ -91,9 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Requires `_fetcher-native-tokio` or `_fetcher-rusttls-tokio`.
 
-## CDP Commands
+## CDP commands
 
-Every CDP command is available through `Page::execute`. Most built-in methods are thin wrappers:
+`Page::execute` runs any CDP command. Most of the built-in methods are thin wrappers over it:
 
 ```rust
 pub async fn pdf(&self, params: PrintToPdfParams) -> Result<Vec<u8>> {
@@ -102,15 +102,15 @@ pub async fn pdf(&self, params: PrintToPdfParams) -> Result<Vec<u8>> {
 }
 ```
 
-Browse CDP types at [vanilla.aslushnikov.com](https://vanilla.aslushnikov.com/).
+Browse the CDP types at [vanilla.aslushnikov.com](https://vanilla.aslushnikov.com/).
 
 ## License
 
-Licensed under either of:
+Licensed under either of
 
 - [Apache License, Version 2.0](LICENSE-APACHE)
 - [MIT License](LICENSE-MIT)
 
 ## Acknowledgments
 
-Originally forked from [chromiumoxide](https://github.com/mattsse/chromiumoxide).
+Forked from [chromiumoxide](https://github.com/mattsse/chromiumoxide).
